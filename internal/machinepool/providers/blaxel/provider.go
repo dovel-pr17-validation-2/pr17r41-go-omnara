@@ -1,0 +1,460 @@
+package blaxel
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"math/rand/v2"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/omnara-ai/omnara/internal/daemonprotocol"
+	"github.com/omnara-ai/omnara/internal/machinepool/providers"
+	"github.com/omnara-ai/omnara/internal/publicid"
+	"github.com/omnara-ai/omnara/internal/storage/executionstore"
+	"github.com/omnara-ai/omnara/observability/metrics"
+)
+
+const (
+	daemonProcessName                         = "omnara-daemon"
+	wakePortName                              = "omnara-wake"
+	wakePortProtocol                          = "HTTP"
+	processStatusRunning sandboxProcessStatus = "running"
+
+	// Blaxel sandbox states follow https://docs.blaxel.ai/api-reference/compute/get-sandbox.
+	sandboxDeploymentDeploying    sandboxDeploymentStatus = "DEPLOYING"
+	sandboxDeploymentDeployed     sandboxDeploymentStatus = "DEPLOYED"
+	sandboxDeploymentDeactivating sandboxDeploymentStatus = "DEACTIVATING"
+	sandboxDeploymentDeleting     sandboxDeploymentStatus = "DELETING"
+	sandboxDeploymentFailed       sandboxDeploymentStatus = "FAILED"
+	sandboxDeploymentTerminated   sandboxDeploymentStatus = "TERMINATED"
+	sandboxDeploymentDeactivated  sandboxDeploymentStatus = "DEACTIVATED"
+
+	sandboxRuntimeRunning sandboxRuntimeState = "RUNNING"
+	sandboxRuntimeStandby sandboxRuntimeState = "STANDBY"
+
+	provisioningTimeout             = time.Minute
+	initialAwakeProcessPollInterval = 100 * time.Millisecond
+	installationLabel               = "omnara-installation"
+	machineLabel                    = "omnara-machine"
+)
+
+var sandboxDeploymentPollInterval = time.Second
+
+type sandboxDeploymentStatus string
+type sandboxRuntimeState string
+type sandboxProcessStatus string
+
+type provider struct {
+	api          apiClient
+	workspace    string
+	apiToken     string
+	omnaraAPIURL string
+	httpRecorder *metrics.HTTPClientRecorder
+}
+
+func (p *provider) apiClient() apiClient {
+	if p.api != nil {
+		return p.api
+	}
+	return &restClient{
+		apiBaseURL: apiBaseURL,
+		workspace:  p.workspace,
+		apiToken:   p.apiToken,
+		httpClient: providers.NewHTTPClient(p.httpRecorder, providers.Blaxel),
+	}
+}
+
+func (*provider) ProvisioningTimeout() time.Duration {
+	return provisioningTimeout
+}
+
+func (*provider) PrepareProvisioning(
+	_ context.Context,
+	machineProvisioning executionstore.MachineProvisioningConfig,
+) (executionstore.MachineResourceFacts, error) {
+	if _, err := providerOptionsFromProvisioning(machineProvisioning); err != nil {
+		return executionstore.MachineResourceFacts{}, err
+	}
+	return executionstore.MachineResourceFacts{
+		CPU:      machineProvisioning.CPU,
+		MemoryMB: machineProvisioning.MemoryMB,
+	}, nil
+}
+
+func (*provider) ValidateMachineConfig(executionstore.MachineProvisioningConfig, map[string]string) error {
+	return nil
+}
+
+func (p *provider) ProvisionMachine(
+	ctx context.Context,
+	installationID uuid.UUID,
+	machineID uuid.UUID,
+	machineProvisioning executionstore.MachineProvisioningConfig,
+	machineToken string,
+	machineEnv map[string]string,
+	_ bool,
+) (providers.ProvisionMachineResult, error) {
+	options, err := providerOptionsFromProvisioning(machineProvisioning)
+	if err != nil {
+		return providers.ProvisionMachineResult{}, err
+	}
+	name, err := providers.MachineAllocationName(installationID, machineID)
+	if err != nil {
+		return providers.ProvisionMachineResult{}, err
+	}
+	env, err := providers.BuildManagedMachineEnv(
+		p.omnaraAPIURL,
+		machineToken,
+		options.StartupScript,
+		machineEnv,
+	)
+	if err != nil {
+		return providers.ProvisionMachineResult{}, err
+	}
+	if options.SleepAfterMS > 0 {
+		env[daemonprotocol.SleepAfterEnvVar] = strconv.Itoa(options.SleepAfterMS)
+		env[daemonprotocol.WakeListenAddrEnvVar] = ":" +
+			strconv.Itoa(daemonprotocol.WakeListenerPort)
+		env[daemonprotocol.SleepPlatformEnvVar] = daemonprotocol.SleepPlatformBlaxel
+	}
+	installationOwner, machineOwner, err := sandboxOwnershipLabelValues(
+		installationID,
+		machineID,
+	)
+	if err != nil {
+		return providers.ProvisionMachineResult{}, err
+	}
+	request := createSandboxRequest{
+		Metadata: resourceMetadata{
+			Name: name,
+			Labels: map[string]string{
+				installationLabel: installationOwner,
+				machineLabel:      machineOwner,
+			},
+		},
+		Spec: sandboxSpec{
+			Region: options.Region,
+			Runtime: sandboxRuntime{
+				Image:  options.Image,
+				Memory: *machineProvisioning.MemoryMB,
+				Envs:   sandboxEnvsFromMap(env),
+			},
+		},
+	}
+	if options.SleepAfterMS > 0 {
+		request.Spec.Runtime.Ports = []sandboxPort{{
+			Name:     wakePortName,
+			Protocol: wakePortProtocol,
+			Target:   daemonprotocol.WakeListenerPort,
+		}}
+	}
+	api := p.apiClient()
+	target, err := api.CreateSandbox(ctx, request)
+	if isConflict(err) {
+		existing, found, getErr := api.GetSandbox(ctx, name)
+		if getErr != nil {
+			return providers.ProvisionMachineResult{}, getErr
+		}
+		if !found {
+			return providers.ProvisionMachineResult{}, fmt.Errorf(
+				"blaxel sandbox %q create conflicted but the sandbox is not usable",
+				name,
+			)
+		}
+		target = existing
+	} else if err != nil {
+		return providers.ProvisionMachineResult{}, err
+	}
+	if !sandboxOwnedBy(target, name, installationID, machineID) {
+		return providers.ProvisionMachineResult{}, fmt.Errorf(
+			"blaxel sandbox %q does not have the expected ownership labels",
+			name,
+		)
+	}
+	result := providers.ProvisionMachineResult{ProviderResourceID: name}
+	pollInterval := sandboxDeploymentPollInterval
+	for normalizeSandboxDeploymentStatus(target.Status) == sandboxDeploymentDeploying {
+		select {
+		case <-ctx.Done():
+			return result, fmt.Errorf("wait for blaxel sandbox %q to deploy: %w", name, ctx.Err())
+		case <-time.After(pollInterval - rand.N(pollInterval)/4):
+		}
+		pollInterval = min(2*pollInterval, 5*time.Second)
+		refreshed, found, err := api.GetSandbox(ctx, name)
+		if err != nil {
+			return result, err
+		}
+		if !found {
+			return result, fmt.Errorf("blaxel sandbox %q disappeared while deploying", name)
+		}
+		target = refreshed
+	}
+	if sandboxDeploymentTerminal(target.Status) {
+		if err := api.DeleteSandbox(ctx, name); err != nil {
+			return result, err
+		}
+		return providers.ProvisionMachineResult{}, fmt.Errorf(
+			"blaxel sandbox %q was deleted; provisioning must be retried: %w",
+			name,
+			providers.ErrResourceReplaced,
+		)
+	}
+	if normalizeSandboxDeploymentStatus(target.Status) != sandboxDeploymentDeployed {
+		return result, fmt.Errorf("blaxel sandbox %q is not ready with status %q", name, target.Status)
+	}
+	daemonProcess, err := ensureDaemonProcess(
+		ctx,
+		api,
+		target,
+		options.StartupScript,
+		options.SleepAfterMS > 0,
+	)
+	if err != nil {
+		return result, err
+	}
+	if options.SleepAfterMS > 0 {
+		supervisorPID, err := strconv.Atoi(daemonProcess.PID)
+		if err != nil || supervisorPID <= 0 {
+			return result, errors.New("blaxel daemon process is missing a valid pid")
+		}
+		awakeProcessName := daemonprotocol.BlaxelAwakeProcessName(supervisorPID)
+		if err := waitForInitialAwakeProcess(ctx, api, target, awakeProcessName); err != nil {
+			return result, err
+		}
+		result.SandboxURL = strings.TrimSpace(target.Metadata.URL)
+	}
+	return result, nil
+}
+
+func ensureDaemonProcess(
+	ctx context.Context,
+	api apiClient,
+	target sandbox,
+	startupScript string,
+	sleepEnabled bool,
+) (sandboxProcess, error) {
+	expectedKeepAlive := !sleepEnabled
+	command := providers.ManagedBootScript()
+	if sleepEnabled {
+		command = managedBootScriptWithAwakeProcess(command)
+	}
+	existing, found, err := api.GetSandboxProcess(ctx, target, daemonProcessName)
+	if err != nil {
+		return sandboxProcess{}, err
+	}
+	if found && normalizeSandboxProcessStatus(existing.Status) == processStatusRunning {
+		if err := validateDaemonProcessKeepAlive(existing, expectedKeepAlive); err != nil {
+			return sandboxProcess{}, err
+		}
+		return existing, nil
+	}
+	process, startErr := api.StartSandboxProcess(ctx, target, processRequest{
+		Name:              daemonProcessName,
+		Command:           command,
+		KeepAlive:         expectedKeepAlive,
+		Timeout:           0,
+		WaitForCompletion: false,
+	})
+	if startErr != nil {
+		existing, found, getErr := api.GetSandboxProcess(ctx, target, daemonProcessName)
+		if getErr == nil && found && normalizeSandboxProcessStatus(existing.Status) == processStatusRunning {
+			if err := validateDaemonProcessKeepAlive(existing, expectedKeepAlive); err != nil {
+				return sandboxProcess{}, err
+			}
+			return existing, nil
+		}
+		return sandboxProcess{}, startErr
+	}
+	if normalizeSandboxProcessStatus(process.Status) != processStatusRunning {
+		return sandboxProcess{}, fmt.Errorf("blaxel daemon process started with status %q", process.Status)
+	}
+	if err := validateDaemonProcessKeepAlive(process, expectedKeepAlive); err != nil {
+		return sandboxProcess{}, err
+	}
+	return process, nil
+}
+
+func validateDaemonProcessKeepAlive(process sandboxProcess, expected bool) error {
+	if process.KeepAlive != expected {
+		return fmt.Errorf(
+			"blaxel daemon process keep-alive is %t, want %t",
+			process.KeepAlive,
+			expected,
+		)
+	}
+	return nil
+}
+
+func waitForInitialAwakeProcess(
+	ctx context.Context,
+	api apiClient,
+	target sandbox,
+	name string,
+) error {
+	for {
+		process, found, err := api.GetSandboxProcess(ctx, target, name)
+		if err != nil {
+			return err
+		}
+		if found {
+			if normalizeSandboxProcessStatus(process.Status) == processStatusRunning && process.KeepAlive {
+				return nil
+			}
+			return fmt.Errorf(
+				"blaxel awake process %q is not running with keep-alive enabled",
+				name,
+			)
+		}
+		timer := time.NewTimer(initialAwakeProcessPollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("wait for initial blaxel awake process %q: %w", name, ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+func (p *provider) WakeMachine(
+	ctx context.Context,
+	input providers.WakeMachineInput,
+) error {
+	return p.apiClient().WakeSandbox(ctx, sandbox{
+		Metadata: resourceMetadata{
+			Name: input.ProviderResourceID,
+			URL:  input.SandboxURL,
+		},
+	})
+}
+
+func (p *provider) InspectMachine(
+	ctx context.Context,
+	installationID uuid.UUID,
+	machineID uuid.UUID,
+	_ executionstore.MachineProvisioningConfig,
+	providerResourceID string,
+) (string, bool, error) {
+	expectedName, err := providers.MachineAllocationName(installationID, machineID)
+	if err != nil {
+		return "", false, err
+	}
+	lookup := providerResourceID
+	if lookup == "" {
+		lookup = expectedName
+	}
+	target, found, err := p.apiClient().GetSandbox(ctx, lookup)
+	if err != nil || !found {
+		return "", false, err
+	}
+	if !sandboxOwnedBy(target, expectedName, installationID, machineID) {
+		return "", false, fmt.Errorf("blaxel sandbox %q does not have the expected ownership labels", lookup)
+	}
+	return expectedName, true, nil
+}
+
+func (p *provider) CheckConnection(ctx context.Context, _ executionstore.MachineProvisioningConfig) error {
+	lister, ok := p.apiClient().(sandboxLister)
+	if !ok {
+		return errors.New("blaxel api client cannot list sandboxes")
+	}
+	_, err := lister.ListSandboxes(ctx, "", 1)
+	return err
+}
+
+func (p *provider) DeleteMachine(
+	ctx context.Context,
+	installationID uuid.UUID,
+	machineID uuid.UUID,
+	machineProvisioning executionstore.MachineProvisioningConfig,
+	providerResourceID string,
+) error {
+	if providerResourceID == "" {
+		return errors.New("provider resource id is required")
+	}
+	resourceID, found, err := p.InspectMachine(
+		ctx,
+		installationID,
+		machineID,
+		machineProvisioning,
+		providerResourceID,
+	)
+	if err == nil && !found {
+		resourceID, found, err = p.InspectMachine(ctx, installationID, machineID, machineProvisioning, "")
+	}
+	if err != nil || !found {
+		return err
+	}
+	return p.apiClient().DeleteSandbox(ctx, resourceID)
+}
+
+func sandboxEnvsFromMap(env map[string]string) []sandboxEnv {
+	if len(env) == 0 {
+		return nil
+	}
+	envs := make([]sandboxEnv, 0, len(env))
+	for _, name := range slices.Sorted(maps.Keys(env)) {
+		envs = append(envs, sandboxEnv{Name: name, Value: env[name]})
+	}
+	return envs
+}
+
+func sandboxOwnedBy(
+	target sandbox,
+	name string,
+	installationID, machineID uuid.UUID,
+) bool {
+	if target.Metadata.Name != name {
+		return false
+	}
+	installationOwner, machineOwner, err := sandboxOwnershipLabelValues(
+		installationID,
+		machineID,
+	)
+	if err != nil {
+		return false
+	}
+	return target.Metadata.Labels[installationLabel] == installationOwner &&
+		target.Metadata.Labels[machineLabel] == machineOwner
+}
+
+func sandboxOwnershipLabelValues(
+	installationID, machineID uuid.UUID,
+) (string, string, error) {
+	installationPublicID, err := publicid.Encode(publicid.KindInstallation, installationID)
+	if err != nil {
+		return "", "", err
+	}
+	machinePublicID, err := publicid.Encode(publicid.KindMachine, machineID)
+	if err != nil {
+		return "", "", err
+	}
+	return installationPublicID, machinePublicID, nil
+}
+
+func sandboxDeploymentTerminal(status sandboxDeploymentStatus) bool {
+	return slices.Contains(
+		[]sandboxDeploymentStatus{
+			sandboxDeploymentFailed,
+			sandboxDeploymentTerminated,
+			sandboxDeploymentDeactivated,
+		},
+		normalizeSandboxDeploymentStatus(status),
+	)
+}
+
+func normalizeSandboxDeploymentStatus(status sandboxDeploymentStatus) sandboxDeploymentStatus {
+	return sandboxDeploymentStatus(strings.ToUpper(strings.TrimSpace(string(status))))
+}
+
+func normalizeSandboxRuntimeState(state sandboxRuntimeState) sandboxRuntimeState {
+	return sandboxRuntimeState(strings.ToUpper(strings.TrimSpace(string(state))))
+}
+
+func normalizeSandboxProcessStatus(status sandboxProcessStatus) sandboxProcessStatus {
+	return sandboxProcessStatus(strings.ToLower(strings.TrimSpace(string(status))))
+}

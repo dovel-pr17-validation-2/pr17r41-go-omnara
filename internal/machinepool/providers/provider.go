@@ -1,0 +1,148 @@
+package providers
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/omnara-ai/omnara/internal/publicid"
+	"github.com/omnara-ai/omnara/internal/storage/executionstore"
+	"github.com/omnara-ai/omnara/observability/metrics"
+)
+
+const (
+	Agent37    = "agent37"
+	Arker      = "arker"
+	Blaxel     = "blaxel"
+	Boxd       = "boxd"
+	CreateOS   = "createos"
+	Daytona    = "daytona"
+	E2B        = "e2b"
+	Freestyle  = "freestyle"
+	Modal      = "modal"
+	Superserve = "superserve"
+	Tenki      = "tenki"
+	Unikraft   = "unikraft"
+)
+
+type RuntimeConfig struct {
+	OmnaraAPIURL      string
+	ProviderAuthToken string
+	HTTPRecorder      *metrics.HTTPClientRecorder
+}
+
+type ProvisionMachineResult struct {
+	ProviderResourceID string
+	SandboxURL         string
+}
+
+// ErrResourceReplaced signals that the provider deleted a replaceable resource
+// and any previously observed resource id is stale; the next retry may observe
+// a different id for the same machine.
+var ErrResourceReplaced = errors.New("provider resource was replaced")
+
+var ErrPermanent = errors.New("permanent provider error")
+
+type WakeMachineInput struct {
+	ProviderResourceID string
+	SandboxURL         string
+}
+
+type MachineWaker interface {
+	// WakeMachine must be idempotent because a call may be retried after an
+	// ambiguous transport failure.
+	WakeMachine(context.Context, WakeMachineInput) error
+}
+
+type MachineDeleter interface {
+	// DeleteMachine must be retry-safe and return nil when the owned resource is already absent.
+	DeleteMachine(
+		ctx context.Context,
+		installationID, machineID uuid.UUID,
+		machineProvisioning executionstore.MachineProvisioningConfig,
+		providerResourceID string,
+	) error
+}
+
+type Provider interface {
+	MachineDeleter
+	ProvisioningTimeout() time.Duration
+	// PrepareProvisioning must be retry-safe and must not mutate external resources.
+	PrepareProvisioning(
+		context.Context,
+		executionstore.MachineProvisioningConfig,
+	) (executionstore.MachineResourceFacts, error)
+	// ValidateMachineConfig runs with the resolved environment before the
+	// provisioning attempt is recorded; an error permanently fails the machine.
+	ValidateMachineConfig(executionstore.MachineProvisioningConfig, map[string]string) error
+	// ProvisionMachine must be idempotent by installation and machine identity;
+	// the caller may retry it immediately after any error.
+	// Calling it is the external side-effect boundary and must be recorded durably first.
+	// Retries for the same machine must converge on one canonical live provider
+	// resource, usually by using a deterministic allocation name. A provider must
+	// not create more than one live sandbox for one Omnara machine. The result must
+	// include any trusted resource id observed before a later readiness error.
+	// After deleting a replaceable resource the provider must return an error
+	// wrapping ErrResourceReplaced so callers discard previously observed ids.
+	// machineEnv is the machine's resolved environment and is applied to the
+	// provider resource at creation; retries that adopt an existing resource
+	// keep the environment it was created with. firstAttempt is true until a
+	// provisioning attempt has been recorded for the machine, including retries
+	// within that attempt.
+	ProvisionMachine(
+		ctx context.Context,
+		installationID, machineID uuid.UUID,
+		machineProvisioning executionstore.MachineProvisioningConfig,
+		machineToken string,
+		machineEnv map[string]string,
+		firstAttempt bool,
+	) (ProvisionMachineResult, error)
+	InspectMachine(
+		ctx context.Context,
+		installationID, machineID uuid.UUID,
+		machineProvisioning executionstore.MachineProvisioningConfig,
+		providerResourceID string,
+	) (string, bool, error)
+	CheckConnection(context.Context, executionstore.MachineProvisioningConfig) error
+}
+
+type Definition interface {
+	ResourcePolicy() MachineResourcePolicy
+	NewProvider(json.RawMessage, RuntimeConfig) (Provider, error)
+	ResolveMachineProviderOptions(
+		defaultOptions map[string]json.RawMessage,
+		projectOptions map[string]json.RawMessage,
+		agentOptions map[string]json.RawMessage,
+	) map[string]json.RawMessage
+	ValidatePool(
+		executionstore.MachinePoolProviderPolicy,
+	) error
+	ValidateMachineProvisioning(
+		executionstore.MachinePoolProviderPolicy,
+		executionstore.MachineProvisioningConfig,
+	) error
+	BuildMachineProvisioningIntent(
+		executionstore.MachinePoolProviderPolicy,
+		executionstore.MachineProvisioningConfig,
+	) (executionstore.MachineProvisioningConfig, error)
+}
+
+func MachineAllocationName(installationID, machineID uuid.UUID) (string, error) {
+	if installationID == uuid.Nil || machineID == uuid.Nil {
+		return "", errors.New("installation and machine ids are required")
+	}
+	allocationID := uuid.NewSHA1(installationID, machineID[:])
+	publicMachineID, err := publicid.Encode(publicid.KindMachine, allocationID)
+	if err != nil {
+		return "", err
+	}
+	suffix := strings.TrimPrefix(publicMachineID, "mch_")
+	if suffix == publicMachineID {
+		return "", fmt.Errorf("public machine id %q does not have expected mch_ prefix", publicMachineID)
+	}
+	return "omnara-mch-" + suffix, nil
+}

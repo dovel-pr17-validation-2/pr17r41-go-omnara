@@ -1,0 +1,865 @@
+package toolcatalog
+
+import (
+	"cmp"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"slices"
+	"sync"
+
+	"github.com/omnara-ai/omnara/internal/jsonschema"
+	"github.com/omnara-ai/omnara/internal/processaction"
+	"github.com/omnara-ai/omnara/internal/toolpermission"
+)
+
+const (
+	ToolTypeBuiltIn       = "built_in"
+	ToolTypeCustom        = "custom"
+	ToolTypeMCP           = "mcp"
+	ToolInputSchemaObject = "object"
+)
+
+const (
+	FilePageBytes                      = 4 * 1024
+	MaxReadableArtifactBytes           = 48 * 1024 * 1024
+	StorageListDefaultLimit            = 50
+	StorageListMaxLimit                = 100
+	StorageListMaxOffset               = 1_000_000
+	ListMachinesDefaultLimit           = 50
+	ListMachinesMaxLimit               = 100
+	ListGitHubRepositoriesDefaultLimit = 50
+	ListGitHubRepositoriesMaxLimit     = 100
+	StorageReadDefaultLines            = 100
+	StorageReadMaxLines                = 200
+	StorageReadDefaultChars            = 512
+	StorageReadMaxChars                = 4096
+	SearchDefaultMatches               = 20
+	SearchMaxMatches                   = 100
+	SearchMaxContextLines              = 5
+	SearchMaxPatternBytes              = 1024
+	SearchMaxArgs                      = 64
+)
+
+func IsPlatformManagedToolType(toolType string) bool {
+	return toolType == ToolTypeBuiltIn || toolType == ToolTypeMCP
+}
+
+const (
+	runCommandToolDescription = "Run a shell command on an attached machine. Waits up to wait_ms (default 5 seconds, " +
+		"at most 30 seconds) for it to exit and returns its output, keeping the start and end of long output. " +
+		"If it is still running, it keeps running and you get a message when it ends; use its process_id with " +
+		"the process tools to read output, send input, or stop it. For a command that may take longer, use " +
+		"wait_ms 0, then do other work or end your turn; that message wakes you to continue. To hear about " +
+		"specific output before then, such as a server's ready line, use watch_process."
+	writeProcessToolDescription = "Write exact bytes to a running process started with io_mode: pty."
+	stopProcessToolDescription  = "Interrupt or terminate a running process."
+	watchProcessToolDescription = "Watch a running process's output and get a message with the lines that match a " +
+		"regular expression, such as a server's ready line or errors, until the watch expires or the process ends. " +
+		"You also get a message when the watch expires. " +
+		"Matches are batched and rate limited, and matches you have not read yet are merged into one message. " +
+		"Watch for rare lines you want to be told about, then use read_process for the surrounding output; " +
+		"a pattern that matches frequent lines, such as progress or every log line, floods you with messages. " +
+		"If a watch reports too often, replace it with a narrower pattern or cancel it. " +
+		"A new watch replaces the process's current one; timeout_seconds 0 cancels it."
+	readProcessToolDescription = "Read a process's current output. Returns immediately unless wait_ms is set, " +
+		"which waits up to 30 seconds for the process to end. Long output keeps the start and end. " +
+		"You get a message when a process ends, so do not call this repeatedly to wait for it."
+	listProcessesToolDescription          = "List active processes in the current agent, including process_id values."
+	createMachineToolDescription          = "Request a pool-backed machine for this agent. First call list_machines (if available) to discover machine pools and resource limits and check for a suitable existing machine; use it if executable or wait for it if provisioning. machine_pool_id is only needed when multiple machine pools are available."
+	deleteMachineToolDescription          = "Request deletion of a pool-backed machine."
+	listMachinesToolDescription           = "List this agent's machines and available pools for creating new machines."
+	inspectMachineToolDescription         = "Inspect a BYO or pool-backed machine. machine_id is only needed when multiple machines are available."
+	listGitHubRepositoriesToolDescription = "List GitHub repositories this agent has access to, and whether it can push to them."
+	askQuestionToolDescription            = "Ask the human user one or more multiple-choice questions. " +
+		"Omnara appends a text-capable Other choice to every question for free-form user responses."
+	webSearchToolDescription = "Search the public web for up-to-date information beyond your training data. " +
+		"Returns results with URLs, titles, and snippets; use web_fetch to read a result in full. " +
+		"Prefer a few focused queries with varied phrasing over one broad query, and keep it to at most ~5 searches per task."
+	webFetchToolDescription = "Fetch a public http(s) URL and return its readable content as markdown (read-only). " +
+		"localhost and private or internal addresses are not reachable from this tool - use run_command " +
+		"(e.g. curl) on the machine where the service runs instead."
+	storageWriteToolDescription = "Create or edit a memory text file. " +
+		"Changing an existing file fails unless you read, wrote, uploaded, or downloaded its current content. " +
+		"Returns path."
+	storageReadToolDescription = "Read a text or image file stored in Omnara. " +
+		"PNG, JPEG, GIF, and WebP images are returned for you to view; paging inputs don't apply to images. " +
+		"Reads text by lines by default; supply offset_char or limit_chars to read by character. " +
+		"For large files, call again with the next position returned in the result."
+	storageSearchToolDescription = "Search text in Omnara files. " +
+		"Returns matching lines with context, matching file paths, or counts. " +
+		"Narrow the query when truncated. Use storage_read to read more around a match."
+	storageListToolDescription = "List files and directories in Omnara matching a glob. " +
+		"Returns paths and metadata without file contents. When has_more is true, call again with next_offset to continue."
+	storageUploadToolDescription = "Copy a file from an attached machine into Omnara, as one of two kinds. " +
+		"Artifact: set path to exactly /artifacts, with no name after it. This creates a new artifact named " +
+		"after the source file and returns its path, /artifacts/<artifact_id>. " +
+		"Memory file: set path to /memory/<store>/<file>. This creates or replaces the file at exactly that " +
+		"path and returns it; replacing fails unless you read, wrote, uploaded, or downloaded its current content. " +
+		"Either way, use the returned path to refer to the file afterward. " +
+		"Set view to load an uploaded image, such as a screenshot, into your context (artifacts only)."
+	storageDownloadToolDescription = "Copy a file stored in Omnara to an attached machine."
+	toolSearchToolDescription      = "Search the tools that are declared but not loaded into this conversation, " +
+		"and load the matches so they can be called as soon as the search returns. " +
+		"Deferred tools are not callable until a search returns them."
+	toolSearchPatternDescription = "A Python-style regular expression matched case-insensitively against each " +
+		"deferred tool's name, description, argument names, and argument descriptions. " +
+		"Prefer broad patterns such as \"weather\" or \"get_.*_data\" over exact names."
+)
+
+type Catalog struct {
+	tools map[string]Entry
+}
+
+type Entry struct {
+	Name              string
+	Description       string
+	Implicit          bool
+	DefaultPermission toolpermission.Selection
+	PermissionModes   []toolpermission.ModeDescriptor
+	InputSchema       json.RawMessage
+}
+
+var defaultCatalog = sync.OnceValues(buildDefaultCatalog)
+
+func Default() (Catalog, error) {
+	return defaultCatalog()
+}
+
+func buildDefaultCatalog() (Catalog, error) {
+	shellSelector := map[string]any{
+		"type":        "string",
+		"enum":        []string{"default", "sh", "bash", "zsh", "pwsh", "powershell", "cmd"},
+		"description": "Shell family to use. Omit unless a specific shell is required.",
+	}
+	machineID := map[string]any{
+		"type":        "string",
+		"description": "Public machine_id (mch_...) returned by list_machines. Omit it when the target is unambiguous.",
+	}
+	deleteMachineID := map[string]any{
+		"type":        "string",
+		"description": "Public machine_id (mch_...) of the pool-backed machine to delete. Use list_machines first if you need the ID.",
+	}
+	machinePoolID := map[string]any{
+		"type":        "string",
+		"pattern":     `^mpo_[a-z2-7]{26}$`,
+		"description": "Public machine_pool_id (mpo_...) returned by list_machines. Omit it when only one machine pool is available.",
+	}
+	processID := map[string]any{
+		"type":        "string",
+		"description": "Opaque process_id returned by a process-backed tool or list_processes. Copy it exactly.",
+	}
+	entries := map[string]Entry{}
+	var err error
+	entries[ToolNameRunCommand], err = toolEntry(
+		ToolNameRunCommand,
+		runCommandToolDescription,
+		[]string{"command"},
+		map[string]any{
+			"command": map[string]any{
+				"type": "string",
+				"description": "Shell command to run. Once execution is granted, the result includes a process_id " +
+					"that can be used with the process tools, even if the command has already ended.",
+			},
+			"machine_id": machineID,
+			"shell":      shellSelector,
+			"cwd": map[string]any{
+				"type":        "string",
+				"description": "Working directory. Omit to use the assigned machine default; do not guess /.",
+			},
+			"wait_ms": map[string]any{
+				"type":    "integer",
+				"minimum": 0,
+				"maximum": processaction.MaxWaitMilliseconds,
+				"description": "How long to wait for the command to exit before returning (default 5000, up to 30000 ms). " +
+					"Set it only to how long you expect the command to take, for a command that should finish within " +
+					"30 seconds. For a long-running command, or one whose duration you do not know, such as a build, " +
+					"test suite, install, or server, use 0 to return as soon as it starts: it keeps running and you get " +
+					"a message when it ends, so do other work or end your turn instead of waiting. " +
+					"This is not a lifetime timeout.",
+			},
+			"io_mode": map[string]any{
+				"type": "string",
+				"enum": []string{"pipe", "pty"},
+				"description": "Process I/O transport. Omit for pipe, which has no input: a prompt reads end of input " +
+					"and fails at once. Use pty for programs you send input to with write_process, such as REPLs, " +
+					"interactive terminal programs, or persistent shells.",
+			},
+		},
+	)
+	if err != nil {
+		return Catalog{}, err
+	}
+	actionSpecs := []struct {
+		name        string
+		description string
+		required    []string
+		properties  map[string]any
+	}{
+		{
+			ToolNameWriteProcess,
+			writeProcessToolDescription,
+			[]string{"process_id", "data"},
+			map[string]any{
+				"process_id": processID,
+				"data": map[string]any{
+					"type": "string",
+					"description": "Exact stdin/PTY bytes to write. " +
+						"Include newlines explicitly when the running command expects Enter.",
+				},
+			},
+		},
+		{
+			ToolNameWatchProcess,
+			watchProcessToolDescription,
+			[]string{"process_id"},
+			map[string]any{
+				"process_id": processID,
+				"pattern": map[string]any{
+					"type":      "string",
+					"minLength": 1,
+					"maxLength": processaction.MaxWatchPatternBytes,
+					"description": "RE2 regular expression matched against each output line. " +
+						"Required unless timeout_seconds is 0.",
+				},
+				"timeout_seconds": map[string]any{
+					"type":    "integer",
+					"minimum": 0,
+					"maximum": processaction.MaxWatchSeconds,
+					"description": fmt.Sprintf("How long the watch lasts, in seconds (default %d). "+
+						"Call watch_process again to keep watching. Use 0 with no pattern or offset_byte "+
+						"to cancel the current watch.", processaction.DefaultWatchSeconds),
+				},
+				"offset_byte": map[string]any{
+					"type":    "integer",
+					"minimum": 0,
+					"description": "Byte position to watch from, such as next_offset_byte from run_command or " +
+						"read_process. Omit to watch from the end of the output returned by run_command or the last " +
+						"read_process call that omitted offset_byte, so output written since then is not missed.",
+				},
+			},
+		},
+		{
+			ToolNameStopProcess,
+			stopProcessToolDescription,
+			[]string{"process_id", "mode"},
+			map[string]any{
+				"process_id": processID,
+				"mode": map[string]any{
+					"type":        "string",
+					"enum":        []string{"interrupt", "terminate"},
+					"description": "interrupt requests a graceful Ctrl-C-style stop; terminate forcibly ends the process tree.",
+				},
+			},
+		},
+	}
+	for _, spec := range actionSpecs {
+		entries[spec.name], err = toolEntry(spec.name, spec.description, spec.required, spec.properties)
+		if err != nil {
+			return Catalog{}, err
+		}
+	}
+	observationProperties := map[string]any{
+		"process_id": processID,
+		"offset_byte": map[string]any{
+			"type":    "integer",
+			"minimum": 0,
+			"description": "Byte position to read from: next_offset_byte from an earlier result, or omitted_offset_byte " +
+				"to page through output a long result left out. Omit to continue after your last read.",
+		},
+		"wait_ms": map[string]any{
+			"type":    "integer",
+			"minimum": 1,
+			"maximum": processaction.MaxWaitMilliseconds,
+			"description": fmt.Sprintf("Wait up to this long for the process to end before returning (up to 30000 ms). "+
+				"A pty process also returns after %d ms with no new output, as a program waiting at a prompt does. "+
+				"With offset_byte, returns once output exists there. Omit to return immediately. "+
+				"Use it only when you expect the process to end or print what you need within that time. "+
+				"You get a message when a background process ends, so do not use this to wait for one that may take longer.",
+				processaction.InteractiveQuietMilliseconds),
+		},
+	}
+	if entries[ToolNameReadProcess], err = toolEntry(
+		ToolNameReadProcess,
+		readProcessToolDescription,
+		[]string{"process_id"},
+		observationProperties,
+	); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameListProcesses], err = toolEntry(
+		ToolNameListProcesses,
+		listProcessesToolDescription,
+		nil,
+		nil,
+	); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameCreateMachine], err = toolEntry(
+		ToolNameCreateMachine,
+		createMachineToolDescription,
+		nil,
+		map[string]any{
+			"machine_pool_id": machinePoolID,
+			"cpu":             map[string]any{"type": "integer", "minimum": 1, "maximum": math.MaxInt32, "description": "vCPU count for this machine. Omit to inherit the pool's effective default; must be supported and within pool limits."},
+			"memory_mb":       map[string]any{"type": "integer", "minimum": 1, "maximum": math.MaxInt32, "description": "Memory in MB for this machine. Omit to inherit the pool's effective default; must be supported and within pool limits."},
+		},
+	); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameDeleteMachine], err = toolEntry(
+		ToolNameDeleteMachine,
+		deleteMachineToolDescription,
+		[]string{"machine_id"},
+		map[string]any{"machine_id": deleteMachineID},
+	); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameStorageList], err = toolEntry(
+		ToolNameStorageList,
+		storageListToolDescription,
+		[]string{"pattern"},
+		map[string]any{
+			"pattern": map[string]any{
+				"type":      "string",
+				"minLength": 1,
+				"description": "Pattern under literal /memory or /artifacts. Memory patterns match paths: " +
+					"/memory/* lists attached stores; /memory/** lists recursively. " +
+					"Artifact patterns match filenames, which can repeat, and return /artifacts/<artifact_id> paths for read/download. " +
+					"An exact artifact ID selects one artifact; wildcards match filenames, not IDs. " +
+					"* matches within a segment, ** spans directory levels, and ? matches one character.",
+			},
+			"offset": map[string]any{
+				"type":    "integer",
+				"minimum": 0,
+				"maximum": StorageListMaxOffset,
+				"description": "Number of matching entries to skip; defaults to 0. " +
+					"To continue, use next_offset from the previous result with the same pattern.",
+			},
+			"limit": map[string]any{
+				"type":        "integer",
+				"minimum":     1,
+				"maximum":     StorageListMaxLimit,
+				"description": fmt.Sprintf("Maximum entries to return. Defaults to %d.", StorageListDefaultLimit),
+			},
+		},
+	); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameListMachines], err = toolEntry(
+		ToolNameListMachines,
+		listMachinesToolDescription,
+		nil,
+		map[string]any{
+			"offset": map[string]any{
+				"type":    "integer",
+				"minimum": 0,
+				"description": "Number of entries to skip; defaults to 0. Pools are listed first, followed by machines. " +
+					"To continue, use next_offset from the previous result.",
+			},
+			"limit": map[string]any{
+				"type":        "integer",
+				"minimum":     1,
+				"maximum":     ListMachinesMaxLimit,
+				"description": fmt.Sprintf("Maximum entries to return. Defaults to %d.", ListMachinesDefaultLimit),
+			},
+		},
+	); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameInspectMachine], err = toolEntry(
+		ToolNameInspectMachine,
+		inspectMachineToolDescription,
+		nil,
+		map[string]any{"machine_id": machineID},
+	); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameListGitHubRepositories], err = toolEntry(
+		ToolNameListGitHubRepositories,
+		listGitHubRepositoriesToolDescription,
+		nil,
+		map[string]any{
+			"offset": map[string]any{
+				"type":        "integer",
+				"minimum":     0,
+				"description": "Number of entries to skip; defaults to 0. To continue, use next_offset from the previous result.",
+			},
+			"limit": map[string]any{
+				"type":        "integer",
+				"minimum":     1,
+				"maximum":     ListGitHubRepositoriesMaxLimit,
+				"description": fmt.Sprintf("Maximum entries to return. Defaults to %d.", ListGitHubRepositoriesDefaultLimit),
+			},
+		},
+	); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameAskQuestion], err = askQuestionTool(); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameWebSearch], err = webSearchTool(); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameWebFetch], err = webFetchTool(); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameStorageRead], err = storageReadTool(); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameStorageWrite], err = storageWriteTool(); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameStorageSearch], err = storageSearchTool(); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameStorageUpload], err = storageUploadTool(machineID); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameStorageDownload], err = storageDownloadTool(machineID); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameSkill], err = skillTool(); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameSpawnAgent], err = spawnAgentTool(); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameReadAgent], err = readAgentTool(); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameSendAgentMessage], err = sendAgentMessageTool(); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameStopAgent], err = stopAgentTool(); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameListAgents], err = listAgentsTool(); err != nil {
+		return Catalog{}, err
+	}
+	if entries[ToolNameToolSearch], err = toolSearchTool(); err != nil {
+		return Catalog{}, err
+	}
+	interactionTools, err := interactionHandlerTools()
+	if err != nil {
+		return Catalog{}, err
+	}
+	for _, entry := range interactionTools {
+		entries[entry.Name] = entry
+	}
+	for _, entry := range entries {
+		if err := entry.validate(); err != nil {
+			return Catalog{}, err
+		}
+	}
+	return Catalog{tools: entries}, nil
+}
+
+func toolEntry(
+	name string,
+	description string,
+	required []string,
+	properties map[string]any,
+) (Entry, error) {
+	schema, err := json.Marshal(objectSchema(properties, required))
+	if err != nil {
+		return Entry{}, fmt.Errorf("marshal %s tool schema: %w", name, err)
+	}
+	return Entry{
+		Name:              name,
+		Description:       description,
+		Implicit:          implicit(name),
+		DefaultPermission: toolpermission.DefaultSelection(toolpermission.ModeAlwaysAllow),
+		PermissionModes:   toolpermission.CommonModeDescriptors(),
+		InputSchema:       schema,
+	}, nil
+}
+
+func askQuestionTool() (Entry, error) {
+	entry, err := toolEntry(
+		ToolNameAskQuestion,
+		askQuestionToolDescription,
+		[]string{"questions"},
+		map[string]any{
+			"questions": map[string]any{
+				"type":     "array",
+				"minItems": 1,
+				"items": map[string]any{
+					"type":                 "object",
+					"required":             []string{"prompt", "options"},
+					"additionalProperties": false,
+					"properties": map[string]any{
+						"prompt": map[string]any{
+							"type":        "string",
+							"minLength":   1,
+							"description": "Question text shown to the user.",
+						},
+						"multiple": map[string]any{
+							"type":        "boolean",
+							"default":     false,
+							"description": "Whether the user may select more than one choice.",
+						},
+						"options": map[string]any{
+							"type":        "array",
+							"minItems":    1,
+							"description": "Choices shown to the user before Omnara appends a text-capable Other choice.",
+							"items": map[string]any{
+								"type":                 "object",
+								"required":             []string{"label"},
+								"additionalProperties": false,
+								"properties": map[string]any{
+									"label": map[string]any{
+										"type":        "string",
+										"minLength":   1,
+										"description": "Option text shown to the user.",
+									},
+								},
+							},
+						},
+					},
+				},
+				"description": "Questions and choices for the human to answer together.",
+			},
+		},
+	)
+	if err != nil {
+		return Entry{}, err
+	}
+	return entry, nil
+}
+
+func toolSearchTool() (Entry, error) {
+	entry, err := toolEntry(
+		ToolNameToolSearch,
+		toolSearchToolDescription,
+		[]string{"pattern"},
+		map[string]any{
+			"pattern": map[string]any{
+				"type":        "string",
+				"minLength":   1,
+				"maxLength":   ToolSearchMaxPatternLength,
+				"description": toolSearchPatternDescription,
+			},
+			"max_results": map[string]any{
+				"type":        "integer",
+				"minimum":     1,
+				"maximum":     ToolSearchMaxResults,
+				"description": fmt.Sprintf("Maximum tools to return. Defaults to %d.", ToolSearchDefaultResults),
+			},
+		},
+	)
+	if err != nil {
+		return Entry{}, err
+	}
+	entry.PermissionModes = toolpermission.AlwaysAllowModeDescriptors()
+	return entry, nil
+}
+
+func webSearchTool() (Entry, error) {
+	entry, err := toolEntry(
+		ToolNameWebSearch,
+		webSearchToolDescription,
+		[]string{"query"},
+		map[string]any{
+			"query": map[string]any{
+				"type":        "string",
+				"description": "Search query.",
+			},
+			"num_results": map[string]any{
+				"type":        "integer",
+				"minimum":     1,
+				"maximum":     20,
+				"description": "Number of results to return. Defaults to 5.",
+			},
+			"recency": map[string]any{
+				"type":        "string",
+				"enum":        []string{"day", "week", "month", "year"},
+				"description": "Restrict results to a recent time window.",
+			},
+			"domains": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": "Limit results to these domains. Prefix a domain with '-' to exclude it.",
+			},
+		},
+	)
+	if err != nil {
+		return Entry{}, err
+	}
+	return entry, nil
+}
+
+func skillTool() (Entry, error) {
+	return toolEntry(
+		ToolNameSkill,
+		"Return an attached skill's SKILL.md instructions and, when machines are attached, install its supporting files. Pass `name` to select an entry from the available_skills catalog.",
+		[]string{"name"},
+		map[string]any{
+			"name": map[string]any{
+				"type":        "string",
+				"description": "Name of an attached skill from the available_skills catalog. Returns its instructions whether or not the agent has an attached machine.",
+			},
+		},
+	)
+}
+
+func webFetchTool() (Entry, error) {
+	entry, err := toolEntry(
+		ToolNameWebFetch,
+		webFetchToolDescription,
+		[]string{"url"},
+		map[string]any{
+			"url": map[string]any{
+				"type":        "string",
+				"description": "Absolute http(s) URL of a public web page.",
+			},
+			"format": map[string]any{
+				"type":        "string",
+				"enum":        []string{"markdown", "text"},
+				"description": "Output format. Defaults to markdown.",
+			},
+			"timeout_seconds": map[string]any{
+				"type":        "integer",
+				"minimum":     1,
+				"maximum":     120,
+				"description": "Maximum fetch time in seconds. Defaults to 30.",
+			},
+		},
+	)
+	if err != nil {
+		return Entry{}, err
+	}
+	return entry, nil
+}
+
+func storageReadTool() (Entry, error) {
+	return toolEntry(
+		ToolNameStorageRead,
+		storageReadToolDescription,
+		[]string{"path"},
+		map[string]any{
+			"path": map[string]any{
+				"type":        "string",
+				"minLength":   1,
+				"description": "Exact file path: /artifacts/<artifact_id> or /memory/<store>/<file>.",
+			},
+			"offset_line": map[string]any{
+				"type":    "integer",
+				"minimum": 1,
+				"description": "Starting line number; defaults to 1 in line mode. " +
+					"To continue, use next_offset_line from the previous result. " +
+					"Cannot be combined with offset_char or limit_chars.",
+			},
+			"limit_lines": map[string]any{
+				"type":        "integer",
+				"minimum":     1,
+				"maximum":     StorageReadMaxLines,
+				"description": "Maximum number of lines to return. Defaults to 100 in line mode; each response contains at most 4 KiB of text.",
+			},
+			"offset_char": map[string]any{
+				"type":    "integer",
+				"minimum": 0,
+				"description": "Starting character position, counting Unicode code points from 0; defaults to 0 in character mode. " +
+					"To continue, use next_offset_char from the previous result. " +
+					"Cannot be combined with offset_line or limit_lines.",
+			},
+			"limit_chars": map[string]any{
+				"type":        "integer",
+				"minimum":     1,
+				"maximum":     StorageReadMaxChars,
+				"description": "Maximum Unicode code points to return. Defaults to 512 in character mode; each response contains at most 4 KiB of text.",
+			},
+		},
+	)
+}
+
+func storageWriteTool() (Entry, error) {
+	return toolEntry(
+		ToolNameStorageWrite,
+		storageWriteToolDescription,
+		[]string{"path"},
+		map[string]any{
+			"path": map[string]any{
+				"type":        "string",
+				"minLength":   1,
+				"pattern":     "^/memory/[^/]+/.+$",
+				"description": "Exact /memory/<store>/<file> destination. Requires write access.",
+			},
+			"content": map[string]any{
+				"type":        "string",
+				"description": "UTF-8 text to create or replace the file with, at most 10 MiB, without NUL bytes. Empty text is allowed. Supply exactly one of content or script.",
+			},
+			"script": map[string]any{
+				"type":        "string",
+				"description": "GNU sed script using extended regex, at most 64 KiB, to transform an existing text file. File reads, file writes, and command execution are disabled. Output must be UTF-8 without NUL bytes, at most 10 MiB.",
+			},
+			"append": map[string]any{
+				"type":        "boolean",
+				"description": "With content, append the exact text instead of replacing; no newline is added. Creates the file if missing. Defaults to false; cannot be used with script.",
+			},
+			"force": memoryForceProperty(""),
+		},
+	)
+}
+
+func storageSearchTool() (Entry, error) {
+	return toolEntry(
+		ToolNameStorageSearch,
+		storageSearchToolDescription,
+		[]string{"path", "args"},
+		map[string]any{
+			"path": map[string]any{
+				"type":        "string",
+				"minLength":   1,
+				"description": "Exact /artifacts/<artifact_id> path, or /memory/<store>/<file> path or glob. Memory globs use the same rules as storage_list and only search attached stores. Artifact globs are not supported.",
+			},
+			"args": map[string]any{
+				"type":        "array",
+				"minItems":    1,
+				"maxItems":    SearchMaxArgs,
+				"items":       map[string]any{"type": "string"},
+				"description": "Ripgrep arguments: -e PATTERN (repeatable), -F literal, -i ignore case, -w whole word, -x whole line, -v invert, -U multiline, -l matching paths, -c counts, and -A/-B/-C context (0–5 lines). Supply patterns with -e, totaling at most 1024 UTF-8 bytes. No other options or file operands. Example: [\"-i\", \"-C\", \"2\", \"-e\", \"deploy\"].",
+			},
+			"limit": map[string]any{
+				"type":        "integer",
+				"minimum":     1,
+				"maximum":     SearchMaxMatches,
+				"default":     SearchDefaultMatches,
+				"description": "Maximum entries across all files: matching lines or multiline blocks, or files in -l/-c modes. Context does not count toward this limit. A separate response budget also applies; counts are not capped by limit.",
+			},
+			"offset_line": map[string]any{
+				"type":        "integer",
+				"minimum":     1,
+				"description": "Starting line, default 1, for exact-file content searches. Cannot be combined with globs, -l, or -c.",
+			},
+		},
+	)
+}
+
+// memoryForceProperty describes skipping memory read tracking when replacing a file.
+func memoryForceProperty(prefix string) map[string]any {
+	return map[string]any{
+		"type": "boolean",
+		"description": prefix + "Replace the file even if it changed since you last read, wrote, uploaded, " +
+			"or downloaded it, or you never did. Use only after a conflict when replacing the latest content " +
+			"is intended. Defaults to false.",
+	}
+}
+
+func storageUploadTool(machineID map[string]any) (Entry, error) {
+	return toolEntry(
+		ToolNameStorageUpload,
+		storageUploadToolDescription,
+		[]string{"path", "source"},
+		map[string]any{
+			"path": map[string]any{
+				"type":      "string",
+				"minLength": 1,
+				"pattern":   "^(/artifacts|/memory/[^/]+/.+)$",
+				"description": "Exactly /artifacts to create a new artifact named after the source file, " +
+					"returned as /artifacts/<artifact_id> (do not add a name after /artifacts); " +
+					"or /memory/<store>/<file> to create or replace the memory file at exactly that path. " +
+					"Memory files may be empty; artifacts must be non-empty.",
+			},
+			"source": map[string]any{
+				"type":      "string",
+				"minLength": 1,
+				"description": "Path to a regular file of any type on the selected machine, at most 10 MiB. " +
+					"Relative paths use the machine working directory; ~ expands to the machine user's home directory.",
+			},
+			"machine_id": machineID,
+			"force":      memoryForceProperty("Memory only. "),
+			"view": map[string]any{
+				"type": "boolean",
+				"description": "Load the uploaded file into your context so you can see it, " +
+					"when it is a PNG, JPEG, GIF, or WebP image. Defaults to false. Artifacts only: path must be /artifacts.",
+			},
+		},
+	)
+}
+
+func storageDownloadTool(machineID map[string]any) (Entry, error) {
+	return toolEntry(
+		ToolNameStorageDownload,
+		storageDownloadToolDescription,
+		[]string{"path", "destination"},
+		map[string]any{
+			"path": map[string]any{
+				"type":        "string",
+				"minLength":   1,
+				"description": "Source path in Omnara: /artifacts/<artifact_id> or /memory/<store>/<path>.",
+			},
+			"destination": map[string]any{
+				"type":      "string",
+				"minLength": 1,
+				"description": "Destination path on the selected machine. " +
+					"The parent directory must exist; an existing destination is replaced atomically. " +
+					"Relative paths use the machine working directory; ~ expands to the machine user's home directory.",
+			},
+			"machine_id": machineID,
+		},
+	)
+}
+
+func (r Catalog) Lookup(name string) (Entry, bool) {
+	entry, ok := r.tools[name]
+	return entry, ok
+}
+
+func (r Catalog) Entries() []Entry {
+	entries := make([]Entry, 0, len(r.tools))
+	for _, entry := range r.tools {
+		entries = append(entries, entry)
+	}
+	slices.SortFunc(entries, func(left, right Entry) int {
+		return cmp.Compare(left.Name, right.Name)
+	})
+	return entries
+}
+
+func (entry Entry) validate() error {
+	if entry.Name == "" {
+		return errors.New("tool catalog entry name is required")
+	}
+	if !toolNamePattern.MatchString(entry.Name) {
+		return fmt.Errorf("tool catalog entry name %q must match %s", entry.Name, ToolNamePattern)
+	}
+	if UsesMCPRuntimeNamespace(entry.Name) {
+		return fmt.Errorf("built-in tool %q uses the reserved MCP tool namespace", entry.Name)
+	}
+	if entry.Description == "" {
+		return fmt.Errorf("tool %q description is required", entry.Name)
+	}
+	if err := toolpermission.ValidateModeDescriptors(entry.PermissionModes); err != nil {
+		return fmt.Errorf("tool %q permission modes: %w", entry.Name, err)
+	}
+	if _, err := toolpermission.ValidateSelection(
+		entry.DefaultPermission,
+		entry.PermissionModes,
+	); err != nil {
+		return fmt.Errorf("tool %q default permission: %w", entry.Name, err)
+	}
+	if len(entry.InputSchema) == 0 {
+		return fmt.Errorf("tool %q input schema is required", entry.Name)
+	}
+	if err := jsonschema.ValidateSchema(entry.InputSchema); err != nil {
+		return fmt.Errorf("tool %q input schema: %w", entry.Name, err)
+	}
+	return nil
+}
+
+func objectSchema(properties map[string]any, required []string) map[string]any {
+	if properties == nil {
+		properties = map[string]any{}
+	}
+	schema := map[string]any{
+		"type":                 ToolInputSchemaObject,
+		"properties":           properties,
+		"additionalProperties": false,
+	}
+	if len(required) > 0 {
+		schema["required"] = required
+	}
+	return schema
+}

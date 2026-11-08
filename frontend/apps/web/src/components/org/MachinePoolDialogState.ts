@@ -1,0 +1,499 @@
+import type {
+  CheckMachinePoolConnectionRequest,
+  CreateMachinePoolRequest,
+  MachinePool,
+  UpdateMachinePoolRequest,
+} from '@omnara/sdk'
+
+import {
+  recordFromSecretRows,
+  recordFromTextRows,
+  type SecretRow,
+  secretRowsFromRecord,
+  type TextRow,
+  textRowsFromRecord,
+} from '@/components/key-value/keyValueRows'
+import {
+  numberDraft,
+  optionalInt,
+  optionalIntOrNull,
+  stringOrUndefined,
+} from '@/components/machines/machineOverrides'
+import {
+  memoryGbDraft,
+  memoryGbDraftValid,
+  memoryGbToMb,
+  memoryGbToMbPreservingOriginal,
+} from '@/lib/machine-memory'
+import { providerOptionStrings } from '@/lib/provider-options'
+
+import {
+  isMachinePoolProvider,
+  machinePoolCoreProviderOptions,
+  type MachinePoolProvider,
+  machinePoolProviderDefinitions,
+} from './machinePoolProviders'
+import {
+  aggregateFitsInt32,
+  memoryAggregateFitsInt32,
+  nonNegativeInt32,
+  positiveInt32,
+} from './machinePoolValidation'
+
+export const machinePoolProviders = Object.entries(machinePoolProviderDefinitions)
+  .map(([value, definition]) => ({ value, label: definition.label }))
+  .sort((a, b) => a.label.localeCompare(b.label))
+
+export function machinePoolProviderLabel(provider: string) {
+  return machinePoolProviders.find((option) => option.value === provider)?.label ?? provider
+}
+
+export interface MachinePoolFormValues {
+  name: string
+  description: string
+  provider: MachinePoolProvider
+  providerScope: string
+  image: string
+  location: string
+  startupScript: string
+  cwd: string
+  envRows: TextRow[]
+  secretEnvRows: SecretRow[]
+  cpu: string
+  memoryGb: string
+  maxMachines: string
+  /** Optional caps; empty derives from machine size × max machines. */
+  maxTotalCpu: string
+  maxTotalMemoryGb: string
+  minMachineCpu: string
+  minMachineMemoryGb: string
+  maxMachineCpu: string
+  maxMachineMemoryGb: string
+  deleteAfterIdleMinutes: string
+  /** Secret id; '' until one is selected. */
+  secretId: string
+  projectGrantIds: string[]
+  runtimeProtectionEnabled: boolean
+}
+
+export type MachinePoolFormMode = 'create' | 'tenant-edit' | 'cluster-edit'
+
+export type MachinePoolFormSetValue = <K extends keyof MachinePoolFormValues>(
+  key: K,
+  value: MachinePoolFormValues[K],
+) => void
+
+export const machinePoolFormDefaults: MachinePoolFormValues = {
+  name: '',
+  description: '',
+  provider: 'blaxel',
+  providerScope: '',
+  image: '',
+  location: machinePoolProviderDefinitions.blaxel.location?.defaultValue ?? '',
+  startupScript: '',
+  cwd: '',
+  envRows: [],
+  secretEnvRows: [],
+  cpu: '1',
+  memoryGb: '1',
+  maxMachines: '3',
+  maxTotalCpu: '',
+  maxTotalMemoryGb: '',
+  minMachineCpu: '',
+  minMachineMemoryGb: '',
+  maxMachineCpu: '',
+  maxMachineMemoryGb: '',
+  deleteAfterIdleMinutes: '',
+  secretId: '',
+  projectGrantIds: [],
+  runtimeProtectionEnabled: false,
+}
+
+/** Placeholder for an aggregate cap input: machine size × max machines. */
+export function derivedTotalCapPlaceholder(perMachine: string, maxMachines: string) {
+  if (!positiveInt32(perMachine) || !nonNegativeInt32(maxMachines)) return undefined
+  if (!aggregateFitsInt32(perMachine, maxMachines)) return undefined
+  return String(Number(perMachine) * Number(maxMachines))
+}
+
+export function derivedMemoryTotalCapPlaceholder(perMachineGb: string, maxMachines: string) {
+  if (!memoryGbDraftValid(perMachineGb) || !nonNegativeInt32(maxMachines)) return undefined
+  const perMachineMb = memoryGbToMb(perMachineGb)
+  if (!memoryAggregateFitsInt32(perMachineGb, maxMachines)) return undefined
+  return memoryGbDraft(perMachineMb * Number(maxMachines))
+}
+
+export function machinePoolFormAfterProviderChange(
+  values: MachinePoolFormValues,
+  provider: MachinePoolProvider,
+): MachinePoolFormValues {
+  if (provider === values.provider) return values
+  const currentDefinition = machinePoolProviderDefinitions[values.provider]
+  const nextDefinition = machinePoolProviderDefinitions[provider]
+  return {
+    ...values,
+    provider,
+    providerScope: '',
+    image: '',
+    location: nextDefinition.location?.defaultValue ?? '',
+    cpu:
+      nextDefinition.resources.defaultCpu ??
+      (currentDefinition.resources.cpu === nextDefinition.resources.cpu &&
+      currentDefinition.resources.defaultCpu === undefined
+        ? values.cpu
+        : machinePoolFormDefaults.cpu),
+    memoryGb:
+      nextDefinition.resources.defaultMemoryGb ??
+      (currentDefinition.resources.memoryMb === nextDefinition.resources.memoryMb &&
+      currentDefinition.resources.defaultMemoryGb === undefined
+        ? values.memoryGb
+        : machinePoolFormDefaults.memoryGb),
+    maxTotalCpu: '',
+    maxTotalMemoryGb: '',
+    minMachineCpu: '',
+    minMachineMemoryGb: '',
+    maxMachineCpu: '',
+    maxMachineMemoryGb: '',
+    secretId: '',
+  }
+}
+
+export function machinePoolCreateRequest(values: MachinePoolFormValues): CreateMachinePoolRequest {
+  const cpu = Number(values.cpu)
+  const memoryMb = memoryGbToMb(values.memoryGb)
+  const maxMachines = Number(values.maxMachines)
+  const common = {
+    name: values.name,
+    description: stringOrUndefined(values.description),
+    provider_auth_secret_id: values.secretId,
+    max_total_machines: maxMachines,
+    default_machine_env: recordFromTextRows(values.envRows),
+    default_machine_secret_env: recordFromSecretRows(values.secretEnvRows),
+    default_cwd: stringOrUndefined(values.cwd),
+    runtime_protection_enabled: values.runtimeProtectionEnabled,
+    delete_after_idle_minutes: optionalInt(values.deleteAfterIdleMinutes),
+  }
+  const startupScript =
+    values.startupScript.trim() === '' ? {} : { startup_script: values.startupScript }
+  switch (values.provider) {
+    case 'agent37':
+    case 'arker':
+    case 'freestyle':
+    case 'modal':
+    case 'tenki':
+    case 'unikraft':
+      return {
+        ...common,
+        provider: values.provider,
+        provider_config:
+          values.provider === 'modal' ? { app: values.providerScope.trim() } : undefined,
+        default_machine_cpu: cpu,
+        default_machine_memory_mb: memoryMb,
+        default_machine_provider_options: {
+          ...machinePoolCoreProviderOptions(values.provider, values.image, values.location),
+          ...startupScript,
+        },
+        max_total_cpu: optionalInt(values.maxTotalCpu) ?? cpu * maxMachines,
+        max_total_memory_mb: optionalMemoryMb(values.maxTotalMemoryGb) ?? memoryMb * maxMachines,
+        min_machine_cpu: optionalInt(values.minMachineCpu),
+        min_machine_memory_mb: optionalMemoryMb(values.minMachineMemoryGb),
+        max_machine_cpu: optionalInt(values.maxMachineCpu) ?? cpu,
+        max_machine_memory_mb: optionalMemoryMb(values.maxMachineMemoryGb) ?? memoryMb,
+      }
+    case 'blaxel':
+      return {
+        ...common,
+        provider: 'blaxel',
+        default_machine_memory_mb: memoryMb,
+        default_machine_provider_options: {
+          ...machinePoolCoreProviderOptions(values.provider, values.image, values.location),
+          ...startupScript,
+        },
+        provider_config: { workspace: values.providerScope.trim() },
+        max_total_memory_mb: optionalMemoryMb(values.maxTotalMemoryGb) ?? memoryMb * maxMachines,
+        min_machine_memory_mb: optionalMemoryMb(values.minMachineMemoryGb),
+        max_machine_memory_mb: optionalMemoryMb(values.maxMachineMemoryGb) ?? memoryMb,
+      }
+    case 'boxd':
+    case 'createos':
+    case 'daytona':
+    case 'e2b':
+    case 'superserve':
+      return {
+        ...common,
+        provider: values.provider,
+        default_machine_provider_options: {
+          ...machinePoolCoreProviderOptions(values.provider, values.image, values.location),
+          ...startupScript,
+        },
+        max_total_cpu: optionalInt(values.maxTotalCpu) ?? cpu * maxMachines,
+        max_total_memory_mb: optionalMemoryMb(values.maxTotalMemoryGb) ?? memoryMb * maxMachines,
+        min_machine_cpu: optionalInt(values.minMachineCpu),
+        min_machine_memory_mb: optionalMemoryMb(values.minMachineMemoryGb),
+        max_machine_cpu: optionalInt(values.maxMachineCpu) ?? cpu,
+        max_machine_memory_mb: optionalMemoryMb(values.maxMachineMemoryGb) ?? memoryMb,
+      }
+  }
+}
+
+export function machinePoolConnectionCheckRequest(
+  values: MachinePoolFormValues,
+  savedProviderConfig?: MachinePool['provider_config'],
+): CheckMachinePoolConnectionRequest {
+  const request = machinePoolCreateRequest(values)
+  const location = machinePoolProviderDefinitions[values.provider].location?.key
+  return {
+    provider: request.provider,
+    provider_auth_secret_id: request.provider_auth_secret_id,
+    provider_config: { ...savedProviderConfig, ...request.provider_config },
+    default_machine_provider_options:
+      location === undefined
+        ? {}
+        : { [location]: request.default_machine_provider_options[location] },
+  }
+}
+
+export function machinePoolFormFromPool(pool: MachinePool): MachinePoolFormValues | null {
+  if (!isMachinePoolProvider(pool.provider)) return null
+  const provider = pool.provider
+  const definition = machinePoolProviderDefinitions[provider]
+  const options = providerOptionStrings(pool.default_machine_provider_options)
+  const cpuValue =
+    definition.resources.cpu === 'provider-resolved'
+      ? pool.max_machine_cpu
+      : pool.default_machine_cpu
+  const memoryValue =
+    definition.resources.memoryMb === 'provider-resolved'
+      ? pool.max_machine_memory_mb
+      : pool.default_machine_memory_mb
+  return {
+    name: pool.name,
+    description: pool.description,
+    provider,
+    providerScope:
+      (definition.scope
+        ? providerOptionStrings(pool.provider_config)[definition.scope.key]
+        : undefined) ?? '',
+    image: options[definition.resource.key] ?? '',
+    location: definition.location ? (options[definition.location.key] ?? '') : '',
+    startupScript: options.startup_script ?? '',
+    cwd: pool.default_cwd,
+    envRows: textRowsFromRecord(pool.default_machine_env),
+    secretEnvRows: secretRowsFromRecord(pool.default_machine_secret_env),
+    cpu: numberDraft(cpuValue) || machinePoolFormDefaults.cpu,
+    memoryGb: memoryGbDraft(memoryValue) || machinePoolFormDefaults.memoryGb,
+    maxMachines: numberDraft(pool.max_total_machines),
+    maxTotalCpu: numberDraft(pool.max_total_cpu),
+    maxTotalMemoryGb: memoryGbDraft(pool.max_total_memory_mb),
+    minMachineCpu: numberDraft(pool.min_machine_cpu),
+    minMachineMemoryGb: memoryGbDraft(pool.min_machine_memory_mb),
+    maxMachineCpu:
+      definition.resources.cpu === 'provider-resolved' ? '' : numberDraft(pool.max_machine_cpu),
+    maxMachineMemoryGb:
+      definition.resources.memoryMb === 'provider-resolved'
+        ? ''
+        : memoryGbDraft(pool.max_machine_memory_mb),
+    deleteAfterIdleMinutes: numberDraft(pool.delete_after_idle_minutes),
+    secretId: pool.provider_auth_secret_id ?? '',
+    projectGrantIds: [],
+    runtimeProtectionEnabled: pool.runtime_protection_enabled,
+  }
+}
+
+export function machinePoolUpdateRequest(
+  pool: MachinePool,
+  values: MachinePoolFormValues,
+): UpdateMachinePoolRequest {
+  if (pool.provider !== values.provider) throw new Error('machine pool provider cannot be changed')
+  if (pool.management_kind === 'cluster') return clusterMachinePoolUpdateRequest(pool, values)
+  const definition = machinePoolProviderDefinitions[values.provider]
+  const editableOptionKeys = new Set([definition.resource.key, 'startup_script'])
+  if (definition.location) editableOptionKeys.add(definition.location.key)
+  const defaultMachineProviderOptions = Object.fromEntries(
+    Object.entries(pool.default_machine_provider_options).filter(
+      ([key]) => !editableOptionKeys.has(key),
+    ),
+  )
+  if (values.image.trim() !== '') {
+    defaultMachineProviderOptions[definition.resource.key] = values.image.trim()
+  }
+  if (definition.location && values.location.trim() !== '') {
+    defaultMachineProviderOptions[definition.location.key] = values.location.trim()
+  }
+  if (values.startupScript.trim() !== '') {
+    defaultMachineProviderOptions.startup_script = values.startupScript
+  }
+  const cpu = Number(values.cpu)
+  const originalMemoryMb =
+    definition.resources.memoryMb === 'provider-resolved'
+      ? pool.max_machine_memory_mb
+      : pool.default_machine_memory_mb
+  const memoryMb = memoryMbFromDraft(values.memoryGb, originalMemoryMb)
+  const maxMachines = Number(values.maxMachines)
+  const common = {
+    name: values.name,
+    description: values.description.trim(),
+    default_machine_env: recordFromTextRows(values.envRows) ?? {},
+    default_machine_secret_env: recordFromSecretRows(values.secretEnvRows) ?? {},
+    default_machine_provider_options: defaultMachineProviderOptions,
+    default_cwd: values.cwd.trim(),
+    provider_auth_secret_id: values.secretId,
+    runtime_protection_enabled: values.runtimeProtectionEnabled,
+    max_total_machines: maxMachines,
+    delete_after_idle_minutes: optionalIntOrNull(values.deleteAfterIdleMinutes),
+  }
+  switch (values.provider) {
+    case 'agent37':
+    case 'arker':
+    case 'freestyle':
+    case 'modal':
+    case 'tenki':
+    case 'unikraft':
+      return {
+        ...common,
+        provider_config:
+          values.provider === 'modal'
+            ? { ...pool.provider_config, app: values.providerScope.trim() }
+            : undefined,
+        default_machine_cpu: cpu,
+        default_machine_memory_mb: memoryMb,
+        max_total_cpu: optionalInt(values.maxTotalCpu) ?? cpu * maxMachines,
+        max_total_memory_mb:
+          optionalMemoryMbPreservingOriginal(values.maxTotalMemoryGb, pool.max_total_memory_mb) ??
+          memoryMb * maxMachines,
+        min_machine_cpu: optionalIntOrNull(values.minMachineCpu),
+        min_machine_memory_mb: optionalMemoryMbOrNull(
+          values.minMachineMemoryGb,
+          pool.min_machine_memory_mb,
+        ),
+        max_machine_cpu: optionalInt(values.maxMachineCpu) ?? cpu,
+        max_machine_memory_mb:
+          optionalMemoryMbPreservingOriginal(
+            values.maxMachineMemoryGb,
+            pool.max_machine_memory_mb,
+          ) ?? memoryMb,
+      }
+    case 'blaxel':
+      return {
+        ...common,
+        default_machine_memory_mb: memoryMb,
+        provider_config: { ...pool.provider_config, workspace: values.providerScope.trim() },
+        max_total_memory_mb:
+          optionalMemoryMbPreservingOriginal(values.maxTotalMemoryGb, pool.max_total_memory_mb) ??
+          memoryMb * maxMachines,
+        min_machine_memory_mb: optionalMemoryMbOrNull(
+          values.minMachineMemoryGb,
+          pool.min_machine_memory_mb,
+        ),
+        max_machine_memory_mb:
+          optionalMemoryMbPreservingOriginal(
+            values.maxMachineMemoryGb,
+            pool.max_machine_memory_mb,
+          ) ?? memoryMb,
+      }
+    case 'boxd':
+    case 'createos':
+    case 'daytona':
+    case 'e2b':
+    case 'superserve':
+      return {
+        ...common,
+        max_total_cpu: optionalInt(values.maxTotalCpu) ?? cpu * maxMachines,
+        max_total_memory_mb:
+          optionalMemoryMbPreservingOriginal(values.maxTotalMemoryGb, pool.max_total_memory_mb) ??
+          memoryMb * maxMachines,
+        min_machine_cpu: optionalIntOrNull(values.minMachineCpu),
+        min_machine_memory_mb: optionalMemoryMbOrNull(
+          values.minMachineMemoryGb,
+          pool.min_machine_memory_mb,
+        ),
+        max_machine_cpu: optionalInt(values.maxMachineCpu) ?? cpu,
+        max_machine_memory_mb:
+          optionalMemoryMbPreservingOriginal(
+            values.maxMachineMemoryGb,
+            pool.max_machine_memory_mb,
+          ) ?? memoryMb,
+      }
+  }
+}
+
+function clusterMachinePoolUpdateRequest(
+  pool: MachinePool,
+  values: MachinePoolFormValues,
+): UpdateMachinePoolRequest {
+  const definition = machinePoolProviderDefinitions[values.provider]
+  const cpu = Number(values.cpu)
+  const originalMemoryMb =
+    definition.resources.memoryMb === 'provider-resolved'
+      ? pool.max_machine_memory_mb
+      : pool.default_machine_memory_mb
+  const memoryMb = memoryMbFromDraft(values.memoryGb, originalMemoryMb)
+  const common = {
+    default_machine_env: recordFromTextRows(values.envRows) ?? {},
+    default_machine_secret_env: recordFromSecretRows(values.secretEnvRows) ?? {},
+    delete_after_idle_minutes: optionalIntOrNull(values.deleteAfterIdleMinutes),
+    min_machine_memory_mb: optionalMemoryMbOrNull(
+      values.minMachineMemoryGb,
+      pool.min_machine_memory_mb,
+    ),
+  }
+  switch (values.provider) {
+    case 'agent37':
+    case 'arker':
+    case 'freestyle':
+    case 'modal':
+    case 'tenki':
+    case 'unikraft':
+      return {
+        ...common,
+        default_machine_cpu: cpu,
+        default_machine_memory_mb: memoryMb,
+        min_machine_cpu: optionalIntOrNull(values.minMachineCpu),
+        max_machine_cpu: optionalInt(values.maxMachineCpu) ?? cpu,
+        max_machine_memory_mb:
+          optionalMemoryMbPreservingOriginal(
+            values.maxMachineMemoryGb,
+            pool.max_machine_memory_mb,
+          ) ?? memoryMb,
+      }
+    case 'blaxel':
+      return {
+        ...common,
+        default_machine_memory_mb: memoryMb,
+        max_machine_memory_mb:
+          optionalMemoryMbPreservingOriginal(
+            values.maxMachineMemoryGb,
+            pool.max_machine_memory_mb,
+          ) ?? memoryMb,
+      }
+    case 'boxd':
+    case 'createos':
+    case 'daytona':
+    case 'e2b':
+    case 'superserve':
+      return {
+        ...common,
+        min_machine_cpu: optionalIntOrNull(values.minMachineCpu),
+        max_machine_cpu: cpu,
+        max_machine_memory_mb: memoryMb,
+      }
+  }
+}
+
+function memoryMbFromDraft(value: string, originalMemoryMb: number | null) {
+  return originalMemoryMb === null
+    ? memoryGbToMb(value)
+    : memoryGbToMbPreservingOriginal(value, originalMemoryMb)
+}
+
+function optionalMemoryMb(value: string) {
+  return value.trim() === '' ? undefined : memoryGbToMb(value)
+}
+
+function optionalMemoryMbPreservingOriginal(value: string, originalMemoryMb: number | null) {
+  return value.trim() === '' ? undefined : memoryMbFromDraft(value, originalMemoryMb)
+}
+
+function optionalMemoryMbOrNull(value: string, originalMemoryMb: number | null) {
+  return optionalMemoryMbPreservingOriginal(value, originalMemoryMb) ?? null
+}

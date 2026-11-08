@@ -1,0 +1,167 @@
+package modelcontext
+
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"strings"
+	"testing"
+)
+
+func budgetFixtureJSON(t testing.TB, value any) json.RawMessage {
+	t.Helper()
+	body, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal budget fixture JSON: %v", err)
+	}
+	return body
+}
+
+func TestPreparedRequestBudgetChargesLiteralTextAndMediaFallback(t *testing.T) {
+	data := bytes.Repeat([]byte("same-as-user-text"), 512)
+	encoded := base64.StdEncoding.EncodeToString(data)
+	for _, tc := range []struct {
+		kind   string
+		block  any
+		tokens int
+	}{
+		{AttachmentKindImage, map[string]any{
+			"type": "image_url", "image_url": map[string]string{"url": "data:image/png;base64," + encoded},
+		}, DefaultImageTokenEstimate},
+		{AttachmentKindDocument, map[string]any{
+			"type": "file", "file": map[string]string{"file_data": "data:application/pdf;base64," + encoded},
+		}, DefaultBinaryDocumentTokenEstimate},
+	} {
+		t.Run(tc.kind, func(t *testing.T) {
+			body := budgetFixtureJSON(t, map[string]any{"messages": []map[string]any{{
+				"role": "user", "content": []any{map[string]string{"type": "text", "text": encoded}, tc.block},
+			}}})
+			media := []RenderedMedia{{
+				Representation: MediaRepresentationInline, Media: ResolvedMedia{Kind: tc.kind, Data: data},
+			}}
+			estimate := EstimatePreparedRequest(body, media)
+			minimum := len(encoded)/4 + tc.tokens
+			if estimate < minimum || estimate >= minimum+200 {
+				t.Fatalf("estimate = %d, want literal text plus %d media tokens and framing", estimate, tc.tokens)
+			}
+		})
+	}
+}
+
+func TestEstimatePreparedRequestExcludesDeferredToolsUntilReferenced(t *testing.T) {
+	description := strings.Repeat("deferred ", 512)
+	largeSchema := map[string]any{
+		"type":       "object",
+		"properties": map[string]any{"query": map[string]string{"type": "string", "description": description}},
+	}
+	loadedTool := map[string]any{"name": "get_time", "input_schema": map[string]string{"type": "object"}}
+	deferredTool := map[string]any{"name": "get_weather", "input_schema": largeSchema, "defer_loading": true}
+	unloaded := budgetFixtureJSON(t, map[string]any{
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+		"tools":    []map[string]any{loadedTool, deferredTool},
+	})
+	withoutDeferred := budgetFixtureJSON(t, map[string]any{
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+		"tools":    []map[string]any{loadedTool},
+	})
+	if got, want := EstimatePreparedRequest(unloaded, nil), EstimatePreparedRequest(withoutDeferred, nil); got != want {
+		t.Fatalf("unloaded deferred tool estimate = %d, want %d (deferred schema excluded)", got, want)
+	}
+
+	referenced := budgetFixtureJSON(t, map[string]any{
+		"messages": []map[string]any{{"role": "user", "content": []map[string]any{{
+			"type":        "tool_result",
+			"tool_use_id": "toolu_1",
+			"content":     []map[string]string{{"type": "tool_reference", "tool_name": "get_weather"}},
+		}}}},
+		"tools": []map[string]any{loadedTool, deferredTool},
+	})
+	minimum := EstimatePreparedRequest(withoutDeferred, nil) + len(description)/8
+	if got := EstimatePreparedRequest(referenced, nil); got <= minimum {
+		t.Fatalf("referenced deferred tool estimate = %d, want the loaded schema charged", got)
+	}
+}
+
+func TestEstimatePreparedRequestDoesNotInferAbsentMedia(t *testing.T) {
+	body := budgetFixtureJSON(t, map[string]any{"input": "small textual fallback"})
+	withNoRenderedMedia := EstimatePreparedRequest(body, nil)
+	if want := (len(body) + 3) / 4; withNoRenderedMedia != want {
+		t.Fatalf("estimate = %d, want body-only estimate %d", withNoRenderedMedia, want)
+	}
+}
+
+func TestEstimatePreparedRequestAccountsForDenseScripts(t *testing.T) {
+	for _, text := range []string{"你好世界", "안녕하세요", "こんにちは", "カタカナ"} {
+		t.Run(text, func(t *testing.T) {
+			body := budgetFixtureJSON(t, map[string]string{"input": strings.Repeat(text, 1_000)})
+			if got, minimum := EstimatePreparedRequest(body, nil), len([]rune(text))*1_000; got < minimum {
+				t.Fatalf("estimate = %d, want at least %d for dense text", got, minimum)
+			}
+		})
+	}
+}
+
+func TestModelWindowComputesExactUsableInputBoundary(t *testing.T) {
+	window := ModelWindow{
+		ContextTokens:       10_000,
+		OutputReserveTokens: 2_000,
+		SafetyMarginTokens:  1_000,
+	}
+	if got := window.UsableInputTokens(); got != 7_000 {
+		t.Fatalf("usable input = %d, want 7000", got)
+	}
+}
+
+func TestEstimatePreparedRequestCountsOnlyPresentMediaInBodiesAndSuffixes(t *testing.T) {
+	data := bytes.Repeat([]byte("inline-image"), 512)
+	encoded := base64.StdEncoding.EncodeToString(data)
+	media := []RenderedMedia{
+		{Representation: MediaRepresentationInline, TokenEstimate: 900,
+			Media: ResolvedMedia{Kind: AttachmentKindImage, Data: data}},
+		{Representation: MediaRepresentationInline, TokenEstimate: 900,
+			Media: ResolvedMedia{Kind: AttachmentKindImage, Data: data}},
+		{Representation: MediaRepresentationInline, TokenEstimate: 900,
+			Media: ResolvedMedia{Kind: AttachmentKindImage, Data: []byte("absent image")}},
+	}
+	for _, tc := range []struct{ key, item string }{
+		{"messages", `{"role":"user","content":[{"type":"image",` +
+			`"source":{"type":"base64","data":"` + encoded + `"}}]}`},
+		{"messages", `{"role":"user","content":[{"type":"tool_result","content":[{"type":"document",` +
+			`"source":{"type":"base64","data":"` + encoded + `"}}]}]}`},
+		{"input", `{"type":"function_call_output","output":[{"type":"input_image",` +
+			`"image_url":"data:image/png;base64,` + encoded + `"}]}`},
+		{"messages", `{"role":"user","content":[{"type":"image_url",` +
+			`"image_url":{"url":"data:image/png;base64,` + encoded + `"}}]}`},
+		{"input", `{"role":"user","content":[{"type":"input_file",` +
+			`"file_data":"data:application/pdf;base64,` + encoded + `"}]}`},
+		{"messages", `{"role":"user","content":[{"type":"file",` +
+			`"file":{"file_data":"data:application/pdf;base64,` + encoded + `"}}]}`},
+	} {
+		for count := 1; count <= 2; count++ {
+			items := "[" + strings.TrimSuffix(strings.Repeat(tc.item+",", count), ",") + "]"
+			for _, body := range []string{items, `{"` + tc.key + `":` + items + `}`} {
+				estimate := EstimatePreparedRequest(json.RawMessage(body), media)
+				if estimate < count*900 || estimate >= count*900+200 {
+					t.Fatalf("estimate = %d, want %d media occurrences plus framing", estimate, count)
+				}
+			}
+		}
+	}
+	for _, item := range []string{
+		`{"role":"user","content":"` + encoded + `"}`,
+		`{"role":"user","content":[{"type":"text","text":"data:image/png;base64,` + encoded + `"}]}`,
+		`{"role":"assistant","tool_calls":[{"function":{"arguments":{"type":"image_url",` +
+			`"image_url":{"url":"data:image/png;base64,` + encoded + `"}}}}]}`,
+		`{"role":"assistant","content":[{"type":"tool_use","input":{"type":"image",` +
+			`"source":{"type":"base64","data":"` + encoded + `"}}}]}`,
+	} {
+		items := "[" + item + "]"
+		for _, body := range []string{items, `{"messages":` + items + `}`, `{"tools":` + items + `}`} {
+			withMedia := EstimatePreparedRequest(json.RawMessage(body), media)
+			withoutMedia := EstimatePreparedRequest(json.RawMessage(body), nil)
+			if withMedia != withoutMedia {
+				t.Fatalf("ordinary text or tool input changed media estimate: %d != %d", withMedia, withoutMedia)
+			}
+		}
+	}
+}

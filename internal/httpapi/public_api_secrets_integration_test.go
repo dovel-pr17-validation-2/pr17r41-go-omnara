@@ -1,0 +1,458 @@
+//go:build integration
+
+package httpapi
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/omnara-ai/omnara/internal/authz"
+	"github.com/omnara-ai/omnara/internal/publicid"
+	"github.com/omnara-ai/omnara/internal/storage"
+	"github.com/omnara-ai/omnara/internal/storage/identitystore"
+	"github.com/omnara-ai/omnara/internal/storage/management"
+	"github.com/omnara-ai/omnara/internal/storage/secretstore"
+	"github.com/omnara-ai/omnara/internal/testutil"
+	"github.com/omnara-ai/omnara/internal/testutil/storagetest"
+	"github.com/stretchr/testify/require"
+)
+
+func TestPublicSecretKindFiltersBeforePagination(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+	handler := newIntegrationServer(pool)
+	project := bootstrapPublicHTTPProject(t, handler, "secret-kind-filter")
+
+	aws := requestJSONWithHeaders(t, handler, http.MethodPost,
+		"/api/v1/orgs/"+project.OrgID+"/secrets",
+		`{"owner":{"kind":"project","project_id":"`+project.ProjectID+`"},"name":"z-aws","material":{"kind":"aws_credentials","access_key_id":"AKIAEXAMPLE","secret_access_key":"secret"}}`,
+		"", http.StatusCreated, authHeaders(project.AdminToken))
+	firstGeneric := requestJSONWithHeaders(t, handler, http.MethodPost,
+		"/api/v1/orgs/"+project.OrgID+"/secrets",
+		`{"owner":{"kind":"project","project_id":"`+project.ProjectID+`"},"name":"a-generic","material":{"kind":"generic","value":"first"}}`,
+		"", http.StatusCreated, authHeaders(project.AdminToken))
+	requestJSONWithHeaders(t, handler, http.MethodPost,
+		"/api/v1/orgs/"+project.OrgID+"/secrets",
+		`{"owner":{"kind":"project","project_id":"`+project.ProjectID+`"},"name":"b-generic","material":{"kind":"generic","value":"second"}}`,
+		"", http.StatusCreated, authHeaders(project.AdminToken))
+
+	canonical := requestJSONWithHeaders(t, handler, http.MethodGet,
+		"/api/v1/orgs/"+project.OrgID+"/secrets?kind=aws_credentials&sort=name&limit=1",
+		"", "", http.StatusOK, authHeaders(project.AdminToken))
+	canonicalData := testutil.RequireType[[]any](t, canonical["data"])
+	if len(canonicalData) != 1 || testutil.RequireType[map[string]any](t, canonicalData[0])["id"] != aws["id"] {
+		t.Fatalf("canonical kind filter = %+v, want AWS secret", canonical)
+	}
+	if canonical["next_cursor"] != nil {
+		t.Fatalf("canonical kind filter next_cursor = %v, want nil", canonical["next_cursor"])
+	}
+
+	available := requestJSONWithHeaders(t, handler, http.MethodGet,
+		project.ProjectPath+"/secrets?kind=aws_credentials&sort=name&limit=1",
+		"", "", http.StatusOK, authHeaders(project.AdminToken))
+	availableData := testutil.RequireType[[]any](t, available["data"])
+	if len(availableData) != 1 ||
+		testutil.RequireType[map[string]any](
+			t, testutil.RequireType[map[string]any](t, availableData[0])["secret"],
+		)["id"] != aws["id"] {
+		t.Fatalf("project kind filter = %+v, want AWS secret", available)
+	}
+	if available["next_cursor"] != nil {
+		t.Fatalf("project kind filter next_cursor = %v, want nil", available["next_cursor"])
+	}
+
+	genericPage := requestJSONWithHeaders(t, handler, http.MethodGet,
+		project.ProjectPath+"/secrets?kind=generic&sort=name&limit=1",
+		"", "", http.StatusOK, authHeaders(project.AdminToken))
+	genericData := testutil.RequireType[[]any](t, genericPage["data"])
+	if len(genericData) != 1 ||
+		testutil.RequireType[map[string]any](
+			t, testutil.RequireType[map[string]any](t, genericData[0])["secret"],
+		)["id"] != firstGeneric["id"] {
+		t.Fatalf("first generic page = %+v, want first generic secret", genericPage)
+	}
+	nextCursor, ok := genericPage["next_cursor"].(string)
+	if !ok || nextCursor == "" {
+		t.Fatalf("first generic page next_cursor = %v, want non-empty cursor", genericPage["next_cursor"])
+	}
+	requestJSONWithHeaders(t, handler, http.MethodGet,
+		project.ProjectPath+"/secrets?kind=aws_credentials&sort=name&limit=1&cursor="+url.QueryEscape(nextCursor),
+		"", "", http.StatusBadRequest, authHeaders(project.AdminToken))
+}
+
+func TestPublicCanonicalSecretsAndProjectAvailability(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+	handler := newIntegrationServer(pool)
+	store := integrationStoreForHandler(t, handler)
+	project := bootstrapPublicHTTPProject(t, handler, "canonical-secrets")
+	for name, body := range map[string]string{
+		"missing owner":                `{"name":"bad","material":{"kind":"generic","value":"x"}}`,
+		"missing project id":           `{"owner":{"kind":"project"},"name":"bad","material":{"kind":"generic","value":"x"}}`,
+		"user id not allowed":          `{"owner":{"kind":"user","user_id":"usr_agjaaaaaaaaaaaaaaaaaaaaaae"},"name":"bad","material":{"kind":"generic","value":"x"}}`,
+		"incomplete refresh":           `{"owner":{"kind":"org"},"name":"bad","material":{"kind":"oauth_token_set","access_token":"access","refresh":{"refresh_token":"refresh"}}}`,
+		"aws external id without role": `{"owner":{"kind":"org"},"name":"bad","material":{"kind":"aws_credentials","access_key_id":"AKIAEXAMPLE","secret_access_key":"secret","external_id":"external"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			requestJSONWithHeaders(t, handler, http.MethodPost, "/api/v1/orgs/"+project.OrgID+"/secrets",
+				body, "", http.StatusBadRequest, authHeaders(project.AdminToken))
+		})
+	}
+
+	second := requestJSONWithHeaders(t, handler, http.MethodPost,
+		"/api/v1/orgs/"+project.OrgID+"/projects", `{"name":"Consumer"}`,
+		"canonical-secret-consumer", http.StatusCreated, authHeaders(project.AdminToken))
+	secondID := testutil.RequireType[string](t, second["id"])
+	secondUUID := mustPublicHTTPID(t, publicid.KindProject, secondID)
+	secondPath := "/api/v1/orgs/" + project.OrgID + "/projects/" + secondID
+	otherOrg := requestJSONWithHeaders(t, handler, http.MethodPost,
+		"/api/v1/orgs", `{"name":"Other Secret Owner Org"}`,
+		"canonical-secret-other-org", http.StatusCreated, authHeaders(project.AdminToken))
+	otherProject := testutil.RequireType[map[string]any](t, otherOrg["project"])
+	requestJSONWithHeaders(t, handler, http.MethodPost,
+		"/api/v1/orgs/"+project.OrgID+"/secrets",
+		`{"owner":{"kind":"project","project_id":"`+testutil.RequireType[string](t, otherProject["id"])+`"},"name":"cross-org","material":{"kind":"generic","value":"x"}}`,
+		"", http.StatusForbidden, authHeaders(project.AdminToken))
+
+	orgSecret := requestJSONWithHeaders(t, handler, http.MethodPost,
+		"/api/v1/orgs/"+project.OrgID+"/secrets",
+		`{"owner":{"kind":"org"},"name":"org-key","metadata":{"env":"prod"},"material":{"kind":"generic","value":"org-secret-value"}}`,
+		"", http.StatusCreated, authHeaders(project.AdminToken))
+	orgSecretID := testutil.RequireType[string](t, orgSecret["id"])
+	if orgSecret["management_kind"] != string(management.Tenant) {
+		t.Fatalf("org secret management_kind = %v, want tenant", orgSecret["management_kind"])
+	}
+	assertSecretOwner(t, orgSecret, secretstore.SecretOwnerOrg, "")
+	assertSecretRedacted(t, orgSecret)
+	gotOrg := requestJSONWithHeaders(t, handler, http.MethodGet,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+orgSecretID,
+		"", "", http.StatusOK, authHeaders(project.AdminToken))
+	assertSecretOwner(t, gotOrg, secretstore.SecretOwnerOrg, "")
+	updatedOrg := requestJSONWithHeaders(t, handler, http.MethodPatch,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+orgSecretID,
+		`{"metadata":{"env":"production"}}`, "", http.StatusOK, authHeaders(project.AdminToken))
+	if testutil.RequireType[map[string]any](t, updatedOrg["metadata"])["env"] != "production" {
+		t.Fatalf("org update = %+v", updatedOrg)
+	}
+	rotatedOrg := requestJSONWithHeaders(t, handler, http.MethodPost,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+orgSecretID+"/versions",
+		`{"material":{"kind":"generic","value":"rotated-org-value"}}`, "", http.StatusOK, authHeaders(project.AdminToken))
+	if rotatedOrg["current_version_number"] != float64(2) {
+		t.Fatalf("org rotation = %+v", rotatedOrg)
+	}
+	awsSecret := requestJSONWithHeaders(t, handler, http.MethodPost,
+		"/api/v1/orgs/"+project.OrgID+"/secrets",
+		`{"owner":{"kind":"org"},"name":"aws-read-only","material":{"kind":"aws_credentials","access_key_id":"AKIAEXAMPLE","secret_access_key":"secret","session_token":"session-token","role_arn":"arn:aws:iam::123456789012:role/ReadOnly"}}`,
+		"", http.StatusCreated, authHeaders(project.AdminToken))
+	if awsSecret["kind"] != "aws_credentials" {
+		t.Fatalf("aws secret = %+v", awsSecret)
+	}
+	assertSecretRedacted(t, awsSecret)
+
+	projectSecret := requestJSONWithHeaders(t, handler, http.MethodPost,
+		"/api/v1/orgs/"+project.OrgID+"/secrets",
+		`{"owner":{"kind":"project","project_id":"`+project.ProjectID+`"},"name":"project-key","material":{"kind":"generic","value":"project-secret-value"}}`,
+		"", http.StatusCreated, authHeaders(project.AdminToken))
+	projectSecretID := testutil.RequireType[string](t, projectSecret["id"])
+	assertSecretOwner(t, projectSecret, secretstore.SecretOwnerProject, project.ProjectID)
+	gotProject := requestJSONWithHeaders(t, handler, http.MethodGet,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+projectSecretID,
+		"", "", http.StatusOK, authHeaders(project.AdminToken))
+	assertSecretOwner(t, gotProject, secretstore.SecretOwnerProject, project.ProjectID)
+	requestJSONWithHeaders(t, handler, http.MethodPatch,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+projectSecretID,
+		`{"owner":{"kind":"org"}}`, "", http.StatusBadRequest, authHeaders(project.AdminToken))
+
+	list := testutil.RequireType[[]any](t, requestJSONWithHeaders(t, handler, http.MethodGet,
+		"/api/v1/orgs/"+project.OrgID+"/secrets", "", "", http.StatusOK,
+		authHeaders(project.AdminToken))["data"])
+	if !containsPublicSecret(t, list, orgSecretID) || !containsPublicSecret(t, list, projectSecretID) {
+		t.Fatalf("canonical list missing mixed owners: %+v", list)
+	}
+	filtered := testutil.RequireType[[]any](t, requestJSONWithHeaders(t, handler, http.MethodGet,
+		"/api/v1/orgs/"+project.OrgID+"/secrets?owner_kind=project&owner_project_id="+project.ProjectID,
+		"", "", http.StatusOK, authHeaders(project.AdminToken))["data"])
+	if len(filtered) != 1 || testutil.RequireType[map[string]any](t, filtered[0])["id"] != projectSecretID {
+		t.Fatalf("project owner filter mismatch: %+v", filtered)
+	}
+
+	direct := testutil.RequireType[[]any](
+		t,
+		requestJSONWithHeaders(t, handler, http.MethodGet, project.ProjectPath+"/secrets",
+			"", "", http.StatusOK, authHeaders(project.AdminToken))["data"],
+	)
+	if len(direct) != 1 {
+		t.Fatalf("direct inventory = %+v", direct)
+	}
+	assertProjectAccess(t, testutil.RequireType[map[string]any](t, direct[0]), projectSecretID, "direct", "")
+	directOnly := testutil.RequireType[[]any](t, requestJSONWithHeaders(t, handler, http.MethodGet,
+		project.ProjectPath+"/secrets?availability_source=direct&owner_kind=project",
+		"", "", http.StatusOK, authHeaders(project.AdminToken))["data"])
+	if len(directOnly) != 1 {
+		t.Fatalf("direct availability filter = %+v", directOnly)
+	}
+	assertProjectAccess(t, testutil.RequireType[map[string]any](t, directOnly[0]), projectSecretID, "direct", "")
+
+	requestJSONWithHeaders(t, handler, http.MethodGet, secondPath+"/secrets/"+orgSecretID,
+		"", "", http.StatusNotFound, authHeaders(project.AdminToken))
+	grant := requestJSONWithHeaders(t, handler, http.MethodPost,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+orgSecretID+"/grants",
+		`{"target_project_id":"`+secondID+`"}`, "", http.StatusCreated, authHeaders(project.AdminToken))
+	grantID := testutil.RequireType[string](t, grant["id"])
+	grantPath := "/api/v1/orgs/" + project.OrgID + "/secrets/" + orgSecretID + "/grants/" + grantID
+	fetchedGrant := requestJSONWithHeaders(t, handler, http.MethodGet, grantPath, "", "", http.StatusOK,
+		authHeaders(project.AdminToken))
+	if fetchedGrant["id"] != grantID || fetchedGrant["target_project_id"] != secondID {
+		t.Fatalf("get secret grant = %+v", fetchedGrant)
+	}
+	granted := testutil.RequireType[[]any](t, requestJSONWithHeaders(t, handler, http.MethodGet, secondPath+"/secrets",
+		"", "", http.StatusOK, authHeaders(project.AdminToken))["data"])
+	if len(granted) != 1 {
+		t.Fatalf("granted inventory = %+v", granted)
+	}
+	assertProjectAccess(t, testutil.RequireType[map[string]any](t, granted[0]), orgSecretID, "grant", grantID)
+	grantedOnly := testutil.RequireType[[]any](t, requestJSONWithHeaders(t, handler, http.MethodGet,
+		secondPath+"/secrets?availability_source=grant&owner_kind=org",
+		"", "", http.StatusOK, authHeaders(project.AdminToken))["data"])
+	if len(grantedOnly) != 1 {
+		t.Fatalf("grant availability filter = %+v", grantedOnly)
+	}
+	assertProjectAccess(t, testutil.RequireType[map[string]any](t, grantedOnly[0]), orgSecretID, "grant", grantID)
+
+	target, targetToken := createHTTPOrgMemberToken(t, ctx, pool, store, project.OrgUUID, "grant-target")
+	if _, err := store.Identity().AddProjectMembership(ctx, identitystore.AddProjectMembershipInput{OrgID: project.OrgUUID,
+		ProjectID: secondUUID, UserID: target.ID, Role: authz.ProjectRoleDeveloper}); err != nil {
+		t.Fatalf("add target manager: %v", err)
+	}
+	requestJSONWithHeaders(t, handler, http.MethodGet,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+orgSecretID, "", "", http.StatusNotFound,
+		authHeaders(targetToken))
+	requestJSONWithHeaders(t, handler, http.MethodGet,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+orgSecretID+"/grants", "", "", http.StatusNotFound,
+		authHeaders(targetToken))
+	requestJSONWithHeaders(t, handler, http.MethodGet, grantPath, "", "", http.StatusNotFound, authHeaders(targetToken))
+	requestJSONWithHeaders(t, handler, http.MethodDelete,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+orgSecretID+"/grants/"+grantID,
+		"", "", http.StatusNoContent, authHeaders(targetToken))
+	requestJSONWithHeaders(t, handler, http.MethodGet, grantPath, "", "", http.StatusNotFound,
+		authHeaders(project.AdminToken))
+	requestJSONWithHeaders(t, handler, http.MethodGet, secondPath+"/secrets/"+orgSecretID,
+		"", "", http.StatusNotFound, authHeaders(targetToken))
+	requestJSONWithHeaders(t, handler, http.MethodDelete,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+orgSecretID,
+		"", "", http.StatusNoContent, authHeaders(project.AdminToken))
+
+	updated := requestJSONWithHeaders(t, handler, http.MethodPatch,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+projectSecretID,
+		`{"metadata":{"rotated":"true"}}`, "", http.StatusOK, authHeaders(project.AdminToken))
+	if testutil.RequireType[map[string]any](t, updated["metadata"])["rotated"] != "true" {
+		t.Fatalf("update = %+v", updated)
+	}
+	rotated := requestJSONWithHeaders(t, handler, http.MethodPost,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+projectSecretID+"/versions",
+		`{"material":{"kind":"generic","value":"rotated-value"}}`, "", http.StatusOK, authHeaders(project.AdminToken))
+	if rotated["current_version_number"] != float64(2) {
+		t.Fatalf("rotation = %+v", rotated)
+	}
+	requestJSONWithHeaders(t, handler, http.MethodDelete,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+projectSecretID,
+		"", "", http.StatusNoContent, authHeaders(project.AdminToken))
+}
+
+func TestPublicUserOwnedSecretAndGrantParties(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+	handler := newIntegrationServer(pool)
+	store := integrationStoreForHandler(t, handler)
+	project := bootstrapPublicHTTPProject(t, handler, "user-secret-parties")
+	owner, ownerToken := createHTTPOrgMemberToken(t, ctx, pool, store, project.OrgUUID, "personal-owner")
+	_, otherToken := createHTTPOrgMemberToken(t, ctx, pool, store, project.OrgUUID, "unrelated-member")
+	if _, err := store.Identity().AddProjectMembership(ctx, identitystore.AddProjectMembershipInput{OrgID: project.OrgUUID,
+		ProjectID: project.ProjectUUID, UserID: owner.ID, Role: authz.ProjectRoleDeveloper}); err != nil {
+		t.Fatal(err)
+	}
+
+	personal := requestJSONWithHeaders(t, handler, http.MethodPost,
+		"/api/v1/orgs/"+project.OrgID+"/secrets",
+		`{"owner":{"kind":"user"},"name":"personal","material":{"kind":"oauth_token_set","access_token":"personal-access","refresh":{"refresh_token":"personal-refresh","token_endpoint":"https://issuer.example/token","client_id":"client-id","resource":"https://mcp.example"}}}`,
+		"", http.StatusCreated, authHeaders(ownerToken))
+	secretID := testutil.RequireType[string](t, personal["id"])
+	assertSecretOwner(t, personal, secretstore.SecretOwnerUser, mustPublicUserID(t, owner.ID))
+	gotPersonal := requestJSONWithHeaders(t, handler, http.MethodGet,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+secretID,
+		"", "", http.StatusOK, authHeaders(ownerToken))
+	assertSecretOwner(t, gotPersonal, secretstore.SecretOwnerUser, mustPublicUserID(t, owner.ID))
+	personalList := testutil.RequireType[[]any](t, requestJSONWithHeaders(t, handler, http.MethodGet,
+		"/api/v1/orgs/"+project.OrgID+"/secrets?owner_kind=user", "", "", http.StatusOK,
+		authHeaders(ownerToken))["data"])
+	if len(personalList) != 1 || testutil.RequireType[map[string]any](t, personalList[0])["id"] != secretID {
+		t.Fatalf("personal canonical list = %+v", personalList)
+	}
+	requestJSONWithHeaders(t, handler, http.MethodGet,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+secretID, "", "", http.StatusNotFound,
+		authHeaders(otherToken))
+	requestJSONWithHeaders(t, handler, http.MethodGet,
+		"/api/v1/orgs/"+project.OrgID+"/secrets?owner_kind=project&owner_project_id="+project.ProjectID,
+		"", "", http.StatusForbidden, authHeaders(otherToken))
+	requestJSONWithHeaders(t, handler, http.MethodGet,
+		"/api/v1/orgs/"+project.OrgID+"/secrets?owner_kind=org",
+		"", "", http.StatusForbidden, authHeaders(otherToken))
+	grant := requestJSONWithHeaders(t, handler, http.MethodPost,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+secretID+"/grants",
+		`{"target_project_id":"`+project.ProjectID+`"}`, "", http.StatusCreated, authHeaders(ownerToken))
+	grantID := testutil.RequireType[string](t, grant["id"])
+
+	requestJSONWithHeaders(t, handler, http.MethodDelete,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+secretID+"/grants/"+grantID,
+		"", "", http.StatusNotFound, authHeaders(otherToken))
+	requestJSONWithHeaders(t, handler, http.MethodDelete,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+secretID+"/grants/"+grantID,
+		"", "", http.StatusNoContent, authHeaders(ownerToken))
+	updated := requestJSONWithHeaders(t, handler, http.MethodPatch,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+secretID,
+		`{"metadata":{"purpose":"personal"}}`, "", http.StatusOK, authHeaders(ownerToken))
+	if testutil.RequireType[map[string]any](t, updated["metadata"])["purpose"] != "personal" {
+		t.Fatalf("personal update = %+v", updated)
+	}
+	requestJSONWithHeaders(t, handler, http.MethodPost,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+secretID+"/versions",
+		`{"material":{"kind":"generic","value":"wrong-kind"}}`,
+		"", http.StatusBadRequest, authHeaders(ownerToken))
+	rotated := requestJSONWithHeaders(t, handler, http.MethodPost,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+secretID+"/versions",
+		`{"material":{"kind":"oauth_token_set","access_token":"next-access","refresh":{"refresh_token":"next-refresh","token_endpoint":"https://issuer.example/token","client_id":"client-id","resource":"https://mcp.example"}}}`,
+		"", http.StatusOK, authHeaders(ownerToken))
+	if rotated["current_version_number"] != float64(2) {
+		t.Fatalf("personal rotation = %+v", rotated)
+	}
+	requestJSONWithHeaders(t, handler, http.MethodDelete,
+		"/api/v1/orgs/"+project.OrgID+"/secrets/"+secretID,
+		"", "", http.StatusNoContent, authHeaders(ownerToken))
+
+	for _, legacy := range []struct{ method, path string }{
+		{http.MethodGet, "/api/v1/orgs/" + project.OrgID + "/users/me/secrets"},
+		{http.MethodPost, project.ProjectPath + "/secrets"},
+		{http.MethodPost, project.ProjectPath + "/secrets/mcp-oauth"},
+		{http.MethodPost, project.ProjectPath + "/secret-grants/" + grantID + "/revoke"},
+	} {
+		requestJSONWithHeaders(t, handler, legacy.method, legacy.path, "", "", http.StatusNotFound, authHeaders(ownerToken))
+	}
+}
+
+func TestPublicSecretErrorsDoNotEchoPayloads(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+	handler := newIntegrationServer(pool)
+	project := bootstrapPublicHTTPProject(t, handler, "secret-redaction")
+	requestJSONWithHeaders(t, handler, http.MethodPost, "/api/v1/orgs/"+project.OrgID+"/secrets",
+		`{"owner":{"kind":"org"},"name":"duplicate","material":{"kind":"generic","value":"original-private-value"}}`,
+		"", http.StatusCreated, authHeaders(project.AdminToken))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/orgs/"+project.OrgID+"/secrets",
+		strings.NewReader(
+			`{"owner":{"kind":"org"},"name":"duplicate","material":{"kind":"generic","value":"new-private-value"}}`,
+		))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+project.AdminToken)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict ||
+		!strings.Contains(rec.Body.String(), `a secret named \"duplicate\" already exists; choose a different name`) {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "private-value") {
+		t.Fatalf("response leaked payload: %s", rec.Body.String())
+	}
+}
+
+func assertSecretOwner(t *testing.T, secret map[string]any, kind, id string) {
+	t.Helper()
+	owner := testutil.RequireType[map[string]any](t, secret["owner"])
+	if owner["kind"] != kind {
+		t.Fatalf("owner = %+v, want %s", owner, kind)
+	}
+	if kind == secretstore.SecretOwnerProject && owner["project_id"] != id {
+		t.Fatalf("owner = %+v", owner)
+	}
+	if kind == secretstore.SecretOwnerUser && owner["user_id"] != id {
+		t.Fatalf("owner = %+v", owner)
+	}
+}
+
+func assertSecretRedacted(t *testing.T, secret map[string]any) {
+	t.Helper()
+	for _, field := range []string{"payload", "current_version_id"} {
+		if _, ok := secret[field]; ok {
+			t.Fatalf("secret leaked %s: %+v", field, secret)
+		}
+	}
+}
+
+func assertProjectAccess(t *testing.T, access map[string]any, secretID, source, grantID string) {
+	t.Helper()
+	secret := testutil.RequireType[map[string]any](t, access["secret"])
+	availability := testutil.RequireType[map[string]any](t, access["availability"])
+	if secret["id"] != secretID || availability["source"] != source {
+		t.Fatalf("access = %+v", access)
+	}
+	if source == "grant" && availability["grant_id"] != grantID {
+		t.Fatalf("access = %+v", access)
+	}
+	assertSecretRedacted(t, secret)
+}
+
+func containsPublicSecret(t *testing.T, secrets []any, id string) bool {
+	t.Helper()
+	for _, value := range secrets {
+		if testutil.RequireType[map[string]any](t, value)["id"] == id {
+			return true
+		}
+	}
+	return false
+}
+
+func mustPublicUserID(t *testing.T, id uuid.UUID) string {
+	t.Helper()
+	value, err := publicid.Encode(publicid.KindUser, id)
+	require.NoError(t, err)
+	return value
+}
+
+func createHTTPOrgMemberToken(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	store *storage.Store,
+	orgID uuid.UUID,
+	seed string,
+) (identitystore.UserRecord, string) {
+	t.Helper()
+	user, err := storagetest.CreateVerifiedUser(
+		ctx, pool, storagetest.CreateVerifiedUserInput{Email: seed + "@example.com", DisplayName: seed},
+	)
+	if err != nil {
+		t.Fatalf("create %s user: %v", seed, err)
+	}
+	if _, err := store.Identity().AddOrgMembership(
+		ctx, identitystore.AddOrgMembershipInput{OrgID: orgID, UserID: user.ID, Role: authz.OrgRoleMember},
+	); err != nil {
+		t.Fatalf("add %s org membership: %v", seed, err)
+	}
+	pat, err := store.Identity().CreatePersonalAccessTokenWithPlaintext(
+		ctx, identitystore.CreatePersonalAccessTokenInput{UserID: user.ID, Name: seed},
+	)
+	if err != nil {
+		t.Fatalf("create %s pat: %v", seed, err)
+	}
+	return user, pat.Token
+}

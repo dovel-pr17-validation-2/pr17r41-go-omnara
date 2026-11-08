@@ -1,0 +1,230 @@
+import { useAgentConfig, useOmnaraClient, useUpdateAgentConfig } from '@omnara/react'
+import { type Agent, type AgentConfig, ApiError } from '@omnara/sdk'
+import { getAgentConfigGeneratedSourceOptions } from '@omnara/sdk/tanstack'
+import { useQuery } from '@tanstack/react-query'
+import { type SyntheticEvent, useState } from 'react'
+
+import { AgentCompiledConfig } from '@/components/agents/AgentCompiledConfig'
+import { AgentConfigEditorFields } from '@/components/agents/AgentConfigEditor'
+import { type AgentConfigMode } from '@/components/agents/agentConfigModeMachine'
+import { useAgentConfigEditor } from '@/components/agents/useAgentConfigEditor'
+import { Button } from '@/components/ui/button'
+import { FieldGroup } from '@/components/ui/field'
+import { Spinner } from '@/components/ui/spinner'
+import { type ConfigSubmitError, configSubmitError, noConfigError } from '@/lib/agent-config-issues'
+
+export const discardConfigEditsPrompt = 'You have unsaved configuration changes. Discard them?'
+
+export function AgentConfigPanel({
+  orgId,
+  projectId,
+  agent,
+  canManage,
+  onDirtyChange,
+  onClose,
+}: {
+  orgId: string
+  projectId: string
+  agent: Agent
+  canManage: boolean
+  onDirtyChange: (dirty: boolean) => void
+  onClose: () => void
+}) {
+  const configQuery = useAgentConfig(orgId, projectId, agent.current_config_id)
+  const [resetNonce, setResetNonce] = useState(0)
+  const [preferredMode, setPreferredMode] = useState<AgentConfigMode>('builder')
+  const [snapshot, setSnapshot] = useState<AgentConfig | null>(null)
+  if (snapshot === null && configQuery.data !== undefined) {
+    setSnapshot(configQuery.data)
+  }
+  const { source, loadingSource, refetchSource } = useEditableSource(orgId, projectId, snapshot)
+
+  return (
+    <div className="flex min-h-full flex-col gap-4">
+      {snapshot !== null && source !== undefined ? (
+        <AgentConfigPanelEditor
+          key={String(resetNonce)}
+          orgId={orgId}
+          projectId={projectId}
+          agentId={agent.id}
+          configId={snapshot.id}
+          source={source}
+          compiledDefinition={snapshot.compiled_definition}
+          canManage={canManage && agent.state !== 'archived'}
+          preferredMode={preferredMode}
+          onModeChange={setPreferredMode}
+          onDirtyChange={onDirtyChange}
+          onDiscard={() => {
+            setSnapshot(configQuery.data ?? null)
+            setResetNonce((nonce) => nonce + 1)
+            onDirtyChange(false)
+          }}
+          onClose={onClose}
+        />
+      ) : configQuery.isPending || loadingSource ? (
+        <>
+          <h2 className="type-card-title">Agent configuration</h2>
+          <Spinner className="mx-auto my-8" />
+        </>
+      ) : (
+        <>
+          <h2 className="type-card-title">Agent configuration</h2>
+          <div className="flex items-center gap-3">
+            <p className="text-muted-foreground text-sm">Couldn&rsquo;t load the agent config.</p>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                void (snapshot === null ? configQuery.refetch() : refetchSource())
+              }}
+            >
+              Retry
+            </Button>
+          </div>
+          <div className="mt-auto flex border-t py-3">
+            <Button type="button" variant="ghost" onClick={onClose}>
+              Cancel editing
+            </Button>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+function useEditableSource(orgId: string, projectId: string, config: AgentConfig | null) {
+  const client = useOmnaraClient()
+  const generated = useQuery({
+    ...getAgentConfigGeneratedSourceOptions({
+      path: { orgID: orgId, projectID: projectId, agentConfigID: config?.id ?? '' },
+      client,
+    }),
+    enabled: config !== null && config.source === undefined,
+    staleTime: Infinity,
+    gcTime: 0,
+  })
+  return {
+    source: config?.source ?? generated.data?.source,
+    loadingSource: generated.isLoading,
+    refetchSource: generated.refetch,
+  }
+}
+
+function AgentConfigPanelEditor({
+  orgId,
+  projectId,
+  agentId,
+  configId,
+  source,
+  compiledDefinition,
+  canManage,
+  preferredMode,
+  onModeChange,
+  onDirtyChange,
+  onDiscard,
+  onClose,
+}: {
+  orgId: string
+  projectId: string
+  agentId: string
+  configId: string
+  source: string
+  compiledDefinition: AgentConfig['compiled_definition']
+  canManage: boolean
+  preferredMode: AgentConfigMode
+  onModeChange: (mode: AgentConfigMode) => void
+  onDirtyChange: (dirty: boolean) => void
+  onDiscard: () => void
+  onClose: () => void
+}) {
+  const updateConfig = useUpdateAgentConfig(orgId, projectId, agentId)
+  const editor = useAgentConfigEditor({
+    orgId,
+    projectId,
+    source,
+    canManage,
+    preferredMode,
+    onModeChange,
+    onDirtyChange,
+  })
+  const [error, setError] = useState<ConfigSubmitError>(noConfigError)
+
+  async function submit(event: SyntheticEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setError(noConfigError)
+    try {
+      await updateConfig.mutateAsync({
+        source: editor.yaml,
+        source_format: 'yaml',
+        expected_current_config_id: configId,
+      })
+      onClose()
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) {
+        setError({
+          message:
+            'The agent’s configuration changed while you were editing. Discard your changes to load the latest version, then reapply them.',
+          issues: [],
+        })
+        return
+      }
+      setError(configSubmitError(err, 'Could not update the agent config'))
+    }
+  }
+
+  return (
+    <form
+      noValidate
+      className="mx-auto flex w-full max-w-3xl flex-1 flex-col"
+      onSubmit={(event) => {
+        void submit(event)
+      }}
+    >
+      <FieldGroup className="pb-6">
+        <AgentConfigEditorFields
+          editor={editor}
+          orgId={orgId}
+          projectId={projectId}
+          header={<h2 className="type-card-title">Agent configuration</h2>}
+          yamlFieldId="agent-config-panel-yaml"
+          yamlFieldClassName="h-[24rem]"
+          issues={error.issues}
+        />
+        {editor.mode.mode === 'yaml' && <AgentCompiledConfig definition={compiledDefinition} />}
+      </FieldGroup>
+      <div className="bg-background sticky bottom-0 z-10 mt-auto flex flex-col gap-2 border-t py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
+        <Button
+          type="button"
+          variant="ghost"
+          className="w-full sm:w-auto"
+          onClick={() => {
+            if (editor.dirty && !window.confirm(discardConfigEditsPrompt)) return
+            onClose()
+          }}
+        >
+          Cancel editing
+        </Button>
+        <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:items-center sm:gap-3">
+          {error.message && (
+            <p className="text-destructive text-sm whitespace-pre-wrap">{error.message}</p>
+          )}
+          {canManage && editor.dirty && !updateConfig.isPending && (
+            <Button type="button" variant="ghost" className="w-full sm:w-auto" onClick={onDiscard}>
+              Discard changes
+            </Button>
+          )}
+          {canManage && (
+            <Button
+              type="submit"
+              disabled={updateConfig.isPending || !editor.dirty || editor.saveBlocked}
+              loading={updateConfig.isPending}
+              className="w-full sm:w-auto"
+            >
+              Save config
+            </Button>
+          )}
+        </div>
+      </div>
+    </form>
+  )
+}

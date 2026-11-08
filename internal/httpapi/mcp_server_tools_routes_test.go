@@ -1,0 +1,586 @@
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"testing"
+
+	"github.com/google/uuid"
+	jsonrpc "github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	"github.com/omnara-ai/omnara/internal/agentconfig"
+	"github.com/omnara-ai/omnara/internal/httpapi/apierror"
+	"github.com/omnara-ai/omnara/internal/httpapi/openapi"
+	"github.com/omnara-ai/omnara/internal/mcp"
+	"github.com/omnara-ai/omnara/internal/storage/identitystore"
+	"github.com/omnara-ai/omnara/internal/storage/storeerr"
+)
+
+type fakeMCPToolServer struct {
+	t          *testing.T
+	wantAuth   string
+	tools      []map[string]any
+	pageSize   int
+	serverInfo map[string]any
+}
+
+func (f fakeMCPToolServer) toolsPage(cursor string) map[string]any {
+	if f.pageSize == 0 {
+		return map[string]any{"tools": f.tools}
+	}
+	start := 0
+	if cursor != "" {
+		if _, err := fmt.Sscanf(cursor, "page-%d", &start); err != nil {
+			f.t.Errorf("unexpected cursor %q", cursor)
+		}
+	}
+	end := min(start+f.pageSize, len(f.tools))
+	page := map[string]any{"tools": f.tools[start:end]}
+	if end < len(f.tools) {
+		page["nextCursor"] = fmt.Sprintf("page-%d", end)
+	}
+	return page
+}
+
+func (f fakeMCPToolServer) handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != f.wantAuth {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"invalid_token"}`))
+			return
+		}
+		var message struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+			Params struct {
+				Cursor string `json:"cursor"`
+			} `json:"params"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&message); err != nil {
+			f.t.Errorf("decode request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		serverInfo := f.serverInfo
+		if serverInfo == nil {
+			serverInfo = map[string]any{"name": "weather", "version": "1.2.3", "title": "Weather"}
+		}
+		switch message.Method {
+		case "server/discover":
+			http.Error(w, "Bad Request: Mcp-Session-Id header is required", http.StatusBadRequest)
+		case "initialize":
+			w.Header().Set("Mcp-Session-Id", "sess-1")
+			writeJSON(w, http.StatusOK, map[string]any{
+				"jsonrpc": "2.0", "id": message.ID,
+				"result": map[string]any{
+					"protocolVersion": "2025-06-18",
+					"capabilities":    map[string]any{"tools": map[string]any{}},
+					"serverInfo":      serverInfo,
+				},
+			})
+		case "notifications/initialized":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/list":
+			if r.Header.Get("Mcp-Session-Id") != "sess-1" {
+				f.t.Errorf("tools/list missing session header")
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"jsonrpc": "2.0", "id": message.ID,
+				"result": f.toolsPage(message.Params.Cursor),
+			})
+		default:
+			f.t.Errorf("unexpected method %q", message.Method)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	})
+}
+
+func mcpServerToolsTestContext() context.Context {
+	return withProjectScope(
+		context.Background(),
+		identitystore.OrgRecord{ID: uuid.New()},
+		identitystore.ProjectRecord{ID: uuid.New()},
+	)
+}
+
+func mcpServerToolsTestServer(t *testing.T) *Server {
+	t.Helper()
+	return mustNewUnitServer(t, WithAgentConfigOptions(agentconfig.CompileOptions{AllowInsecureLocalMCPHTTP: true}))
+}
+
+func mcpServerAuthNone(t *testing.T) openapi.MCPServerAuth {
+	t.Helper()
+	var auth openapi.MCPServerAuth
+	if err := auth.FromMCPServerAuthNone(openapi.MCPServerAuthNone{Type: "none"}); err != nil {
+		t.Fatalf("build auth: %v", err)
+	}
+	return auth
+}
+
+func TestListMCPServerToolsReturnsDiscoveredTools(t *testing.T) {
+	upstream := httptest.NewServer(fakeMCPToolServer{
+		t:        t,
+		pageSize: 1,
+		tools: []map[string]any{
+			{
+				"name":        "get_forecast",
+				"title":       "Get forecast",
+				"description": "Forecast for a city.",
+				"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"city": map[string]any{"type": "string"}}},
+				"annotations": map[string]any{"readOnlyHint": true, "destructiveHint": false},
+			},
+			{"name": "bare", "inputSchema": map[string]any{"type": "object"}},
+		},
+	}.handler())
+	defer upstream.Close()
+
+	response, err := strictOpenAPIServer{server: mcpServerToolsTestServer(t)}.ListMCPServerTools(
+		mcpServerToolsTestContext(),
+		openapi.ListMCPServerToolsRequestObject{
+			Body: &openapi.MCPServerToolsRequest{Url: upstream.URL + "/mcp", Auth: mcpServerAuthNone(t)},
+		},
+	)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	result, ok := response.(openapi.ListMCPServerTools200JSONResponse)
+	if !ok {
+		t.Fatalf("response type = %T", response)
+	}
+	if result.ProtocolVersion != "2025-06-18" {
+		t.Fatalf("protocol_version = %q", result.ProtocolVersion)
+	}
+	if result.ServerInfo.Name != "weather" || result.ServerInfo.Version != "1.2.3" ||
+		result.ServerInfo.Title == nil || *result.ServerInfo.Title != "Weather" {
+		t.Fatalf("server_info = %+v", result.ServerInfo)
+	}
+	if len(result.Tools) != 2 {
+		t.Fatalf("tools = %+v", result.Tools)
+	}
+	forecast := result.Tools[0]
+	if forecast.Name != "get_forecast" || forecast.Title == nil || *forecast.Title != "Get forecast" ||
+		forecast.Description == nil || *forecast.Description != "Forecast for a city." {
+		t.Fatalf("forecast tool = %+v", forecast)
+	}
+	if forecast.InputSchema["type"] != "object" {
+		t.Fatalf("input_schema = %+v", forecast.InputSchema)
+	}
+	if forecast.Annotations == nil || forecast.Annotations.ReadOnlyHint == nil || !*forecast.Annotations.ReadOnlyHint ||
+		forecast.Annotations.DestructiveHint == nil || *forecast.Annotations.DestructiveHint {
+		t.Fatalf("annotations = %+v", forecast.Annotations)
+	}
+	bare := result.Tools[1]
+	if bare.Title != nil || bare.Description != nil || bare.Annotations != nil || bare.OutputSchema != nil {
+		t.Fatalf("bare tool = %+v", bare)
+	}
+}
+
+func TestListMCPServerToolsRejectsInvalidURL(t *testing.T) {
+	for name, rawURL := range map[string]string{
+		"scheme":      "ftp://example.com/mcp",
+		"credentials": "https://user:pass@example.com/mcp",
+		"empty":       "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := strictOpenAPIServer{server: mcpServerToolsTestServer(t)}.ListMCPServerTools(
+				mcpServerToolsTestContext(),
+				openapi.ListMCPServerToolsRequestObject{
+					Body: &openapi.MCPServerToolsRequest{Url: rawURL, Auth: mcpServerAuthNone(t)},
+				},
+			)
+			var apiErr apierror.ResponseError
+			if !errors.As(err, &apiErr) || apiErr.Code != openapi.ErrorCodeInvalidRequest {
+				t.Fatalf("err = %v, want invalid_request", err)
+			}
+		})
+	}
+}
+
+func TestListMCPServerToolsReportsBearerRequiredWithoutOAuthMetadata(t *testing.T) {
+	upstream := httptest.NewServer(fakeMCPToolServer{t: t, wantAuth: "Bearer expected"}.handler())
+	defer upstream.Close()
+
+	response, err := strictOpenAPIServer{server: mcpServerToolsTestServer(t)}.ListMCPServerTools(
+		mcpServerToolsTestContext(),
+		openapi.ListMCPServerToolsRequestObject{
+			Body: &openapi.MCPServerToolsRequest{Url: upstream.URL + "/mcp", Auth: mcpServerAuthNone(t)},
+		},
+	)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	hint, ok := response.(openapi.ListMCPServerTools422JSONResponse)
+	if !ok {
+		t.Fatalf("response type = %T", response)
+	}
+	if hint.Auth.Type != openapi.MCPServerAuthHintTypeBearer || hint.Code != "unprocessable" || hint.Error == "" {
+		t.Fatalf("response = %+v, want bearer hint", hint)
+	}
+}
+
+func TestListMCPServerToolsReportsOAuthRequiredFromServerMetadata(t *testing.T) {
+	mux := http.NewServeMux()
+	upstream := httptest.NewServer(mux)
+	defer upstream.Close()
+	issuer := upstream.URL + "/issuer"
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Bearer resource_metadata="`+upstream.URL+`/prm"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	mux.HandleFunc("/prm", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"resource":              upstream.URL + "/mcp",
+			"authorization_servers": []string{issuer},
+		})
+	})
+	mux.HandleFunc("/.well-known/oauth-authorization-server/issuer", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"issuer":                           issuer,
+			"authorization_endpoint":           upstream.URL + "/authorize",
+			"token_endpoint":                   upstream.URL + "/token",
+			"response_types_supported":         []string{"code"},
+			"code_challenge_methods_supported": []string{"S256"},
+		})
+	})
+
+	response, err := strictOpenAPIServer{server: mcpServerToolsTestServer(t)}.ListMCPServerTools(
+		mcpServerToolsTestContext(),
+		openapi.ListMCPServerToolsRequestObject{
+			Body: &openapi.MCPServerToolsRequest{Url: upstream.URL + "/mcp", Auth: mcpServerAuthNone(t)},
+		},
+	)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	hint, ok := response.(openapi.ListMCPServerTools422JSONResponse)
+	if !ok {
+		t.Fatalf("response type = %T", response)
+	}
+	if hint.Auth.Type != openapi.MCPServerAuthHintTypeOauth ||
+		hint.Auth.AuthorizationServer == nil || *hint.Auth.AuthorizationServer != issuer {
+		t.Fatalf("response = %+v, want oauth hint for %s", hint, issuer)
+	}
+}
+
+func TestListMCPServerToolsDoesNotGuessBearerWhenProbeReturnsForbidden(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer upstream.Close()
+
+	response, err := strictOpenAPIServer{server: mcpServerToolsTestServer(t)}.ListMCPServerTools(
+		mcpServerToolsTestContext(),
+		openapi.ListMCPServerToolsRequestObject{
+			Body: &openapi.MCPServerToolsRequest{Url: upstream.URL + "/mcp", Auth: mcpServerAuthNone(t)},
+		},
+	)
+	if err != nil {
+		t.Fatalf("ListMCPServerTools() error = %v", err)
+	}
+	unreachable, ok := response.(openapi.ListMCPServerTools422JSONResponse)
+	if !ok || unreachable.Auth != nil {
+		t.Fatalf("response = %+v, want 422 without an auth hint", response)
+	}
+}
+
+func TestListMCPServerToolsReportsUpstreamUnavailableForTransientErrors(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+
+	_, err := strictOpenAPIServer{server: mcpServerToolsTestServer(t)}.ListMCPServerTools(
+		mcpServerToolsTestContext(),
+		openapi.ListMCPServerToolsRequestObject{
+			Body: &openapi.MCPServerToolsRequest{Url: upstream.URL + "/mcp", Auth: mcpServerAuthNone(t)},
+		},
+	)
+	var apiErr apierror.ResponseError
+	if !errors.As(err, &apiErr) || apiErr.Code != openapi.ErrorCodeUpstreamUnavailable {
+		t.Fatalf("ListMCPServerTools() error = %v, want upstream_unavailable", err)
+	}
+	if apiErr.Status != http.StatusFailedDependency {
+		t.Fatalf("status = %d, want 424", apiErr.Status)
+	}
+}
+
+func TestListMCPServerToolsReportsUpstreamUnavailableForMalformedServerInfo(t *testing.T) {
+	upstream := httptest.NewServer(fakeMCPToolServer{t: t, serverInfo: map[string]any{"name": 1}}.handler())
+	defer upstream.Close()
+
+	_, err := strictOpenAPIServer{server: mcpServerToolsTestServer(t)}.ListMCPServerTools(
+		mcpServerToolsTestContext(),
+		openapi.ListMCPServerToolsRequestObject{
+			Body: &openapi.MCPServerToolsRequest{Url: upstream.URL + "/mcp", Auth: mcpServerAuthNone(t)},
+		},
+	)
+	var apiErr apierror.ResponseError
+	if !errors.As(err, &apiErr) || apiErr.Code != openapi.ErrorCodeUpstreamUnavailable {
+		t.Fatalf("ListMCPServerTools() error = %v, want upstream_unavailable", err)
+	}
+	if apiErr.Status != http.StatusFailedDependency {
+		t.Fatalf("status = %d, want 424", apiErr.Status)
+	}
+}
+
+func TestListMCPServerToolsReportsUnprocessableForNonMCPResponses(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<html>not mcp</html>"))
+	}))
+	defer upstream.Close()
+
+	response, err := strictOpenAPIServer{server: mcpServerToolsTestServer(t)}.ListMCPServerTools(
+		mcpServerToolsTestContext(),
+		openapi.ListMCPServerToolsRequestObject{
+			Body: &openapi.MCPServerToolsRequest{Url: upstream.URL + "/mcp", Auth: mcpServerAuthNone(t)},
+		},
+	)
+	if err != nil {
+		t.Fatalf("ListMCPServerTools() error = %v", err)
+	}
+	unreachable, ok := response.(openapi.ListMCPServerTools422JSONResponse)
+	if !ok || unreachable.Auth != nil {
+		t.Fatalf("response = %+v, want 422 without an auth hint", response)
+	}
+}
+
+func TestListMCPServerToolsReportsUpstreamUnavailableWhenAuthProbeFailsTransiently(t *testing.T) {
+	var probes int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if atomic.AddInt32(&probes, 1) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+
+	_, err := strictOpenAPIServer{server: mcpServerToolsTestServer(t)}.ListMCPServerTools(
+		mcpServerToolsTestContext(),
+		openapi.ListMCPServerToolsRequestObject{
+			Body: &openapi.MCPServerToolsRequest{Url: upstream.URL + "/mcp", Auth: mcpServerAuthNone(t)},
+		},
+	)
+	var apiErr apierror.ResponseError
+	if !errors.As(err, &apiErr) || apiErr.Code != openapi.ErrorCodeUpstreamUnavailable {
+		t.Fatalf("ListMCPServerTools() error = %v, want upstream_unavailable", err)
+	}
+}
+
+func TestListMCPServerToolsRequiresStoreForSecretAuth(t *testing.T) {
+	var auth openapi.MCPServerAuth
+	if err := auth.FromMCPServerAuthBearer(openapi.MCPServerAuthBearer{
+		Type: "bearer", SecretId: "sec_ceirceircfardairceirceirce",
+	}); err != nil {
+		t.Fatalf("build auth: %v", err)
+	}
+	_, err := strictOpenAPIServer{server: mcpServerToolsTestServer(t)}.ListMCPServerTools(
+		mcpServerToolsTestContext(),
+		openapi.ListMCPServerToolsRequestObject{
+			Body: &openapi.MCPServerToolsRequest{Url: "https://example.com/mcp", Auth: auth},
+		},
+	)
+	var apiErr apierror.ResponseError
+	if !errors.As(err, &apiErr) || apiErr.Code != openapi.ErrorCodeServiceUnavailable {
+		t.Fatalf("err = %v, want service_unavailable", err)
+	}
+}
+
+func TestListMCPServerToolsReportsAuthRequiredFromJSONRPCUnauthorizedBody(t *testing.T) {
+	mux := http.NewServeMux()
+	upstream := httptest.NewServer(mux)
+	defer upstream.Close()
+	issuer := upstream.URL + "/issuer"
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Bearer resource_metadata="`+upstream.URL+`/prm"`)
+		writeJSON(w, http.StatusUnauthorized, map[string]any{
+			"jsonrpc": "2.0", "id": -2,
+			"error": map[string]any{"code": -32001, "message": "unauthorized"},
+		})
+	})
+	mux.HandleFunc("/prm", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"resource":              upstream.URL + "/mcp",
+			"authorization_servers": []string{issuer},
+		})
+	})
+	mux.HandleFunc("/.well-known/oauth-authorization-server/issuer", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"issuer":                           issuer,
+			"authorization_endpoint":           upstream.URL + "/authorize",
+			"token_endpoint":                   upstream.URL + "/token",
+			"response_types_supported":         []string{"code"},
+			"code_challenge_methods_supported": []string{"S256"},
+		})
+	})
+
+	response, err := strictOpenAPIServer{server: mcpServerToolsTestServer(t)}.ListMCPServerTools(
+		mcpServerToolsTestContext(),
+		openapi.ListMCPServerToolsRequestObject{
+			Body: &openapi.MCPServerToolsRequest{Url: upstream.URL + "/mcp", Auth: mcpServerAuthNone(t)},
+		},
+	)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+	hint, ok := response.(openapi.ListMCPServerTools422JSONResponse)
+	if !ok {
+		t.Fatalf("response type = %T", response)
+	}
+	if hint.Auth.Type != openapi.MCPServerAuthHintTypeOauth ||
+		hint.Auth.AuthorizationServer == nil || *hint.Auth.AuthorizationServer != issuer {
+		t.Fatalf("response = %+v, want oauth hint for %s", hint, issuer)
+	}
+}
+
+func TestMCPServerToolsFailureMapsErrorOrigins(t *testing.T) {
+	server := strictOpenAPIServer{server: mcpServerToolsTestServer(t)}
+	tests := []struct {
+		name       string
+		err        error
+		wantCode   openapi.ErrorCode
+		wantStatus int
+	}{
+		{
+			name:       "internal failure",
+			err:        fmt.Errorf("%w: store mcp catalog: %w", mcp.ErrInternal, errors.New("connection reset")),
+			wantCode:   openapi.ErrorCodeInternalError,
+			wantStatus: http.StatusInternalServerError,
+		},
+		{
+			name:       "refresh busy",
+			err:        fmt.Errorf("%w: lease is busy", mcp.ErrRefreshBusy),
+			wantCode:   openapi.ErrorCodeConflict,
+			wantStatus: http.StatusConflict,
+		},
+		{
+			name:       "store call past the operation deadline",
+			err:        fmt.Errorf("%w: mark mcp catalog fetched: %w", mcp.ErrStoreTimeout, context.DeadlineExceeded),
+			wantCode:   openapi.ErrorCodeServiceUnavailable,
+			wantStatus: http.StatusServiceUnavailable,
+		},
+		{
+			name:       "mcp server past the operation deadline",
+			err:        fmt.Errorf("list mcp tools: %w", context.DeadlineExceeded),
+			wantCode:   openapi.ErrorCodeUpstreamUnavailable,
+			wantStatus: http.StatusFailedDependency,
+		},
+		{
+			name:       "secret kind mismatch",
+			err:        fmt.Errorf("read mcp auth secret: %w", storeerr.ErrInvalidSecretRequest),
+			wantCode:   openapi.ErrorCodeInvalidRequest,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "credential refresh transient",
+			err: fmt.Errorf(
+				"%w: refresh mcp oauth token: %w",
+				mcp.ErrCredential,
+				&mcp.HTTPError{Status: http.StatusServiceUnavailable},
+			),
+			wantCode:   openapi.ErrorCodeUpstreamUnavailable,
+			wantStatus: http.StatusFailedDependency,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := server.mcpServerToolsFailure(mcpServerToolsTestContext(), "https://mcp.example.com/mcp", tt.err)
+			var apiErr apierror.ResponseError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("mcpServerToolsFailure() error = %v, want ResponseError", err)
+			}
+			if apiErr.Code != tt.wantCode || apiErr.Status != tt.wantStatus {
+				t.Fatalf("code=%q status=%d, want %q %d", apiErr.Code, apiErr.Status, tt.wantCode, tt.wantStatus)
+			}
+		})
+	}
+}
+
+func TestMCPServerToolsFailureUpstreamInternalErrorIsUpstreamUnavailable(t *testing.T) {
+	server := strictOpenAPIServer{server: mcpServerToolsTestServer(t)}
+	cause := &mcp.RPCError{Code: jsonrpc.CodeInternalError, Message: "missing upstream api key", HTTPStatus: http.StatusOK}
+	_, err := server.mcpServerToolsFailure(mcpServerToolsTestContext(), "https://mcp.example.com/mcp", cause)
+	var apiErr apierror.ResponseError
+	if !errors.As(err, &apiErr) || apiErr.Code != openapi.ErrorCodeUpstreamUnavailable {
+		t.Fatalf("mcpServerToolsFailure() error = %v, want upstream_unavailable", err)
+	}
+	if apiErr.Status != http.StatusFailedDependency {
+		t.Fatalf("status = %d, want 424", apiErr.Status)
+	}
+}
+
+func TestMCPServerToolsFailureUnauthorizedCredentialHintsOAuthWithoutProbing(t *testing.T) {
+	server := strictOpenAPIServer{server: mcpServerToolsTestServer(t)}
+	cause := fmt.Errorf(
+		"%w: refresh mcp oauth token: %w",
+		mcp.ErrCredential,
+		&mcp.HTTPError{Status: http.StatusUnauthorized},
+	)
+	response, err := server.mcpServerToolsFailure(mcpServerToolsTestContext(), "https://mcp.example.com/mcp", cause)
+	if err != nil {
+		t.Fatalf("mcpServerToolsFailure() error = %v", err)
+	}
+	rejected, ok := response.(openapi.ListMCPServerTools422JSONResponse)
+	if !ok || rejected.Auth == nil || rejected.Auth.Type != openapi.MCPServerAuthHintTypeOauth {
+		t.Fatalf("response = %+v, want 422 with an oauth hint", response)
+	}
+}
+
+func TestMCPServerToolsFailureRejectedRefreshGrantHintsOAuth(t *testing.T) {
+	tokenEndpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+	}))
+	defer tokenEndpoint.Close()
+	_, refreshErr := mcp.RefreshOAuthToken(context.Background(), mcp.OAuthRefreshInput{
+		TokenEndpoint: tokenEndpoint.URL + "/token",
+		ClientID:      "client-123",
+		RefreshToken:  "refresh-revoked",
+		Resource:      "https://mcp.example.com/mcp",
+		HTTPClient:    tokenEndpoint.Client(),
+	})
+	if refreshErr == nil {
+		t.Fatal("RefreshOAuthToken() error = nil, want invalid_grant")
+	}
+	cause := fmt.Errorf("%w: refresh mcp oauth token: %w", mcp.ErrCredential, refreshErr)
+
+	server := strictOpenAPIServer{server: mcpServerToolsTestServer(t)}
+	response, err := server.mcpServerToolsFailure(mcpServerToolsTestContext(), "https://mcp.example.com/mcp", cause)
+	if err != nil {
+		t.Fatalf("mcpServerToolsFailure() error = %v", err)
+	}
+	rejected, ok := response.(openapi.ListMCPServerTools422JSONResponse)
+	if !ok || rejected.Auth == nil || rejected.Auth.Type != openapi.MCPServerAuthHintTypeOauth {
+		t.Fatalf("response = %+v, want 422 with an oauth hint", response)
+	}
+}
+
+func TestMCPServerAuthRequiredReportsCanceledProbe(t *testing.T) {
+	ctx, cancel := context.WithCancel(mcpServerToolsTestContext())
+	cancel()
+	server := strictOpenAPIServer{server: mcpServerToolsTestServer(t)}
+	_, err := server.mcpServerAuthRequired(ctx, "https://mcp.example.com/mcp", "unauthorized")
+	var apiErr apierror.ResponseError
+	if !errors.As(err, &apiErr) || apiErr.Code != openapi.ErrorCodeUnprocessable || !errors.Is(err, context.Canceled) {
+		t.Fatalf("mcpServerAuthRequired() error = %v, want canceled unprocessable", err)
+	}
+}
+
+func TestMCPServerToolsFailureUnusableCredentialHasNoHint(t *testing.T) {
+	server := strictOpenAPIServer{server: mcpServerToolsTestServer(t)}
+	cause := fmt.Errorf("%w: mcp oauth secret is expired and has no refresh token", mcp.ErrCredential)
+	response, err := server.mcpServerToolsFailure(mcpServerToolsTestContext(), "https://mcp.example.com/mcp", cause)
+	if err != nil {
+		t.Fatalf("mcpServerToolsFailure() error = %v", err)
+	}
+	rejected, ok := response.(openapi.ListMCPServerTools422JSONResponse)
+	if !ok || rejected.Auth != nil {
+		t.Fatalf("response = %+v, want 422 without an auth hint", response)
+	}
+}

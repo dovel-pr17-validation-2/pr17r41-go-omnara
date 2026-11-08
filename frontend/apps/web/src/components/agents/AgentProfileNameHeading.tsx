@@ -1,0 +1,115 @@
+import { useRenameAgentProfile } from '@omnara/react'
+import { type AgentProfile, ApiError } from '@omnara/sdk'
+import { type SyntheticEvent, useState } from 'react'
+
+import { CheckIcon, PencilIcon, XIcon } from '@/components/icons'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { ResourceNameFieldError } from '@/components/ui/resource-name-error'
+import { resourceNameValid } from '@/lib/resource-name'
+
+export function AgentProfileNameHeading({
+  orgId,
+  projectId,
+  profile,
+  canManage,
+}: {
+  orgId: string
+  projectId: string
+  profile: AgentProfile
+  canManage: boolean
+}) {
+  const renameProfile = useRenameAgentProfile(orgId, projectId)
+  const [nameDraft, setNameDraft] = useState<string | null>(null)
+  const [renameError, setRenameError] = useState('')
+
+  function stopEditing() {
+    setNameDraft(null)
+    setRenameError('')
+  }
+
+  async function submitRename(event: SyntheticEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const name = nameDraft ?? ''
+    if (name === profile.name) {
+      stopEditing()
+      return
+    }
+    if (!resourceNameValid(name)) return
+    try {
+      await renameProfile.mutateAsync({ agentProfileID: profile.id, name })
+      stopEditing()
+    } catch (err) {
+      setRenameError(err instanceof ApiError ? err.message : 'Could not rename agent profile')
+    }
+  }
+
+  return (
+    <>
+      {nameDraft !== null ? (
+        <div>
+          <form
+            className="flex min-w-0 items-center gap-1"
+            onSubmit={(event) => {
+              void submitRename(event)
+            }}
+          >
+            <Input
+              // eslint-disable-next-line jsx-a11y/no-autofocus -- focus follows the user's explicit edit action
+              autoFocus
+              aria-label="Profile name"
+              required
+              variant="embedded"
+              value={nameDraft}
+              className="border-border focus-visible:border-ring type-title -mx-1 h-auto w-full max-w-96 min-w-0 rounded-none border-b px-1 py-0 text-2xl sm:h-auto md:text-2xl"
+              onChange={(event) => {
+                setNameDraft(event.target.value)
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') stopEditing()
+              }}
+            />
+            <Button
+              size="icon"
+              type="submit"
+              variant="ghost"
+              aria-label="Save name"
+              disabled={renameProfile.isPending || !resourceNameValid(nameDraft)}
+              loading={renameProfile.isPending}
+              icon={<CheckIcon />}
+            />
+            <Button
+              size="icon"
+              type="button"
+              variant="ghost"
+              aria-label="Cancel rename"
+              className="text-muted-foreground"
+              onClick={stopEditing}
+            >
+              <XIcon />
+            </Button>
+          </form>
+          <ResourceNameFieldError value={nameDraft} fieldLabel="Profile name" showRequired />
+        </div>
+      ) : (
+        <div className="flex items-center gap-1">
+          <h1 className="type-title">{profile.name}</h1>
+          {canManage && (
+            <Button
+              size="icon"
+              variant="ghost"
+              aria-label="Rename profile"
+              className="text-muted-foreground"
+              onClick={() => {
+                setNameDraft(profile.name)
+              }}
+            >
+              <PencilIcon />
+            </Button>
+          )}
+        </div>
+      )}
+      {renameError && <p className="text-destructive text-sm">{renameError}</p>}
+    </>
+  )
+}

@@ -1,0 +1,239 @@
+import { useConnectMachine } from '@omnara/react'
+import { type SyntheticEvent, useId, useReducer } from 'react'
+
+import { CheckIcon, CopyIcon } from '@/components/icons'
+import { ProjectShareChips } from '@/components/projects/ProjectShareChips'
+import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field'
+import { Input } from '@/components/ui/input'
+import { ResourceNameFieldError } from '@/components/ui/resource-name-error'
+import { resourceNameValid } from '@/lib/resource-name'
+import { errorMessage } from '@/lib/submit-status'
+import { useWebConfig } from '@/lib/web-config'
+
+/**
+ * The dialog is a two-step flow: fill in the form, then show the install command
+ * and machine token. `connected` is the only transition between steps, and
+ * closing the dialog resets to a fresh form.
+ */
+type ConnectMachineState =
+  | { step: 'form'; name: string; projectGrantIds: string[]; submitting: boolean; error: string }
+  | {
+      step: 'result'
+      machineToken: string
+      copied: 'command' | 'token' | null
+    }
+
+type ConnectMachineAction =
+  | { type: 'setName'; name: string }
+  | { type: 'setProjectGrantIds'; projectGrantIds: string[] }
+  | { type: 'submitStart' }
+  | { type: 'submitFail'; message: string }
+  | { type: 'connected'; machineToken: string }
+  | { type: 'copied'; target: 'command' | 'token' }
+  | { type: 'reset'; projectGrantIds: string[] }
+
+function formState(projectGrantIds: string[]): ConnectMachineState {
+  return { step: 'form', name: '', projectGrantIds, submitting: false, error: '' }
+}
+
+function reducer(state: ConnectMachineState, action: ConnectMachineAction): ConnectMachineState {
+  switch (action.type) {
+    case 'setName':
+      return state.step === 'form' ? { ...state, name: action.name } : state
+    case 'setProjectGrantIds':
+      return state.step === 'form' ? { ...state, projectGrantIds: action.projectGrantIds } : state
+    case 'submitStart':
+      return state.step === 'form' ? { ...state, submitting: true, error: '' } : state
+    case 'submitFail':
+      return state.step === 'form' ? { ...state, submitting: false, error: action.message } : state
+    case 'connected':
+      return {
+        step: 'result',
+        machineToken: action.machineToken,
+        copied: null,
+      }
+    case 'copied':
+      return state.step === 'result' ? { ...state, copied: action.target } : state
+    case 'reset':
+      return formState(action.projectGrantIds)
+  }
+}
+
+export function ConnectMachineDialog({
+  open,
+  onOpenChange,
+  orgId,
+  defaultProjectIds = [],
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  orgId: string
+  /** Projects the machine is shared with unless deselected. */
+  defaultProjectIds?: string[]
+}) {
+  const idPrefix = useId()
+  const connectMachine = useConnectMachine(orgId)
+  const { data: webConfig } = useWebConfig()
+  const [state, dispatch] = useReducer(reducer, defaultProjectIds, formState)
+  const apiURL = webConfig?.apiURL ?? `${window.location.origin}/api/v1`
+  const installerURL = new URL('/install/omnarad.sh', apiURL)
+  const installCommand = `curl -fsSL ${installerURL.toString()} | sh`
+
+  function handleOpenChange(nextOpen: boolean) {
+    if (!nextOpen) {
+      dispatch({ type: 'reset', projectGrantIds: defaultProjectIds })
+    }
+    onOpenChange(nextOpen)
+  }
+
+  async function submit(event: SyntheticEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (state.step !== 'form') {
+      return
+    }
+    dispatch({ type: 'submitStart' })
+    try {
+      const { token } = await connectMachine.mutateAsync({
+        displayName: state.name,
+        projectIDs: state.projectGrantIds,
+      })
+      dispatch({
+        type: 'connected',
+        machineToken: token,
+      })
+    } catch (err) {
+      dispatch({ type: 'submitFail', message: errorMessage(err, 'Could not connect machine') })
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Connect a machine</DialogTitle>
+          <DialogDescription>
+            Register a machine you operate and install its daemon.
+          </DialogDescription>
+        </DialogHeader>
+        {state.step === 'form' ? (
+          <form
+            onSubmit={(event) => {
+              void submit(event)
+            }}
+          >
+            <FieldGroup>
+              <Field>
+                <FieldLabel htmlFor="machine-name">Machine name</FieldLabel>
+                <Input
+                  id="machine-name"
+                  required
+                  value={state.name}
+                  placeholder="my-macbook"
+                  onChange={(event) => {
+                    dispatch({ type: 'setName', name: event.target.value })
+                  }}
+                />
+                <ResourceNameFieldError value={state.name} />
+                <FieldDescription>
+                  Agent configs reference this name via machine_sources.machine_name.
+                </FieldDescription>
+              </Field>
+              <Field>
+                <ProjectShareChips
+                  orgId={orgId}
+                  isProjectEligible={(project) => project.access.can_manage_access}
+                  value={state.projectGrantIds}
+                  onChange={(projectGrantIds) => {
+                    dispatch({ type: 'setProjectGrantIds', projectGrantIds })
+                  }}
+                  disabled={state.submitting}
+                />
+                <FieldDescription>
+                  Agents in selected projects will be able to run commands on the machine.
+                </FieldDescription>
+              </Field>
+              {state.error && (
+                <p className="text-destructive text-sm whitespace-pre-wrap">{state.error}</p>
+              )}
+              <DialogFooter>
+                <Button
+                  type="submit"
+                  disabled={state.submitting || !resourceNameValid(state.name)}
+                  loading={state.submitting}
+                >
+                  Connect machine
+                </Button>
+              </DialogFooter>
+            </FieldGroup>
+          </form>
+        ) : (
+          <FieldGroup>
+            <Field aria-labelledby={`${idPrefix}-command`}>
+              <div id={`${idPrefix}-command`} className="type-label">
+                Install command
+              </div>
+              <pre className="bg-muted max-h-56 min-w-0 overflow-y-auto rounded-md p-3 font-mono text-xs break-all whitespace-pre-wrap">
+                {installCommand}
+              </pre>
+              <FieldDescription>
+                Run this on the machine, then paste the machine token when prompted.
+              </FieldDescription>
+              <Button
+                type="button"
+                variant="outline"
+                icon={state.copied === 'command' ? <CheckIcon /> : <CopyIcon />}
+                onClick={() => {
+                  void navigator.clipboard.writeText(installCommand).then(() => {
+                    dispatch({ type: 'copied', target: 'command' })
+                  })
+                }}
+              >
+                {state.copied === 'command' ? 'Copied' : 'Copy command'}
+              </Button>
+            </Field>
+            <Field aria-labelledby={`${idPrefix}-token`}>
+              <div id={`${idPrefix}-token`} className="type-label">
+                Machine token
+              </div>
+              <pre className="bg-muted min-w-0 overflow-y-auto rounded-md p-3 font-mono text-xs break-all whitespace-pre-wrap">
+                {state.machineToken}
+              </pre>
+              <FieldDescription>Shown once.</FieldDescription>
+              <Button
+                type="button"
+                variant="outline"
+                icon={state.copied === 'token' ? <CheckIcon /> : <CopyIcon />}
+                onClick={() => {
+                  void navigator.clipboard.writeText(state.machineToken).then(() => {
+                    dispatch({ type: 'copied', target: 'token' })
+                  })
+                }}
+              >
+                {state.copied === 'token' ? 'Copied' : 'Copy token'}
+              </Button>
+            </Field>
+            <DialogFooter>
+              <Button
+                type="button"
+                onClick={() => {
+                  handleOpenChange(false)
+                }}
+              >
+                Done
+              </Button>
+            </DialogFooter>
+          </FieldGroup>
+        )}
+      </DialogContent>
+    </Dialog>
+  )
+}

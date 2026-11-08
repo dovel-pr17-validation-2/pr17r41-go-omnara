@@ -1,0 +1,1034 @@
+//go:build integration
+
+package dbmigrate_test
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"testing/fstest"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/omnara-ai/omnara/internal/dbmigrate"
+	"github.com/omnara-ai/omnara/internal/resourcename"
+	"github.com/omnara-ai/omnara/internal/skills"
+	"github.com/omnara-ai/omnara/internal/testutil/integrationdb"
+	schemamigrations "github.com/omnara-ai/omnara/migrations"
+	"github.com/stretchr/testify/require"
+)
+
+func TestPostgresMigrationsReplayIdempotently(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	_, db := openPostgresMigrationTestDB(t, ctx)
+	if err := applyProductionPostgresMigrations(ctx, db); err != nil {
+		t.Fatalf("idempotent migration replay: %v", err)
+	}
+
+	var applied int
+	require.NoError(t, db.QueryRowContext(
+		ctx,
+		`SELECT count(*)
+		 FROM goose_db_version
+		 WHERE version_id > 0 AND is_applied`,
+	).Scan(&applied))
+	migrationFiles, err := productionMigrationFiles()
+	require.NoError(t, err)
+	if applied != len(migrationFiles) {
+		t.Fatalf(
+			"applied production migrations = %d, want %d",
+			applied,
+			len(migrationFiles),
+		)
+	}
+}
+
+func TestPostgresNameStoragePolicies(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	pool, _ := openPostgresMigrationTestDB(t, ctx)
+	tests := []struct {
+		value string
+		want  bool
+	}{
+		{value: "", want: false},
+		{value: "Studio  54", want: true},
+		{value: "Café", want: true},
+		{value: "Cafe\u0301", want: false},
+		{value: "研究開発 شركة برمجيات", want: true},
+		{value: "🚀 Lab", want: true},
+		{value: strings.Repeat("界", resourcename.MaxCodePoints), want: true},
+		{value: strings.Repeat("界", resourcename.MaxCodePoints+1), want: false},
+		{value: " Acme", want: false},
+		{value: "Acme ", want: false},
+		{value: "Acme\u00a0Labs", want: false},
+		{value: "Acme\u2003Labs", want: false},
+		{value: "Acme\tLabs", want: false},
+		{value: "Acme\u007fLabs", want: false},
+		{value: "Acme\ufffdLabs", want: false},
+	}
+	for _, test := range tests {
+		var got bool
+		if err := pool.QueryRow(
+			ctx,
+			`SELECT resource_name_storage_is_valid($1)`,
+			test.value,
+		).Scan(&got); err != nil {
+			t.Fatalf("validate resource name %q in PostgreSQL: %v", test.value, err)
+		}
+		if got != test.want {
+			t.Errorf(
+				"PostgreSQL resource-name validity for %q = %t, want %t",
+				test.value,
+				got,
+				test.want,
+			)
+		}
+	}
+
+	skillNames := []string{
+		"deploy",
+		"deploy-api",
+		"Deploy",
+		"deploy_api",
+		"café",
+		strings.Repeat("a", skills.MaxSkillNameChars+1),
+	}
+	for _, name := range skillNames {
+		want := skills.ValidateName(name) == nil
+		var got bool
+		if err := pool.QueryRow(ctx, `SELECT skill_name_is_valid($1)`, name).Scan(&got); err != nil {
+			t.Fatalf("validate skill name %q in PostgreSQL: %v", name, err)
+		}
+		if got != want {
+			t.Errorf("PostgreSQL skill-name validity for %q = %t, want %t", name, got, want)
+		}
+	}
+}
+
+func TestPostgresStoredOrgScopeColumnsMatchOwnershipBoundaries(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	_, db := openPostgresMigrationTestDB(t, ctx)
+	const expected = "agent_config_definitions,agent_configs,agent_machine_bindings,agents,configured_model_revisions," +
+		"configured_models,daemon_runtimes,event_webhook_deliveries,event_webhooks,integrations,machine_daemon_tokens," +
+		"machine_online_intervals,machine_pools,machines,mcp_server_catalogs,model_call_contexts," +
+		"model_provider_configs,org_api_keys,org_invitations,org_managed_work_admission," +
+		"org_memberships,org_resource_limit_overrides,process_actions,processes," +
+		"project_machine_grants,project_machine_pool_grants,project_memberships," +
+		"project_model_grants,projects,secret_grants,secret_oauth_refresh_leases," +
+		"secret_versions,secrets,skill_grants,skills"
+	var actual string
+	require.NoError(t, db.QueryRowContext(ctx, `
+SELECT coalesce(string_agg(column_info.table_name, ',' ORDER BY column_info.table_name), '')
+FROM information_schema.columns column_info
+JOIN information_schema.tables table_info
+  ON table_info.table_schema = column_info.table_schema
+ AND table_info.table_name = column_info.table_name
+WHERE column_info.table_schema = current_schema()
+  AND column_info.column_name = 'org_id'
+  AND table_info.table_type = 'BASE TABLE'
+`).Scan(&actual))
+	if actual != expected {
+		t.Fatalf("stored org_id columns = %q, want %q", actual, expected)
+	}
+}
+
+func TestPostgresStoredProjectScopeColumnsMatchOwnershipBoundaries(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	_, db := openPostgresMigrationTestDB(t, ctx)
+	const expected = "actors,agent_config_definitions,agent_configs,agent_inputs,agent_machine_bindings," +
+		"agent_profile_versions," +
+		"agent_profiles,agents,cron_triggers,event_webhooks,integration_inbox,integration_runtime,integration_states," +
+		"integration_subscriptions,integration_targets,integrations," +
+		"memory_stores,model_call_contexts,process_actions,processes,project_machine_grants," +
+		"project_machine_pool_grants,project_memberships,project_model_grants"
+	var actual string
+	require.NoError(t, db.QueryRowContext(ctx, `
+	SELECT coalesce(string_agg(column_info.table_name, ',' ORDER BY column_info.table_name), '')
+	FROM information_schema.columns column_info
+	JOIN information_schema.tables table_info
+	  ON table_info.table_schema = column_info.table_schema
+	 AND table_info.table_name = column_info.table_name
+	WHERE column_info.table_schema = current_schema()
+	  AND column_info.column_name = 'project_id'
+	  AND table_info.table_type = 'BASE TABLE'
+	`).Scan(&actual))
+	if actual != expected {
+		t.Fatalf("stored project_id columns = %q, want %q", actual, expected)
+	}
+}
+
+func TestPostgresProjectOrganizationIsImmutable(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	_, db := openPostgresMigrationTestDB(t, ctx)
+	var originalOrgID, otherOrgID, projectID string
+	for name, destination := range map[string]*string{
+		"original": &originalOrgID,
+		"other":    &otherOrgID,
+	} {
+		require.NoError(t, db.QueryRowContext(ctx, `
+INSERT INTO orgs(name, created_at, updated_at)
+VALUES ($1, statement_timestamp(), statement_timestamp())
+RETURNING id::text
+`, name).Scan(destination))
+	}
+	require.NoError(t, db.QueryRowContext(ctx, `
+INSERT INTO projects(org_id, name, created_at, updated_at)
+VALUES ($1, 'immutable-project', statement_timestamp(), statement_timestamp())
+RETURNING id::text
+`, originalOrgID).Scan(&projectID))
+	if _, err := db.ExecContext(ctx, `UPDATE projects SET org_id = $1 WHERE id = $2`, otherOrgID, projectID); err == nil {
+		t.Fatal("project organization update succeeded")
+	}
+	var retainedOrgID string
+	require.NoError(
+		t, db.QueryRowContext(ctx, `SELECT org_id::text FROM projects WHERE id = $1`, projectID).Scan(&retainedOrgID),
+	)
+	if retainedOrgID != originalOrgID {
+		t.Fatalf("project org_id = %s, want %s", retainedOrgID, originalOrgID)
+	}
+}
+
+func TestPostgresAuthoredSchemaIdentifiersStayBelowTruncationLimit(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	_, db := openPostgresMigrationTestDB(t, ctx)
+	var identifiers string
+	require.NoError(t, db.QueryRowContext(ctx, `
+SELECT coalesce(string_agg(kind || ':' || owner || '.' || name, ',' ORDER BY kind, owner, name), '')
+FROM (
+  SELECT 'relation' AS kind, namespace.nspname AS owner, relation.relname AS name
+  FROM pg_class relation
+  JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+  WHERE namespace.oid = current_schema()::regnamespace
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_constraint constraint_info
+      WHERE constraint_info.conindid = relation.oid
+    )
+  UNION ALL
+  SELECT 'column', column_info.attrelid::regclass::text, column_info.attname
+  FROM pg_attribute column_info
+  WHERE column_info.attrelid IN (
+    SELECT relation.oid
+    FROM pg_class relation
+    WHERE relation.relnamespace = current_schema()::regnamespace
+  )
+    AND column_info.attnum > 0
+    AND NOT column_info.attisdropped
+  UNION ALL
+  SELECT 'trigger', trigger_info.tgrelid::regclass::text, trigger_info.tgname
+  FROM pg_trigger trigger_info
+  WHERE trigger_info.tgrelid IN (
+    SELECT relation.oid
+    FROM pg_class relation
+    WHERE relation.relnamespace = current_schema()::regnamespace
+  )
+    AND NOT trigger_info.tgisinternal
+  UNION ALL
+  SELECT 'function', current_schema(), function_info.proname
+  FROM pg_proc function_info
+  WHERE function_info.pronamespace = current_schema()::regnamespace
+  UNION ALL
+  SELECT 'policy', policy_info.polrelid::regclass::text, policy_info.polname
+  FROM pg_policy policy_info
+  WHERE policy_info.polrelid IN (
+    SELECT relation.oid
+    FROM pg_class relation
+    WHERE relation.relnamespace = current_schema()::regnamespace
+  )
+) identifiers
+WHERE octet_length(name) >= 63
+`).Scan(&identifiers))
+	if identifiers != "" {
+		t.Fatalf("authored schema identifiers at PostgreSQL's 63-byte truncation limit: %s", identifiers)
+	}
+}
+
+func TestPostgresExplicitConstraintNamesStayBelowTruncationLimit(t *testing.T) {
+	t.Parallel()
+	migrationFiles, err := filepath.Glob("../../migrations/*.sql")
+	require.NoError(t, err)
+	constraintNamePattern := regexp.MustCompile(
+		`(?is)\b(?:ADD\s+)?CONSTRAINT\s+("(?:[^"]|"")*"|[a-z_][a-z0-9_$]*)\s+` +
+			`(?:CHECK\b|UNIQUE\b|PRIMARY\s+KEY\b|EXCLUDE\b|FOREIGN\s+KEY\b|` +
+			`REFERENCES\b|NOT\s+NULL\b|NULL\b|DEFAULT\b|GENERATED\b)`,
+	)
+	columnReference := `owner_id uuid CONSTRAINT owner_reference_contract REFERENCES owners(id)`
+	if match := constraintNamePattern.FindStringSubmatch(
+		columnReference,
+	); len(match) != 2 || match[1] != "owner_reference_contract" {
+		t.Fatalf("explicit constraint matcher missed column-level reference: %q", match)
+	}
+	for _, migrationFile := range migrationFiles {
+		body, readErr := os.ReadFile(migrationFile)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		for _, match := range constraintNamePattern.FindAllSubmatch(body, -1) {
+			name := string(match[1])
+			if strings.HasPrefix(name, `"`) {
+				name = strings.ReplaceAll(strings.Trim(name, `"`), `""`, `"`)
+			}
+			if len([]byte(name)) >= 63 {
+				t.Errorf(
+					"explicit constraint name %q in %s reaches PostgreSQL's 63-byte truncation limit",
+					name,
+					migrationFile,
+				)
+			}
+		}
+	}
+}
+
+func TestPostgresSchemaHasNoExactDuplicateIndexes(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	_, db := openPostgresMigrationTestDB(t, ctx)
+	var duplicates string
+	require.NoError(t, db.QueryRowContext(ctx, `
+WITH index_info AS (
+  SELECT index_catalog.indrelid,
+         index_catalog.indexrelid,
+         index_catalog.indisexclusion,
+         access_method.amname,
+         index_catalog.indnkeyatts,
+         index_catalog.indnatts,
+         index_catalog.indkey::text AS keys,
+         index_catalog.indcollation::text AS collations,
+         index_catalog.indclass::text AS classes,
+         index_catalog.indoption::text AS options,
+         coalesce(pg_get_expr(index_catalog.indexprs, index_catalog.indrelid), '') AS expressions,
+         coalesce(pg_get_expr(index_catalog.indpred, index_catalog.indrelid), '') AS predicate
+  FROM pg_index index_catalog
+  JOIN pg_class index_relation ON index_relation.oid = index_catalog.indexrelid
+  JOIN pg_am access_method ON access_method.oid = index_relation.relam
+  WHERE index_relation.relnamespace = current_schema()::regnamespace
+    AND index_catalog.indisvalid
+    AND index_catalog.indisready
+), duplicate_groups AS (
+  SELECT indrelid,
+         string_agg(indexrelid::regclass::text, '+' ORDER BY indexrelid::regclass::text) AS names
+  FROM index_info
+  GROUP BY indrelid, indisexclusion, amname, indnkeyatts, indnatts,
+           keys, collations, classes, options, expressions, predicate
+  HAVING count(*) > 1
+)
+SELECT coalesce(string_agg(indrelid::regclass::text || ':' || names, ',' ORDER BY indrelid::regclass::text), '')
+FROM duplicate_groups
+`).Scan(&duplicates))
+	if duplicates != "" {
+		t.Fatalf("exact duplicate indexes: %s", duplicates)
+	}
+}
+
+func TestPostgresUniqueConstraintsDoNotRedundantlySupersetPrimaryKeys(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	_, db := openPostgresMigrationTestDB(t, ctx)
+	var redundant string
+	require.NoError(t, db.QueryRowContext(ctx, `
+WITH primary_keys AS (
+  SELECT primary_key.conrelid, primary_key.conkey
+  FROM pg_constraint primary_key
+  WHERE primary_key.connamespace = current_schema()::regnamespace
+    AND primary_key.contype = 'p'
+), redundant_unique_constraints AS (
+  SELECT unique_constraint.conrelid,
+         unique_constraint.conname
+  FROM pg_constraint unique_constraint
+  JOIN primary_keys
+    ON primary_keys.conrelid = unique_constraint.conrelid
+  WHERE unique_constraint.connamespace = current_schema()::regnamespace
+    AND unique_constraint.contype = 'u'
+    AND unique_constraint.conkey @> primary_keys.conkey
+    AND cardinality(unique_constraint.conkey) > cardinality(primary_keys.conkey)
+    AND NOT EXISTS (
+      SELECT 1
+      FROM pg_constraint foreign_key
+      WHERE foreign_key.contype = 'f'
+        AND foreign_key.confrelid = unique_constraint.conrelid
+        AND foreign_key.confkey = unique_constraint.conkey
+    )
+)
+SELECT coalesce(string_agg(
+  conrelid::regclass::text || '.' || conname, ','
+  ORDER BY conrelid::regclass::text, conname
+), '')
+FROM redundant_unique_constraints
+`).Scan(&redundant))
+	if redundant != "" {
+		t.Fatalf(
+			"unique constraints redundantly contain primary keys without a referencing foreign key: %s",
+			redundant,
+		)
+	}
+}
+
+const mutatingForeignKeysWithoutSupportingIndexesQuery = `
+WITH mutating_foreign_keys AS (
+  SELECT constraint_info.conrelid,
+         constraint_info.conname,
+         constraint_info.conkey,
+         CASE count(*) FILTER (WHERE NOT child_column.attnotnull)
+           WHEN 0 THEN NULL
+           WHEN 1 THEN string_agg(format('(%I IS NOT NULL)', child_column.attname), '')
+             FILTER (WHERE NOT child_column.attnotnull)
+           ELSE '(' || string_agg(
+             format('(%I IS NOT NULL)', child_column.attname),
+             ' AND ' ORDER BY foreign_key_column.ordinal
+           ) FILTER (WHERE NOT child_column.attnotnull) || ')'
+         END AS nullable_key_predicate
+  FROM pg_constraint constraint_info
+  CROSS JOIN LATERAL unnest(constraint_info.conkey) WITH ORDINALITY
+    AS foreign_key_column(attnum, ordinal)
+  JOIN pg_attribute child_column
+    ON child_column.attrelid = constraint_info.conrelid
+   AND child_column.attnum = foreign_key_column.attnum
+  WHERE constraint_info.connamespace = current_schema()::regnamespace
+    AND constraint_info.contype = 'f'
+    AND constraint_info.confdeltype IN ('c', 'n', 'd')
+  GROUP BY constraint_info.conrelid, constraint_info.conname, constraint_info.conkey
+), unsupported_foreign_keys AS (
+  SELECT foreign_key.conrelid,
+         foreign_key.conname
+  FROM mutating_foreign_keys foreign_key
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM pg_index index_info
+    WHERE index_info.indrelid = foreign_key.conrelid
+      AND index_info.indisvalid
+      AND index_info.indisready
+      AND index_info.indnkeyatts >= cardinality(foreign_key.conkey)
+      AND (
+        SELECT array_agg(index_column.attnum ORDER BY index_column.attnum)
+        FROM unnest(index_info.indkey) WITH ORDINALITY index_column(attnum, ordinal)
+        WHERE index_column.ordinal <= cardinality(foreign_key.conkey)
+      ) = (
+          SELECT array_agg(foreign_key_column.attnum ORDER BY foreign_key_column.attnum)
+          FROM unnest(foreign_key.conkey) foreign_key_column(attnum)
+        )
+      AND (
+        index_info.indpred IS NULL
+        OR (
+          foreign_key.nullable_key_predicate IS NOT NULL
+          AND pg_get_expr(index_info.indpred, index_info.indrelid) =
+            foreign_key.nullable_key_predicate
+        )
+      )
+  )
+)
+SELECT coalesce(string_agg(
+  conrelid::regclass::text || '.' || conname, ','
+  ORDER BY conrelid::regclass::text, conname
+), '')
+FROM unsupported_foreign_keys
+`
+
+func TestPostgresMutatingForeignKeysHaveSupportingIndexes(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	_, db := openPostgresMigrationTestDB(t, ctx)
+	unsupported := mutatingForeignKeysWithoutSupportingIndexes(t, ctx, db)
+	if unsupported != "" {
+		t.Fatalf("mutating foreign keys without full-key indexes: %s", unsupported)
+	}
+}
+
+func TestPostgresMutatingForeignKeyIndexesRejectIncompletePredicates(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	_, db := openPostgresMigrationTestDB(t, ctx)
+	if _, err := db.ExecContext(ctx, `
+DROP INDEX user_auth_tokens_email_idx;
+CREATE INDEX user_auth_tokens_incomplete_email_idx
+    ON user_auth_tokens(user_id, user_email_id)
+    WHERE consumed_at IS NULL;
+`); err != nil {
+		t.Fatal(err)
+	}
+	unsupported := mutatingForeignKeysWithoutSupportingIndexes(t, ctx, db)
+	if !strings.Contains(unsupported, "user_auth_tokens.") {
+		t.Fatalf("incomplete partial index unexpectedly supported user-auth-token cascade: %s", unsupported)
+	}
+}
+
+func mutatingForeignKeysWithoutSupportingIndexes(
+	t *testing.T,
+	ctx context.Context,
+	db *sql.DB,
+) string {
+	t.Helper()
+	var unsupported string
+	require.NoError(
+		t,
+		db.QueryRowContext(ctx, mutatingForeignKeysWithoutSupportingIndexesQuery).Scan(&unsupported),
+	)
+	return unsupported
+}
+
+func TestOpenPostgresAcceptsPoolParameters(t *testing.T) {
+	t.Parallel()
+
+	databaseURL := os.Getenv("OMNARA_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("OMNARA_TEST_DATABASE_URL is not set")
+	}
+	integrationdb.AssertTestDatabaseURL(t, databaseURL)
+	parsed, err := url.Parse(databaseURL)
+	require.NoError(t, err)
+	query := parsed.Query()
+	query.Set("pool_max_conns", "5")
+	parsed.RawQuery = query.Encode()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	db, err := dbmigrate.OpenPostgres(ctx, parsed.String())
+	if err != nil {
+		t.Fatalf("open migration database with pool parameter: %v", err)
+	}
+	require.NoError(t, db.Close())
+}
+
+func TestOpenPostgresAppliesSessionDefaultsToEveryConnection(t *testing.T) {
+	t.Parallel()
+	databaseURL := testDatabaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	db, err := dbmigrate.OpenPostgres(ctx, databaseURL)
+	if err != nil {
+		t.Fatalf("open migration database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	connections := make([]*sql.Conn, 0, 3)
+	defer func() {
+		for _, conn := range connections {
+			_ = conn.Close()
+		}
+	}()
+	for range 3 {
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatalf("acquire migration connection: %v", err)
+		}
+		connections = append(connections, conn)
+		var applicationName, lockTimeout, statementTimeout string
+		if err := conn.QueryRowContext(ctx, `
+SELECT current_setting('application_name'),
+       current_setting('lock_timeout'),
+       current_setting('statement_timeout')
+`).Scan(&applicationName, &lockTimeout, &statementTimeout); err != nil {
+			t.Fatalf("read migration session settings: %v", err)
+		}
+		if applicationName != "omnara-migrate" || lockTimeout != "30s" || statementTimeout != "15min" {
+			t.Fatalf(
+				"migration session settings = (%q, %q, %q)",
+				applicationName,
+				lockTimeout,
+				statementTimeout,
+			)
+		}
+	}
+}
+
+func TestOpenPostgresPreservesExplicitSessionSettings(t *testing.T) {
+	t.Parallel()
+	parsed, err := url.Parse(testDatabaseURL(t))
+	require.NoError(t, err)
+	query := parsed.Query()
+	query.Set("application_name", "operator-migrator")
+	query.Set("lock_timeout", "4s")
+	query.Set("statement_timeout", "9s")
+	parsed.RawQuery = query.Encode()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	db, err := dbmigrate.OpenPostgres(ctx, parsed.String())
+	if err != nil {
+		t.Fatalf("open migration database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var applicationName, lockTimeout, statementTimeout string
+	require.NoError(t, db.QueryRowContext(ctx, `
+SELECT current_setting('application_name'),
+       current_setting('lock_timeout'),
+       current_setting('statement_timeout')
+`).Scan(&applicationName, &lockTimeout, &statementTimeout))
+	if applicationName != "operator-migrator" || lockTimeout != "4s" || statementTimeout != "9s" {
+		t.Fatalf(
+			"migration session settings = (%q, %q, %q)",
+			applicationName,
+			lockTimeout,
+			statementTimeout,
+		)
+	}
+}
+
+func TestRunPostgresHonorsWholeRunTimeout(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	pool := integrationdb.OpenUnmigratedPool(t, ctx)
+	databaseURL := generatedDatabaseURL(t, pool)
+
+	slow := fstest.MapFS{
+		"000001_slow.sql": {Data: []byte(`-- +goose Up
+CREATE TABLE slow_probe(id bigint PRIMARY KEY);
+SELECT pg_sleep(10);
+`)},
+	}
+	started := time.Now()
+	err := dbmigrate.RunPostgres(ctx, databaseURL, slow, 200*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("bounded migration error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("bounded migration returned after %s", elapsed)
+	}
+
+	var tableExists bool
+	require.NoError(t, pool.QueryRow(
+		ctx,
+		`SELECT to_regclass('slow_probe') IS NOT NULL`,
+	).Scan(&tableExists))
+	if tableExists {
+		t.Fatal("timed-out migration left schema changes behind")
+	}
+}
+
+func TestPostgresMigrationsUseConfiguredPgTrgmSchema(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	pool := integrationdb.OpenUnmigratedPool(t, ctx)
+	for _, statement := range []string{
+		`DROP EXTENSION IF EXISTS pg_trgm`,
+		`CREATE SCHEMA extensions`,
+		`CREATE EXTENSION pg_trgm WITH SCHEMA extensions`,
+		`CREATE SCHEMA agents`,
+	} {
+		if _, err := pool.Exec(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	config := pool.Config().ConnConfig.Copy()
+	config.RuntimeParams["search_path"] = "agents,extensions"
+	db := stdlib.OpenDB(*config)
+	defer func() { _ = db.Close() }()
+	if err := applyProductionPostgresMigrations(ctx, db); err != nil {
+		t.Fatalf("migrate with configured pg_trgm schema: %v", err)
+	}
+
+	var extensionSchema string
+	require.NoError(t, db.QueryRowContext(
+		ctx,
+		`SELECT namespace.nspname
+		 FROM pg_catalog.pg_extension AS extension
+		 JOIN pg_catalog.pg_namespace AS namespace
+		   ON namespace.oid = extension.extnamespace
+		 WHERE extension.extname = 'pg_trgm'`,
+	).Scan(&extensionSchema))
+	if extensionSchema != "extensions" {
+		t.Fatalf("pg_trgm schema = %q, want extensions", extensionSchema)
+	}
+
+	var indexes int
+	require.NoError(t, db.QueryRowContext(
+		ctx,
+		`SELECT count(*)
+		 FROM pg_catalog.pg_indexes
+		 WHERE schemaname = 'agents'
+		   AND indexname IN (
+		       'projects_name_trgm_idx',
+		       'secrets_name_trgm_idx',
+		       'agent_profiles_name_trgm_idx',
+		       'agents_name_trgm_idx',
+		       'machines_display_name_trgm_idx',
+		       'skills_name_trgm_idx'
+		   )`,
+	).Scan(&indexes))
+	if indexes != 6 {
+		t.Fatalf("trigram indexes in product schema = %d, want 6", indexes)
+	}
+}
+
+func TestPostgresMigrationsInstallPgTrgmInProductSchema(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	pool := integrationdb.OpenUnmigratedPool(t, ctx)
+	for _, statement := range []string{
+		`DROP EXTENSION IF EXISTS pg_trgm`,
+		`DROP SCHEMA public CASCADE`,
+		`CREATE SCHEMA agents`,
+	} {
+		if _, err := pool.Exec(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	config := pool.Config().ConnConfig.Copy()
+	config.RuntimeParams["search_path"] = "agents"
+	db := stdlib.OpenDB(*config)
+	defer func() { _ = db.Close() }()
+	if err := applyProductionPostgresMigrations(ctx, db); err != nil {
+		t.Fatalf("migrate without public schema: %v", err)
+	}
+
+	var extensionSchema string
+	require.NoError(t, db.QueryRowContext(
+		ctx,
+		`SELECT namespace.nspname
+		 FROM pg_catalog.pg_extension AS extension
+		 JOIN pg_catalog.pg_namespace AS namespace
+		   ON namespace.oid = extension.extnamespace
+		 WHERE extension.extname = 'pg_trgm'`,
+	).Scan(&extensionSchema))
+	if extensionSchema != "agents" {
+		t.Fatalf("pg_trgm schema = %q, want agents", extensionSchema)
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("open empty-search-path connection: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(ctx, `SET search_path TO ''`); err != nil {
+		t.Fatalf("clear search path: %v", err)
+	}
+	if _, err := conn.ExecContext(
+		ctx,
+		`INSERT INTO agents.orgs(name, created_at, updated_at)
+		 VALUES ('Qualified Organization', now(), now())`,
+	); err != nil {
+		t.Fatalf("insert through qualified table with empty search path: %v", err)
+	}
+}
+
+func TestPostgresMigrationFailureRollsBack(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	_, db := openPostgresMigrationTestDB(t, ctx)
+	nextVersion := currentPostgresMigrationVersion(t, ctx, db) + 1
+	failing := fstest.MapFS{
+		fmt.Sprintf("%06d_failing.sql", nextVersion): {
+			Data: []byte(`-- +goose Up
+CREATE TABLE migration_transaction_probe(id bigint PRIMARY KEY);
+SELECT missing_migration_function();
+`),
+		},
+	}
+	if err := dbmigrate.ApplyPostgres(ctx, db, failing); err == nil {
+		t.Fatal("failing migration unexpectedly succeeded")
+	}
+
+	var probeExists bool
+	require.NoError(t, db.QueryRowContext(
+		ctx,
+		`SELECT to_regclass('public.migration_transaction_probe') IS NOT NULL`,
+	).Scan(&probeExists))
+	if probeExists {
+		t.Fatal("failed migration left its schema change behind")
+	}
+}
+
+func TestPostgresMigrationsSerializeConcurrentRunners(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	_, db := openPostgresMigrationTestDB(t, ctx)
+	nextVersion := currentPostgresMigrationVersion(t, ctx, db) + 1
+	locked := fstest.MapFS{
+		fmt.Sprintf("%06d_locked.sql", nextVersion): {
+			Data: []byte(`-- +goose Up
+SELECT pg_sleep(0.2);
+CREATE TABLE migration_lock_probe(id bigint PRIMARY KEY);
+`),
+		},
+	}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	for range 2 {
+		go func() {
+			ready.Done()
+			<-start
+			errs <- dbmigrate.ApplyPostgres(ctx, db, locked)
+		}()
+	}
+	ready.Wait()
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent migration: %v", err)
+		}
+	}
+
+	var applied int
+	require.NoError(t, db.QueryRowContext(
+		ctx,
+		`SELECT count(*)
+		 FROM goose_db_version
+		 WHERE version_id = $1 AND is_applied`,
+		nextVersion,
+	).Scan(&applied))
+	if applied != 1 {
+		t.Fatalf("concurrent migration records = %d, want 1", applied)
+	}
+}
+
+func TestPostgresRejectsNewerDatabaseVersion(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	_, db := openPostgresMigrationTestDB(t, ctx)
+	newerVersion := currentPostgresMigrationVersion(t, ctx, db) + 1
+	if _, err := db.ExecContext(
+		ctx,
+		`INSERT INTO goose_db_version(version_id, is_applied)
+		 VALUES($1, true)`,
+		newerVersion,
+	); err != nil {
+		t.Fatal(err)
+	}
+	err := applyProductionPostgresMigrations(ctx, db)
+	if err == nil || !strings.Contains(err.Error(), "newer than binary target") {
+		t.Fatalf("newer database migration error = %v", err)
+	}
+}
+
+func TestPostgresOlderMigratorSeesConcurrentNewerVersion(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	pool, db := openPostgresMigrationTestDB(t, ctx)
+	nextVersion := currentPostgresMigrationVersion(t, ctx, db) + 1
+	newerVersion := nextVersion + 1
+	nextMigration := []byte(`-- +goose Up
+SELECT pg_sleep(1) /* omnara_concurrent_migration_probe */;
+CREATE TABLE concurrent_migration_next(id bigint PRIMARY KEY);
+`)
+	older := fstest.MapFS{
+		fmt.Sprintf("%06d_concurrent.sql", nextVersion): {Data: nextMigration},
+	}
+	newer := fstest.MapFS{
+		fmt.Sprintf("%06d_concurrent.sql", nextVersion): {Data: nextMigration},
+		fmt.Sprintf("%06d_newer.sql", newerVersion): {
+			Data: []byte(`-- +goose Up
+CREATE TABLE concurrent_migration_newer(id bigint PRIMARY KEY);
+`),
+		},
+	}
+
+	newerErr := make(chan error, 1)
+	go func() {
+		newerErr <- dbmigrate.ApplyPostgres(ctx, db, newer)
+	}()
+
+	for {
+		var active bool
+		require.NoError(t, pool.QueryRow(
+			ctx,
+			`SELECT EXISTS (
+				SELECT 1
+				FROM pg_stat_activity
+				WHERE datname = current_database()
+				  AND pid <> pg_backend_pid()
+				  AND state = 'active'
+				  AND query LIKE '%omnara_concurrent_migration_probe%'
+			)`,
+		).Scan(&active))
+		if active {
+			break
+		}
+		select {
+		case err := <-newerErr:
+			t.Fatalf("newer migrator finished before concurrency probe: %v", err)
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	err := dbmigrate.ApplyPostgres(ctx, db, older)
+	if err == nil || !strings.Contains(err.Error(), "newer than binary target") {
+		t.Fatalf("older concurrent migrator error = %v", err)
+	}
+	if err := <-newerErr; err != nil {
+		t.Fatalf("newer concurrent migrator: %v", err)
+	}
+}
+
+func openPostgresMigrationTestDB(
+	t *testing.T,
+	ctx context.Context,
+) (*pgxpool.Pool, *sql.DB) {
+	t.Helper()
+	pool := integrationdb.OpenMigratedPool(t, ctx, "../../migrations")
+	db := stdlib.OpenDBFromPool(pool)
+	t.Cleanup(func() { _ = db.Close() })
+	return pool, db
+}
+
+func applyProductionPostgresMigrations(ctx context.Context, db *sql.DB) error {
+	return dbmigrate.ApplyPostgres(
+		ctx,
+		db,
+		os.DirFS("../../migrations"),
+		schemamigrations.GoMigrations()...,
+	)
+}
+
+func applyProductionPostgresMigrationsThrough(
+	t *testing.T,
+	ctx context.Context,
+	db *sql.DB,
+	maximum int64,
+) error {
+	t.Helper()
+	goMigrations := schemamigrations.GoMigrations()
+	selectedGoMigrations := goMigrations[:0]
+	for _, migration := range goMigrations {
+		if migration.Version <= maximum {
+			selectedGoMigrations = append(selectedGoMigrations, migration)
+		}
+	}
+	return dbmigrate.ApplyPostgres(
+		ctx,
+		db,
+		migrationFilesThrough(t, maximum),
+		selectedGoMigrations...,
+	)
+}
+
+func currentPostgresMigrationVersion(t *testing.T, ctx context.Context, db *sql.DB) int64 {
+	t.Helper()
+	var version int64
+	require.NoError(t, db.QueryRowContext(
+		ctx,
+		`SELECT coalesce(max(version_id), 0)
+		 FROM goose_db_version
+		 WHERE is_applied`,
+	).Scan(&version))
+	return version
+}
+
+func migrationFilesThrough(t *testing.T, maximum int64) fstest.MapFS {
+	t.Helper()
+	entries, err := os.ReadDir("../../migrations")
+	require.NoError(t, err)
+	migrations := make(fstest.MapFS)
+	for _, entry := range entries {
+		if entry.IsDir() || !isProductionMigrationFile(entry.Name()) {
+			continue
+		}
+		prefix, _, ok := strings.Cut(entry.Name(), "_")
+		if !ok {
+			t.Fatalf("migration file lacks version prefix: %s", entry.Name())
+		}
+		version, err := strconv.ParseInt(prefix, 10, 64)
+		if err != nil {
+			t.Fatalf("parse migration version %s: %v", entry.Name(), err)
+		}
+		if version > maximum {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join("../../migrations", entry.Name()))
+		require.NoError(t, err)
+		migrations[entry.Name()] = &fstest.MapFile{Data: data}
+	}
+	return migrations
+}
+
+func productionMigrationFiles() ([]string, error) {
+	entries, err := os.ReadDir("../../migrations")
+	if err != nil {
+		return nil, err
+	}
+	files := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !isProductionMigrationFile(entry.Name()) {
+			continue
+		}
+		files = append(files, filepath.Join("../../migrations", entry.Name()))
+	}
+	return files, nil
+}
+
+func isProductionMigrationFile(name string) bool {
+	version, _, found := strings.Cut(name, "_")
+	if !found || len(version) != 6 {
+		return false
+	}
+	if _, err := strconv.ParseUint(version, 10, 64); err != nil {
+		return false
+	}
+	extension := filepath.Ext(name)
+	return extension == ".sql" || extension == ".go" && !strings.HasSuffix(name, "_test.go")
+}
+
+func testDatabaseURL(t *testing.T) string {
+	t.Helper()
+	databaseURL := os.Getenv("OMNARA_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("OMNARA_TEST_DATABASE_URL is not set")
+	}
+	integrationdb.AssertTestDatabaseURL(t, databaseURL)
+	return databaseURL
+}
+
+func generatedDatabaseURL(t *testing.T, pool *pgxpool.Pool) string {
+	t.Helper()
+	parsed, err := url.Parse(testDatabaseURL(t))
+	require.NoError(t, err)
+	if parsed.Scheme != "postgres" && parsed.Scheme != "postgresql" {
+		t.Skip("whole-run URL test requires a PostgreSQL URL connection string")
+	}
+	parsed.Path = "/" + pool.Config().ConnConfig.Database
+	return parsed.String()
+}

@@ -1,0 +1,143 @@
+import {
+  approveDeviceAuth,
+  denyDeviceAuth,
+  type DeviceAuthPending,
+  pendingDeviceAuth,
+} from '@omnara/sdk/browser'
+import { useEffect, useState } from 'react'
+
+import { AuthLayout } from '@/components/auth/AuthLayout'
+import { Check, X } from '@/components/icons'
+import { Button } from '@/components/ui/button'
+import { Spinner } from '@/components/ui/spinner'
+import { errorMessage } from '@/lib/submit-status'
+
+type DeviceAuthState =
+  | { kind: 'loading' }
+  | { kind: 'ready'; flow: DeviceAuthPending }
+  | { kind: 'submitting'; flow: DeviceAuthPending; decision: 'approve' | 'deny' }
+  | { kind: 'approved' }
+  | { kind: 'denied' }
+  | { kind: 'error'; message: string }
+
+export function DeviceAuth() {
+  const userCode = new URLSearchParams(window.location.search).get('user_code')?.trim() ?? ''
+  const [state, setState] = useState<DeviceAuthState>(
+    userCode ? { kind: 'loading' } : { kind: 'error', message: 'Missing device code' },
+  )
+
+  useEffect(() => {
+    let cancelled = false
+    async function load() {
+      if (!userCode) return
+      try {
+        const flow = await pendingDeviceAuth(userCode)
+        if (!cancelled) setState({ kind: 'ready', flow })
+      } catch (error) {
+        if (!cancelled) {
+          setState({ kind: 'error', message: errorMessage(error, 'Device approval failed') })
+        }
+      }
+    }
+    void load()
+    return () => {
+      cancelled = true
+    }
+  }, [userCode])
+
+  async function submit(decision: 'approve' | 'deny') {
+    setState((prev) =>
+      prev.kind === 'ready' ? { kind: 'submitting', flow: prev.flow, decision } : prev,
+    )
+    try {
+      if (decision === 'approve') {
+        await approveDeviceAuth(userCode)
+        setState({ kind: 'approved' })
+      } else {
+        await denyDeviceAuth(userCode)
+        setState({ kind: 'denied' })
+      }
+    } catch (error) {
+      setState({ kind: 'error', message: errorMessage(error, 'Device approval failed') })
+    }
+  }
+
+  return (
+    <AuthLayout>
+      <div className="flex flex-col gap-6">
+        <div>
+          <h1 className="type-title">Approve device login</h1>
+          <p className="text-muted-foreground mt-1 text-sm">
+            Only approve if this code matches the one shown by the CLI where you started login.
+          </p>
+        </div>
+
+        {state.kind === 'loading' && (
+          <div className="flex items-center gap-3 text-sm">
+            <Spinner />
+            Loading device request
+          </div>
+        )}
+
+        {(state.kind === 'ready' || state.kind === 'submitting') && (
+          <div className="space-y-5 rounded-lg border p-5">
+            <div className="space-y-3 text-sm">
+              <Detail label="Client" value={state.flow.clientName || 'Unknown client'} />
+              <Detail label="Token" value={state.flow.tokenName || 'Device token'} />
+              <Detail label="Code" value={userCode} />
+            </div>
+            <div className="flex flex-wrap gap-3">
+              <Button
+                loading={state.kind === 'submitting' && state.decision === 'approve'}
+                icon={<Check className="h-4 w-4" />}
+                onClick={() => {
+                  void submit('approve')
+                }}
+                disabled={state.kind === 'submitting'}
+              >
+                Approve
+              </Button>
+              <Button
+                variant="outline"
+                loading={state.kind === 'submitting' && state.decision === 'deny'}
+                icon={<X className="h-4 w-4" />}
+                onClick={() => {
+                  void submit('deny')
+                }}
+                disabled={state.kind === 'submitting'}
+              >
+                Deny
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {state.kind === 'approved' && (
+          <Result title="Device approved" detail="Return to the CLI to continue." />
+        )}
+        {state.kind === 'denied' && (
+          <Result title="Device denied" detail="You can close this tab and return to the CLI." />
+        )}
+        {state.kind === 'error' && <Result title={state.message} />}
+      </div>
+    </AuthLayout>
+  )
+}
+
+function Detail({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="grid gap-1 sm:grid-cols-[8rem_1fr]">
+      <div className="text-muted-foreground">{label}</div>
+      <div className="font-medium break-words">{value}</div>
+    </div>
+  )
+}
+
+function Result({ title, detail }: { title: string; detail?: string }) {
+  return (
+    <div className="space-y-1 rounded-lg border p-5 text-sm">
+      <div className="font-medium">{title}</div>
+      {detail && <div className="text-muted-foreground">{detail}</div>}
+    </div>
+  )
+}

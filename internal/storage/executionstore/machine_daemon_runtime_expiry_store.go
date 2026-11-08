@@ -1,0 +1,98 @@
+package executionstore
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/omnara-ai/omnara/internal/notifications"
+	"github.com/omnara-ai/omnara/internal/storage/internal/agentexecution"
+	"github.com/omnara-ai/omnara/internal/storage/internal/dbsqlc"
+)
+
+func (s *Store) EndExpiredDaemonRuntimes(
+	ctx context.Context,
+	batchLimit int32,
+) ([]DaemonRuntimeRecord, error) {
+	if batchLimit <= 0 {
+		batchLimit = 100
+	}
+	candidates, err := s.q.ListExpiredDaemonRuntimeCandidates(
+		ctx,
+		dbsqlc.ListExpiredDaemonRuntimeCandidatesParams{BatchLimit: batchLimit},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list expired daemon runtimes: %w", err)
+	}
+	records := make([]DaemonRuntimeRecord, 0, len(candidates))
+	for _, candidate := range candidates {
+		record, ended, err := s.endExpiredDaemonRuntime(ctx, candidate)
+		if err != nil {
+			return nil, err
+		}
+		if ended {
+			records = append(records, record)
+		}
+	}
+	return records, nil
+}
+
+func (s *Store) endExpiredDaemonRuntime(
+	ctx context.Context,
+	candidate dbsqlc.ListExpiredDaemonRuntimeCandidatesRow,
+) (DaemonRuntimeRecord, bool, error) {
+	type transactionResult struct {
+		runtime DaemonRuntimeRecord
+		ended   bool
+	}
+	retried, retryErr := agentexecution.Retry(ctx,
+		"end_expired_daemon_runtime",
+		func(ctx context.Context) (transactionResult, error) {
+			unit, err := s.cell.Begin(ctx)
+			if err != nil {
+				return transactionResult{}, err
+			}
+			defer func() { _ = unit.Rollback(ctx) }()
+			tx := unit.DB()
+			txNotifications := unit.Notifications()
+
+			qtx := dbsqlc.New(tx)
+			if _, err := qtx.LockMachineForLifecycle(
+				ctx,
+				dbsqlc.LockMachineForLifecycleParams{
+					OrgID: candidate.OrgID,
+					ID:    candidate.MachineID,
+				},
+			); err != nil {
+				return transactionResult{}, fmt.Errorf(
+					"lock machine for expired daemon runtime: %w",
+					err,
+				)
+			}
+			row, err := qtx.EndExpiredDaemonRuntime(
+				ctx,
+				dbsqlc.EndExpiredDaemonRuntimeParams(candidate),
+			)
+			if errors.Is(err, pgx.ErrNoRows) {
+				if err := unit.Commit(ctx, "skipped expired daemon runtime"); err != nil {
+					return transactionResult{}, err
+				}
+				return transactionResult{}, nil
+			}
+			if err != nil {
+				return transactionResult{}, fmt.Errorf("end expired daemon runtime: %w", err)
+			}
+			record := daemonRuntimeFromExpired(row)
+			txNotifications.AddDaemonRuntimeEnded(
+				record.ID,
+				record.MachineID,
+				notifications.DaemonRuntimeEndReconnect,
+			)
+			if err := unit.Commit(ctx, "end expired daemon runtime"); err != nil {
+				return transactionResult{}, err
+			}
+			return transactionResult{record, true}, nil
+		})
+	return retried.runtime, retried.ended, retryErr
+}

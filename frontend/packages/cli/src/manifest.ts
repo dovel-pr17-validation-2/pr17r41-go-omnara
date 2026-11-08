@@ -1,0 +1,1207 @@
+import { type MemoryFile, sdk } from '@omnara/sdk'
+import * as schemas from '@omnara/sdk/zod'
+import * as z from 'zod'
+
+import { agentChatOp, agentEventsStreamOp } from './agent-commands.ts'
+import { formatAgentEventList } from './agent-rendering.ts'
+import { agentWaitOp } from './agent-wait.ts'
+import {
+  currentProfileConfigId,
+  renderConfigSource,
+  renderLaunchConfig,
+  resolveConfigId,
+  zConfigAttachment,
+  zConfigSourceAttachment,
+} from './config-attachment.ts'
+import { type CommandGroup, flowOp, op, type OperationSpec } from './factory.ts'
+import { formatRecord, formatTable, formatVoid } from './format.ts'
+import { integrationCommandGroups } from './integration-setup.ts'
+import { formatMachineSetup, runMachineCreateLocal, zMachineSetupBody } from './machine-setup.ts'
+import { runAgentMcpAdd, runProfileMcpAdd, zMcpAddBody } from './mcp-add.ts'
+import { runMcpOAuth, zMcpOAuthBody } from './mcp-oauth.ts'
+import { loadMemoryUpload, memoryDownloadOp, zMemoryUploadBody } from './memory-files.ts'
+import { loadSkillArchive, zCreateSkillCliBody } from './skill-archive.ts'
+
+export const commandGroups: CommandGroup[] = [
+  ...integrationCommandGroups,
+  {
+    name: 'agents',
+    aliases: ['agent'],
+    summary: 'Launch and manage agents',
+    operations: [
+      op({
+        verb: 'list',
+        summary: 'List agents in a project',
+        fn: sdk.listAgents,
+        format: (response) =>
+          formatTable([
+            'id',
+            'name',
+            'state',
+            'activity',
+            'model',
+            'parent_agent_id',
+            'created_at',
+          ])({
+            data: response.data.map((agent) => ({
+              ...agent,
+              activity: agent.activity?.state,
+              model: agent.model?.name,
+              parent_agent_id: agent.parent_agent_id ?? '',
+            })),
+            next_cursor: response.next_cursor,
+          }),
+        path: schemas.zListAgentsPath,
+        query: schemas.zListAgentsQuery,
+      }),
+      op({
+        verb: 'get',
+        summary: 'Fetch an agent',
+        fn: sdk.getAgent,
+        format: formatRecord(),
+        path: schemas.zGetAgentPath,
+      }),
+      agentWaitOp,
+      op({
+        verb: 'launch',
+        summary: 'Launch a new agent',
+        fn: sdk.createAgent,
+        format: formatRecord(),
+        path: schemas.zCreateAgentPath,
+        body: zConfigAttachment.extend({
+          profile: schemas.zAgentProfileId
+            .optional()
+            .describe('agent profile ID; runs its current config unless a config is given'),
+          name: schemas.zAgentName.optional(),
+          message: z.string().optional(),
+        }),
+        transformBody: ({ profile, name, message, ...attachment }) => ({
+          name,
+          message,
+          ...renderLaunchConfig(profile, attachment),
+        }),
+      }),
+      op({
+        verb: 'update',
+        summary: "Replace a running agent's config",
+        fn: sdk.updateAgentConfig,
+        format: (response) => formatRecord()(response.agent_config),
+        path: schemas.zUpdateAgentConfigPath,
+        body: zConfigSourceAttachment.extend({
+          expected_current_config_id: schemas.zAgentConfigId
+            .optional()
+            .describe('fail unless the agent still runs this config'),
+        }),
+        transformBody: ({ expected_current_config_id, ...attachment }) => ({
+          ...renderConfigSource(attachment),
+          expected_current_config_id,
+        }),
+      }),
+      op({
+        verb: 'cancel',
+        summary: 'Cancel a running agent',
+        fn: sdk.cancelAgent,
+        format: formatRecord(),
+        path: schemas.zCancelAgentPath,
+        body: schemas.zCancelAgentBody,
+      }),
+      op({
+        verb: 'archive',
+        summary: 'Archive an agent',
+        fn: sdk.archiveAgent,
+        format: formatRecord(),
+        path: schemas.zArchiveAgentPath,
+      }),
+      flowOp({
+        verb: 'mcp-add',
+        summary: 'Create an OAuth secret and add an MCP server to an agent',
+        path: z.object({
+          orgID: schemas.zOrganizationId,
+          projectID: schemas.zProjectId,
+          agentID: schemas.zAgentId,
+        }),
+        body: zMcpAddBody,
+        run: runAgentMcpAdd,
+      }),
+      agentChatOp,
+      op({
+        verb: 'input',
+        summary: 'Send input to an agent',
+        fn: sdk.createAgentInput,
+        format: (response) => formatRecord()(response.agent_input),
+        path: schemas.zCreateAgentInputPath,
+        body: schemas.zCreateAgentInputBody
+          .partial({ content_blocks: true })
+          .extend({
+            message: z.string().optional().describe('plain text to send as a single text block'),
+          })
+          .transform(({ message, content_blocks, ...rest }, ctx) => {
+            if (content_blocks !== undefined && message === undefined) {
+              return { ...rest, content_blocks }
+            }
+            if (message !== undefined && content_blocks === undefined) {
+              return { ...rest, content_blocks: [{ type: 'text' as const, text: message }] }
+            }
+            ctx.addIssue('pass exactly one of --message or --content-blocks')
+            return z.NEVER
+          }),
+      }),
+    ],
+    groups: [
+      {
+        name: 'events',
+        aliases: ['event'],
+        summary: "Inspect an agent's event log",
+        operations: [
+          op({
+            verb: 'list',
+            summary: "List an agent's events",
+            fn: sdk.listEvents,
+            format: formatAgentEventList,
+            path: schemas.zListEventsPath,
+            query: schemas.zListEventsQuery.extend({
+              before_sequence: z.int().gte(0).optional(),
+              after_sequence: z.int().gte(0).optional(),
+            }),
+          }),
+          agentEventsStreamOp,
+        ],
+      },
+      {
+        name: 'interactions',
+        aliases: ['interaction'],
+        summary: "Manage an agent's interactions",
+        operations: [
+          op({
+            verb: 'list',
+            summary: "List an agent's interactions",
+            fn: sdk.listAgentInteractions,
+            format: (response) =>
+              formatTable(['id', 'interaction_kind', 'state', 'title', 'created_at'])({
+                data: response.data.map((interaction) => ({
+                  ...interaction,
+                  title: interaction.request.title,
+                })),
+                next_cursor: response.next_cursor,
+              }),
+            path: schemas.zListAgentInteractionsPath,
+            query: schemas.zListAgentInteractionsQuery,
+          }),
+          op({
+            verb: 'resolve',
+            summary: 'Resolve an open interaction',
+            fn: sdk.resolveAgentInteraction,
+            format: formatRecord(),
+            path: schemas.zResolveAgentInteractionPath,
+            body: schemas.zResolveAgentInteractionBody,
+          }),
+        ],
+      },
+    ],
+  },
+  {
+    name: 'orgs',
+    aliases: ['org'],
+    summary: 'Manage organizations',
+    operations: [
+      op({
+        verb: 'create',
+        summary: 'Create an organization',
+        fn: sdk.createOrganization,
+        format: formatRecord(),
+        body: schemas.zCreateOrganizationBody,
+      }),
+      op({
+        verb: 'overview',
+        summary: 'Show an organization overview',
+        fn: sdk.getOrgOverview,
+        format: formatRecord(),
+        path: schemas.zGetOrgOverviewPath,
+      }),
+      op({
+        verb: 'delete',
+        summary: 'Delete an organization',
+        fn: sdk.deleteOrganization,
+        format: formatVoid('deleted'),
+        path: schemas.zDeleteOrganizationPath,
+        positional: ['orgID'],
+      }),
+    ],
+  },
+  {
+    name: 'projects',
+    aliases: ['project'],
+    summary: 'Manage projects',
+    operations: [
+      op({
+        verb: 'list',
+        summary: 'List projects visible to you',
+        fn: sdk.listVisibleProjects,
+        format: formatTable(['id', 'name', 'created_at', 'updated_at']),
+        path: schemas.zListVisibleProjectsPath,
+        query: schemas.zListVisibleProjectsQuery,
+      }),
+      op({
+        verb: 'create',
+        summary: 'Create a project',
+        fn: sdk.createProject,
+        format: formatRecord(),
+        path: schemas.zCreateProjectPath,
+        body: schemas.zCreateProjectBody,
+      }),
+      op({
+        verb: 'get',
+        summary: 'Fetch a project',
+        fn: sdk.getProject,
+        format: formatRecord(),
+        path: schemas.zGetProjectPath,
+        positional: ['projectID'],
+      }),
+      op({
+        verb: 'update',
+        summary: 'Rename a project',
+        fn: sdk.updateProject,
+        format: formatRecord(),
+        path: schemas.zUpdateProjectPath,
+        body: schemas.zUpdateProjectBody,
+        positional: ['projectID'],
+      }),
+      op({
+        verb: 'delete',
+        summary: 'Delete a project',
+        fn: sdk.deleteProject,
+        format: formatVoid('deleted'),
+        path: schemas.zDeleteProjectPath,
+        positional: ['projectID'],
+      }),
+    ],
+  },
+  {
+    name: 'members',
+    aliases: ['member'],
+    summary: 'Manage organization members and invitations',
+    operations: [
+      op({
+        verb: 'list',
+        summary: 'List organization members',
+        fn: sdk.listOrgMembers,
+        format: formatTable(['user_id', 'email', 'display_name', 'role', 'created_at']),
+        path: schemas.zListOrgMembersPath,
+        query: schemas.zListOrgMembersQuery,
+      }),
+      op({
+        verb: 'update',
+        summary: "Update a member's role",
+        fn: sdk.updateOrgMember,
+        format: formatRecord(),
+        path: schemas.zUpdateOrgMemberPath,
+        body: schemas.zUpdateOrgMemberBody,
+      }),
+      op({
+        verb: 'remove',
+        summary: 'Remove a member from the organization',
+        fn: sdk.removeOrgMember,
+        format: formatVoid('removed'),
+        path: schemas.zRemoveOrgMemberPath,
+      }),
+    ],
+    groups: [
+      {
+        name: 'invites',
+        aliases: ['invite'],
+        summary: 'Manage organization invitations',
+        operations: [
+          op({
+            verb: 'list',
+            summary: "List an organization's invitations",
+            fn: sdk.listOrgInvitations,
+            format: formatTable(['id', 'email', 'org_role', 'created_at']),
+            path: schemas.zListOrgInvitationsPath,
+            query: schemas.zListOrgInvitationsQuery,
+          }),
+          op({
+            verb: 'create',
+            summary: 'Invite someone to the organization',
+            fn: sdk.createOrgInvitation,
+            format: formatRecord(),
+            path: schemas.zCreateOrgInvitationPath,
+            body: schemas.zCreateOrgInvitationBody,
+          }),
+          op({
+            verb: 'delete',
+            summary: 'Withdraw an invitation',
+            fn: sdk.deleteOrgInvitation,
+            format: formatVoid('deleted'),
+            path: schemas.zDeleteOrgInvitationPath,
+          }),
+          op({
+            verb: 'pending',
+            summary: 'List invitations waiting on you',
+            fn: sdk.listPendingInvitations,
+            format: formatTable(['id', 'org_name', 'email', 'org_role', 'created_at']),
+            query: schemas.zListPendingInvitationsQuery,
+          }),
+          op({
+            verb: 'accept',
+            summary: 'Accept an invitation',
+            fn: sdk.acceptInvitation,
+            format: formatRecord(),
+            path: schemas.zAcceptInvitationPath,
+          }),
+          op({
+            verb: 'decline',
+            summary: 'Decline an invitation',
+            fn: sdk.declineInvitation,
+            format: formatRecord(),
+            path: schemas.zDeclineInvitationPath,
+          }),
+        ],
+      },
+    ],
+  },
+  {
+    name: 'keys',
+    aliases: ['key'],
+    summary: 'Manage organization API keys and personal access tokens',
+    groups: [
+      {
+        name: 'org',
+        summary: 'Inspect organization API keys',
+        operations: [
+          op({
+            verb: 'list',
+            summary: 'List organization API keys',
+            fn: sdk.listOrgApiKeys,
+            format: formatTable([
+              'id',
+              'name',
+              'org_role',
+              'created_at',
+              'last_used_at',
+              'revoked_at',
+            ]),
+            path: schemas.zListOrgApiKeysPath,
+            query: schemas.zListOrgApiKeysQuery,
+          }),
+          op({
+            verb: 'get',
+            summary: 'Fetch an organization API key',
+            fn: sdk.getOrgApiKey,
+            format: formatRecord(),
+            path: schemas.zGetOrgApiKeyPath,
+          }),
+        ],
+      },
+      {
+        name: 'personal',
+        summary: 'Manage your personal access tokens',
+        operations: [
+          op({
+            verb: 'list',
+            summary: "List the authenticated user's personal access tokens",
+            fn: sdk.listPersonalAccessTokens,
+            query: schemas.zListPersonalAccessTokensQuery,
+            format: formatTable(['id', 'name', 'created_at', 'last_used_at', 'revoked_at']),
+          }),
+          op({
+            verb: 'create',
+            summary: 'Create a personal access token',
+            fn: sdk.createPersonalAccessToken,
+            format: formatRecord(),
+            body: schemas.zCreatePersonalAccessTokenBody,
+          }),
+          op({
+            verb: 'revoke',
+            summary: 'Revoke a personal access token',
+            fn: sdk.revokePersonalAccessToken,
+            format: formatRecord(),
+            path: schemas.zRevokePersonalAccessTokenPath,
+          }),
+        ],
+      },
+    ],
+  },
+  {
+    name: 'machines',
+    aliases: ['machine'],
+    summary: 'Manage machines',
+    operations: [
+      op({
+        verb: 'list',
+        summary: 'List machines visible to you',
+        fn: sdk.listVisibleMachines,
+        format: formatTable([
+          'id',
+          'display_name',
+          'source_kind',
+          'provider',
+          'lifecycle_state',
+          'connection_state',
+          'created_at',
+        ]),
+        path: schemas.zListVisibleMachinesPath,
+        query: schemas.zListVisibleMachinesQuery,
+      }),
+      op({
+        verb: 'get',
+        summary: 'Fetch a machine',
+        fn: sdk.getMachine,
+        format: formatRecord(),
+        path: schemas.zGetMachinePath,
+      }),
+      op({
+        verb: 'create',
+        summary: 'Create a machine with a daemon token and show how to install omnarad',
+        fn: sdk.connectByoMachine,
+        format: formatMachineSetup,
+        path: schemas.zConnectByoMachinePath,
+        body: zMachineSetupBody,
+      }),
+      flowOp({
+        verb: 'create-local',
+        summary: 'Create a machine and install omnarad on this machine',
+        path: schemas.zConnectByoMachinePath,
+        body: zMachineSetupBody,
+        run: runMachineCreateLocal,
+      }),
+      op({
+        verb: 'update',
+        summary: 'Update a machine',
+        fn: sdk.updateMachine,
+        format: formatRecord(),
+        path: schemas.zUpdateMachinePath,
+        body: schemas.zUpdateMachineBody,
+      }),
+      op({
+        verb: 'delete',
+        summary: 'Delete a machine',
+        fn: sdk.deleteMachine,
+        format: formatVoid('deleted'),
+        path: schemas.zDeleteMachinePath,
+      }),
+    ],
+  },
+  {
+    name: 'pools',
+    aliases: ['pool'],
+    summary: 'Manage machine pools',
+    operations: [
+      op({
+        verb: 'list',
+        summary: 'List machine pools',
+        fn: sdk.listMachinePools,
+        format: formatTable(['id', 'name', 'provider', 'max_total_machines', 'created_at']),
+        path: schemas.zListMachinePoolsPath,
+        query: schemas.zListMachinePoolsQuery,
+      }),
+      op({
+        verb: 'get',
+        summary: 'Fetch a machine pool',
+        fn: sdk.getMachinePool,
+        format: formatRecord(),
+        path: schemas.zGetMachinePoolPath,
+      }),
+      op({
+        verb: 'create',
+        summary: 'Create a machine pool',
+        fn: sdk.createMachinePool,
+        format: formatRecord(),
+        path: schemas.zCreateMachinePoolPath,
+        body: schemas.zCreateMachinePoolBody,
+      }),
+      op({
+        verb: 'update',
+        summary: 'Update a machine pool',
+        fn: sdk.updateMachinePool,
+        format: formatRecord(),
+        path: schemas.zUpdateMachinePoolPath,
+        body: schemas.zUpdateMachinePoolBody,
+      }),
+      op({
+        verb: 'delete',
+        summary: 'Delete a machine pool',
+        fn: sdk.deleteMachinePool,
+        format: formatVoid('deleted'),
+        path: schemas.zDeleteMachinePoolPath,
+      }),
+    ],
+  },
+  {
+    name: 'model-providers',
+    aliases: ['model-provider'],
+    summary: 'Manage model provider configs',
+    operations: [
+      op({
+        verb: 'list',
+        summary: 'List model provider configs',
+        fn: sdk.listModelProviderConfigs,
+        format: formatTable(['id', 'name', 'api_format', 'base_url', 'created_at']),
+        path: schemas.zListModelProviderConfigsPath,
+        query: schemas.zListModelProviderConfigsQuery,
+      }),
+      op({
+        verb: 'get',
+        summary: 'Fetch a model provider config',
+        fn: sdk.getModelProviderConfig,
+        format: formatRecord(),
+        path: schemas.zGetModelProviderConfigPath,
+      }),
+      op({
+        verb: 'create',
+        summary: 'Create a model provider config',
+        fn: sdk.createModelProviderConfig,
+        format: formatRecord(),
+        path: schemas.zCreateModelProviderConfigPath,
+        body: schemas.zCreateModelProviderConfigBody,
+      }),
+      op({
+        verb: 'update',
+        summary: 'Update a model provider config',
+        fn: sdk.updateModelProviderConfig,
+        format: formatRecord(),
+        path: schemas.zUpdateModelProviderConfigPath,
+        body: schemas.zUpdateModelProviderConfigBody,
+      }),
+      op({
+        verb: 'delete',
+        summary: 'Delete a model provider config',
+        fn: sdk.deleteModelProviderConfig,
+        format: formatVoid('deleted'),
+        path: schemas.zDeleteModelProviderConfigPath,
+      }),
+      op({
+        verb: 'catalog',
+        summary: "Show a provider's model catalog",
+        fn: sdk.getModelCatalog,
+        format: formatRecord(),
+        path: schemas.zGetModelCatalogPath,
+      }),
+    ],
+  },
+  {
+    name: 'models',
+    aliases: ['model'],
+    summary: 'Manage configured models on a provider config',
+    operations: [
+      op({
+        verb: 'list',
+        summary: 'List configured models',
+        fn: sdk.listConfiguredModels,
+        format: formatTable([
+          'id',
+          'name',
+          'provider_model_slug',
+          'context_window_tokens',
+          'created_at',
+        ]),
+        path: schemas.zListConfiguredModelsPath,
+        query: schemas.zListConfiguredModelsQuery,
+      }),
+      op({
+        verb: 'get',
+        summary: 'Fetch a configured model',
+        fn: sdk.getConfiguredModel,
+        format: formatRecord(),
+        path: schemas.zGetConfiguredModelPath,
+      }),
+      op({
+        verb: 'create',
+        summary: 'Configure a model',
+        fn: sdk.createConfiguredModel,
+        format: formatRecord(),
+        path: schemas.zCreateConfiguredModelPath,
+        body: schemas.zCreateConfiguredModelBody,
+      }),
+      op({
+        verb: 'update',
+        summary: 'Update a configured model',
+        fn: sdk.updateConfiguredModel,
+        format: formatRecord(),
+        path: schemas.zUpdateConfiguredModelPath,
+        body: schemas.zUpdateConfiguredModelBody,
+      }),
+      op({
+        verb: 'delete',
+        summary: 'Remove a configured model',
+        fn: sdk.deleteConfiguredModel,
+        format: formatVoid('deleted'),
+        path: schemas.zDeleteConfiguredModelPath,
+      }),
+    ],
+  },
+  {
+    name: 'secrets',
+    aliases: ['secret'],
+    summary: 'Manage organization secrets',
+    operations: [
+      op({
+        verb: 'list',
+        summary: 'List secrets visible through ownership authority',
+        fn: sdk.listSecrets,
+        format: formatTable([
+          'id',
+          'name',
+          'kind',
+          'current_version_number',
+          'created_at',
+          'updated_at',
+        ]),
+        path: schemas.zListSecretsPath,
+        query: schemas.zListSecretsQuery,
+      }),
+      op({
+        verb: 'get',
+        summary: 'Fetch a secret',
+        fn: sdk.getSecret,
+        format: formatRecord(),
+        path: schemas.zGetSecretPath,
+      }),
+      op({
+        verb: 'create',
+        summary: 'Create a secret',
+        fn: sdk.createSecret,
+        format: formatRecord(),
+        path: schemas.zCreateSecretPath,
+        body: schemas.zCreateSecretBody,
+      }),
+      op({
+        verb: 'update',
+        summary: "Update a secret's name or metadata",
+        fn: sdk.updateSecret,
+        format: formatRecord(),
+        path: schemas.zUpdateSecretPath,
+        body: schemas.zUpdateSecretBody,
+      }),
+      op({
+        verb: 'delete',
+        summary: 'Delete a secret',
+        fn: sdk.deleteSecret,
+        format: formatVoid('deleted'),
+        path: schemas.zDeleteSecretPath,
+      }),
+      flowOp({
+        verb: 'mcp-oauth',
+        summary: 'Create a secret through an MCP server OAuth flow',
+        path: z.object({ orgID: schemas.zOrganizationId }),
+        body: zMcpOAuthBody,
+        run: runMcpOAuth,
+      }),
+    ],
+  },
+  {
+    name: 'skills',
+    aliases: ['skill'],
+    summary: 'Manage skills',
+    operations: [
+      op({
+        verb: 'list',
+        summary: 'List skills',
+        fn: sdk.listSkills,
+        format: formatTable(['id', 'name', 'description', 'created_at', 'updated_at']),
+        path: schemas.zListSkillsPath,
+        query: schemas.zListSkillsQuery,
+      }),
+      op({
+        verb: 'get',
+        summary: 'Fetch a skill',
+        fn: sdk.getSkill,
+        format: formatRecord(),
+        path: schemas.zGetSkillPath,
+      }),
+      op({
+        verb: 'create',
+        summary: 'Create a skill from a directory or a .zip/.tar.gz archive',
+        fn: sdk.createSkill,
+        format: formatRecord(),
+        path: schemas.zCreateSkillPath,
+        body: zCreateSkillCliBody,
+        transformBody: async (body) => ({
+          ...body,
+          archive: await loadSkillArchive(body.archive),
+        }),
+      }),
+      op({
+        verb: 'delete',
+        summary: 'Delete a skill',
+        fn: sdk.deleteSkill,
+        format: formatVoid('deleted'),
+        path: schemas.zDeleteSkillPath,
+      }),
+    ],
+  },
+  {
+    name: 'memory-stores',
+    aliases: ['memory-store'],
+    summary: 'Manage project memory stores',
+    operations: [
+      op({
+        verb: 'list',
+        summary: 'List memory stores',
+        fn: sdk.listMemoryStores,
+        format: formatTable([
+          'id',
+          'name',
+          'description',
+          'agent_access',
+          'created_at',
+          'updated_at',
+        ]),
+        path: schemas.zListMemoryStoresPath,
+        query: schemas.zListMemoryStoresQuery,
+      }),
+      op({
+        verb: 'get',
+        summary: 'Fetch a memory store',
+        fn: sdk.getMemoryStore,
+        format: formatRecord(),
+        path: schemas.zGetMemoryStorePath,
+      }),
+      op({
+        verb: 'create',
+        summary: 'Create a memory store',
+        fn: sdk.createMemoryStore,
+        format: formatRecord(),
+        path: schemas.zCreateMemoryStorePath,
+        body: schemas.zCreateMemoryStoreBody,
+      }),
+      op({
+        verb: 'update',
+        summary: 'Update memory store settings',
+        fn: sdk.updateMemoryStore,
+        format: formatRecord(),
+        path: schemas.zUpdateMemoryStorePath,
+        body: schemas.zUpdateMemoryStoreBody,
+      }),
+      op({
+        verb: 'delete',
+        summary: 'Delete a memory store',
+        fn: sdk.deleteMemoryStore,
+        format: formatVoid('deleted'),
+        path: schemas.zDeleteMemoryStorePath,
+      }),
+    ],
+    groups: [
+      {
+        name: 'files',
+        aliases: ['file'],
+        summary: 'Manage files in a memory store',
+        operations: [
+          op({
+            verb: 'list',
+            summary: 'List files and directories in a memory store',
+            fn: sdk.listMemoryFiles,
+            format: formatTable<MemoryFile & { size_bytes?: number }>([
+              'path',
+              'type',
+              'size_bytes',
+              'modified_at',
+            ]),
+            path: schemas.zListMemoryFilesPath,
+            query: schemas.zListMemoryFilesQuery,
+          }),
+          op({
+            verb: 'upload',
+            summary: 'Create or replace a memory file',
+            fn: sdk.writeMemoryFile,
+            format: formatRecord(),
+            path: schemas.zWriteMemoryFilePath,
+            query: schemas.zWriteMemoryFileQuery,
+            body: zMemoryUploadBody,
+            transformBody: ({ file }) => loadMemoryUpload(file),
+          }),
+          memoryDownloadOp,
+          op({
+            verb: 'delete',
+            summary: 'Delete a memory file',
+            fn: sdk.deleteMemoryFile,
+            format: formatVoid('deleted'),
+            path: schemas.zDeleteMemoryFilePath,
+            query: schemas.zDeleteMemoryFileQuery,
+          }),
+        ],
+      },
+    ],
+  },
+  {
+    name: 'profiles',
+    aliases: ['profile'],
+    summary: 'Manage agent launch profiles',
+    operations: [
+      op({
+        verb: 'list',
+        summary: 'List agent profiles in a project',
+        fn: sdk.listAgentProfiles,
+        format: formatTable(['id', 'name', 'current_generation', 'created_at', 'updated_at']),
+        path: schemas.zListAgentProfilesPath,
+        query: schemas.zListAgentProfilesQuery,
+      }),
+      op({
+        verb: 'get',
+        summary: 'Fetch an agent profile',
+        fn: sdk.getAgentProfile,
+        format: formatRecord(),
+        path: schemas.zGetAgentProfilePath,
+      }),
+      op({
+        verb: 'create',
+        summary: 'Create an agent profile',
+        fn: sdk.createAgentProfile,
+        format: formatRecord(),
+        path: schemas.zCreateAgentProfilePath,
+        body: zConfigAttachment.extend({ name: schemas.zResourceName }),
+        transformBody: async ({ name, ...attachment }, { client, path }) => ({
+          name,
+          config: await resolveConfigId(client, path, attachment),
+        }),
+      }),
+      op({
+        verb: 'update',
+        summary: 'Point an agent profile at a new config',
+        fn: sdk.updateAgentProfile,
+        format: formatRecord(),
+        path: schemas.zUpdateAgentProfilePath,
+        body: zConfigAttachment.extend({
+          expected_current_config_id: schemas.zAgentConfigId
+            .optional()
+            .describe('fail unless the profile still points at this config'),
+        }),
+        transformBody: async ({ expected_current_config_id, ...attachment }, { client, path }) => {
+          const expected =
+            expected_current_config_id ?? (await currentProfileConfigId(client, path))
+          return {
+            config: await resolveConfigId(client, path, attachment),
+            expected_current_config_id: expected,
+          }
+        },
+      }),
+      op({
+        verb: 'rename',
+        summary: 'Rename an agent profile',
+        fn: sdk.renameAgentProfile,
+        format: formatRecord(),
+        path: schemas.zRenameAgentProfilePath,
+        body: schemas.zRenameAgentProfileBody,
+      }),
+      op({
+        verb: 'delete',
+        summary: 'Delete an agent profile',
+        fn: sdk.deleteAgentProfile,
+        format: formatVoid('deleted'),
+        path: schemas.zDeleteAgentProfilePath,
+      }),
+      flowOp({
+        verb: 'mcp-add',
+        summary: 'Create an OAuth secret and add an MCP server to an agent profile',
+        path: z.object({
+          orgID: schemas.zOrganizationId,
+          projectID: schemas.zProjectId,
+          agentProfileID: schemas.zAgentProfileId,
+        }),
+        body: zMcpAddBody,
+        run: runProfileMcpAdd,
+      }),
+    ],
+  },
+  {
+    name: 'crons',
+    aliases: ['cron'],
+    summary: 'Manage cron triggers',
+    operations: [
+      op({
+        verb: 'list',
+        summary: 'List cron triggers in a project',
+        fn: sdk.listCronTriggers,
+        format: formatTable([
+          'id',
+          'name',
+          'cron',
+          'timezone',
+          'enabled',
+          'next_fire_at',
+          'created_at',
+        ]),
+        path: schemas.zListCronTriggersPath,
+        query: schemas.zListCronTriggersQuery,
+      }),
+      op({
+        verb: 'get',
+        summary: 'Fetch a cron trigger',
+        fn: sdk.getCronTrigger,
+        format: formatRecord(),
+        path: schemas.zGetCronTriggerPath,
+      }),
+      op({
+        verb: 'create',
+        summary: 'Create a cron trigger',
+        fn: sdk.createCronTrigger,
+        format: formatRecord(),
+        path: schemas.zCreateCronTriggerPath,
+        body: schemas.zCreateCronTriggerBody,
+      }),
+      op({
+        verb: 'update',
+        summary: 'Update a cron trigger',
+        fn: sdk.updateCronTrigger,
+        format: formatRecord(),
+        path: schemas.zUpdateCronTriggerPath,
+        body: schemas.zUpdateCronTriggerBody,
+      }),
+      op({
+        verb: 'delete',
+        summary: 'Delete a cron trigger',
+        fn: sdk.deleteCronTrigger,
+        format: formatVoid('deleted'),
+        path: schemas.zDeleteCronTriggerPath,
+      }),
+    ],
+  },
+  {
+    name: 'grant',
+    aliases: ['grants'],
+    summary: 'Manage resource grants to projects',
+    groups: [
+      {
+        name: 'skills',
+        aliases: ['skill'],
+        summary: 'Manage skill grants',
+        operations: [
+          op({
+            verb: 'list',
+            summary: "List a skill's project grants",
+            fn: sdk.listSkillGrants,
+            format: (response) =>
+              formatTable(['id', 'target_project', 'target_project_id', 'created_at'])({
+                data: response.data.map((item) => ({
+                  ...item.grant,
+                  target_project: item.target_project.name,
+                })),
+                next_cursor: response.next_cursor,
+              }),
+            path: schemas.zListSkillGrantsPath,
+            query: schemas.zListSkillGrantsQuery,
+          }),
+          op({
+            verb: 'get',
+            summary: 'Fetch a skill grant',
+            fn: sdk.getSkillGrant,
+            format: formatRecord(),
+            path: schemas.zGetSkillGrantPath,
+          }),
+          op({
+            verb: 'add',
+            summary: 'Grant a skill to a project',
+            fn: sdk.createSkillGrant,
+            format: formatRecord(),
+            path: schemas.zCreateSkillGrantPath,
+            body: schemas.zCreateSkillGrantBody,
+          }),
+          op({
+            verb: 'delete',
+            summary: 'Remove a skill grant',
+            fn: sdk.deleteSkillGrant,
+            format: formatVoid('deleted'),
+            path: schemas.zDeleteSkillGrantPath,
+          }),
+        ],
+      },
+      {
+        name: 'secrets',
+        aliases: ['secret'],
+        summary: 'Manage secret grants',
+        operations: [
+          op({
+            verb: 'list',
+            summary: "List a secret's project grants",
+            fn: sdk.listSecretGrants,
+            format: (response) =>
+              formatTable(['id', 'target_project', 'target_project_id', 'created_at'])({
+                data: response.data.map((item) => ({
+                  ...item.grant,
+                  target_project: item.target_project.name,
+                })),
+                next_cursor: response.next_cursor,
+              }),
+            path: schemas.zListSecretGrantsPath,
+            query: schemas.zListSecretGrantsQuery,
+          }),
+          op({
+            verb: 'get',
+            summary: 'Fetch a secret grant',
+            fn: sdk.getSecretGrant,
+            format: formatRecord(),
+            path: schemas.zGetSecretGrantPath,
+          }),
+          op({
+            verb: 'add',
+            summary: 'Grant a secret to a project',
+            fn: sdk.createSecretGrant,
+            format: formatRecord(),
+            path: schemas.zCreateSecretGrantPath,
+            body: schemas.zCreateSecretGrantBody,
+          }),
+          op({
+            verb: 'delete',
+            summary: 'Remove a secret grant',
+            fn: sdk.deleteSecretGrant,
+            format: formatVoid('deleted'),
+            path: schemas.zDeleteSecretGrantPath,
+          }),
+        ],
+      },
+      {
+        name: 'machines',
+        aliases: ['machine'],
+        summary: 'Manage machine grants in a project',
+        operations: [
+          op({
+            verb: 'list',
+            summary: "List a project's explicit machine grants",
+            fn: sdk.listProjectMachineGrants,
+            format: (response) =>
+              formatTable(['id', 'machine', 'machine_id', 'source_kind', 'created_at'])({
+                data: response.data.map((item) => ({
+                  ...item.grant,
+                  machine: item.machine.display_name,
+                })),
+                next_cursor: response.next_cursor,
+              }),
+            path: schemas.zListProjectMachineGrantsPath,
+            query: schemas.zListProjectMachineGrantsQuery,
+          }),
+          op({
+            verb: 'get',
+            summary: 'Fetch a machine grant',
+            fn: sdk.getProjectMachineGrant,
+            format: (response) => formatRecord()(response.grant),
+            path: schemas.zGetProjectMachineGrantPath,
+          }),
+          op({
+            verb: 'add',
+            summary: 'Grant a machine to a project',
+            fn: sdk.createProjectMachineGrant,
+            format: (response) => formatRecord()(response.grant),
+            path: schemas.zCreateProjectMachineGrantPath,
+            body: schemas.zCreateProjectMachineGrantBody,
+          }),
+          op({
+            verb: 'delete',
+            summary: 'Remove a machine grant',
+            fn: sdk.deleteProjectMachineGrant,
+            format: formatVoid('deleted'),
+            path: schemas.zDeleteProjectMachineGrantPath,
+          }),
+        ],
+      },
+      {
+        name: 'pools',
+        aliases: ['pool'],
+        summary: 'Manage machine pool grants in a project',
+        operations: [
+          op({
+            verb: 'list',
+            summary: "List a project's machine pool grants",
+            fn: sdk.listProjectMachinePoolGrants,
+            format: (response) =>
+              formatTable(['id', 'machine_pool', 'machine_pool_id', 'description', 'created_at'])({
+                data: response.data.map((item) => ({
+                  ...item.grant,
+                  machine_pool: item.machine_pool.name,
+                })),
+                next_cursor: response.next_cursor,
+              }),
+            path: schemas.zListProjectMachinePoolGrantsPath,
+            query: schemas.zListProjectMachinePoolGrantsQuery,
+          }),
+          op({
+            verb: 'get',
+            summary: 'Fetch a machine pool grant',
+            fn: sdk.getProjectMachinePoolGrant,
+            format: formatRecord(),
+            path: schemas.zGetProjectMachinePoolGrantPath,
+          }),
+          op({
+            verb: 'add',
+            summary: 'Grant a machine pool to a project',
+            fn: sdk.createProjectMachinePoolGrant,
+            format: formatRecord(),
+            path: schemas.zCreateProjectMachinePoolGrantPath,
+            body: schemas.zCreateProjectMachinePoolGrantBody,
+          }),
+          op({
+            verb: 'edit',
+            summary: "Edit a machine pool grant's overrides",
+            fn: sdk.updateProjectMachinePoolGrant,
+            format: formatRecord(),
+            path: schemas.zUpdateProjectMachinePoolGrantPath,
+            body: schemas.zUpdateProjectMachinePoolGrantBody,
+          }),
+          op({
+            verb: 'delete',
+            summary: 'Remove a machine pool grant',
+            fn: sdk.deleteProjectMachinePoolGrant,
+            format: formatVoid('deleted'),
+            path: schemas.zDeleteProjectMachinePoolGrantPath,
+          }),
+        ],
+      },
+      {
+        name: 'models',
+        aliases: ['model'],
+        summary: 'Manage model grants in a project',
+        operations: [
+          op({
+            verb: 'list',
+            summary: "List a project's model grants",
+            fn: sdk.listProjectModelGrants,
+            format: (response) =>
+              formatTable(['id', 'model', 'configured_model_id', 'created_at'])({
+                data: response.data.map((item) => ({ ...item.grant, model: item.model.name })),
+                next_cursor: response.next_cursor,
+              }),
+            path: schemas.zListProjectModelGrantsPath,
+            query: schemas.zListProjectModelGrantsQuery,
+          }),
+          op({
+            verb: 'get',
+            summary: 'Fetch a model grant',
+            fn: sdk.getProjectModelGrant,
+            format: (response) => formatRecord()(response.grant),
+            path: schemas.zGetProjectModelGrantPath,
+          }),
+          op({
+            verb: 'add',
+            summary: 'Grant a configured model to a project',
+            fn: sdk.createProjectModelGrant,
+            format: (response) => formatRecord()(response.grant),
+            path: schemas.zCreateProjectModelGrantPath,
+            body: schemas.zCreateProjectModelGrantBody,
+          }),
+          op({
+            verb: 'edit',
+            summary: "Edit a model grant's overrides",
+            fn: sdk.updateProjectModelGrant,
+            format: (response) => formatRecord()(response.grant),
+            path: schemas.zUpdateProjectModelGrantPath,
+            body: schemas.zUpdateProjectModelGrantBody,
+          }),
+          op({
+            verb: 'delete',
+            summary: 'Remove a model grant',
+            fn: sdk.deleteProjectModelGrant,
+            format: formatVoid('deleted'),
+            path: schemas.zDeleteProjectModelGrantPath,
+          }),
+        ],
+      },
+    ],
+  },
+]
+
+export const topLevelOperations: OperationSpec[] = [
+  op({
+    verb: 'whoami',
+    summary: 'Show the authenticated user and their organizations',
+    fn: sdk.getCurrentUser,
+    format: formatRecord(),
+  }),
+]

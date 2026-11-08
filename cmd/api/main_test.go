@@ -1,0 +1,113 @@
+package main
+
+import (
+	"bytes"
+	"io/fs"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/omnara-ai/omnara/internal/config"
+	"github.com/omnara-ai/omnara/internal/storage/orglifecycle"
+	"github.com/stretchr/testify/require"
+)
+
+func TestWebAssetsDefaultsToDisabled(t *testing.T) {
+	assets, ok, err := webAssets(config.Config{})
+	if err != nil {
+		t.Fatalf("default web assets: %v", err)
+	}
+	if ok || assets != nil {
+		t.Fatalf("default web assets should be disabled, got ok=%t assets=%v", ok, assets)
+	}
+}
+
+func TestWebAssetsEmbeddedBuild(t *testing.T) {
+	assets, ok, err := webAssets(config.Config{WebServing: config.WebServingEmbedded})
+	if err == nil {
+		if !ok {
+			t.Fatal("embedded web assets should be enabled when bundled index.html exists")
+		}
+		if assets == nil {
+			t.Fatal("embedded web assets must not be nil when bundled index.html exists")
+		}
+		if _, err := fs.Stat(assets, "index.html"); err != nil {
+			t.Fatalf("embedded dist assets should include index.html, got error: %v", err)
+		}
+		return
+	}
+	if !strings.Contains(err.Error(), "embedded web assets") || !strings.Contains(err.Error(), "index.html") {
+		t.Fatalf("embedded web assets error = %v, want embedded index.html context", err)
+	}
+	if ok || assets != nil {
+		t.Fatalf("embedded web assets without index.html should be disabled, got ok=%t assets=%v", ok, assets)
+	}
+}
+
+func TestWebAssetsDisabled(t *testing.T) {
+	assets, ok, err := webAssets(config.Config{WebServing: config.WebServingDisabled})
+	if err != nil {
+		t.Fatalf("disabled web assets: %v", err)
+	}
+	if ok {
+		t.Fatal("disabled web assets should report disabled")
+	}
+	if assets != nil {
+		t.Fatal("disabled web assets must be nil")
+	}
+}
+
+func TestRequireWebIndexRejectsMissingIndex(t *testing.T) {
+	err := requireWebIndex(os.DirFS(t.TempDir()), "test web assets")
+	if err == nil {
+		t.Fatal("expected missing index.html to fail")
+	}
+	if !strings.Contains(err.Error(), "test web assets") || !strings.Contains(err.Error(), "index.html") {
+		t.Fatalf("missing index error = %v, want source/index context", err)
+	}
+}
+
+func TestParseDefaultReconciliationMode(t *testing.T) {
+	for _, test := range []struct {
+		args      []string
+		wantMode  string
+		wantError bool
+	}{
+		{args: []string{"reconcile-defaults", "plan"}, wantMode: defaultReconciliationPlan},
+		{args: []string{"reconcile-defaults", "apply"}, wantMode: defaultReconciliationApply},
+		{wantError: true},
+		{args: []string{"unknown"}, wantError: true},
+		{args: []string{"reconcile-defaults", "unknown"}, wantError: true},
+		{args: []string{"reconcile-defaults", "plan", "extra"}, wantError: true},
+	} {
+		mode, err := parseDefaultReconciliationMode(test.args)
+		if (err != nil) != test.wantError || mode != test.wantMode {
+			t.Fatalf("parse reconciliation mode %v = mode %q, err %v", test.args, mode, err)
+		}
+	}
+}
+
+func TestDefaultReconciliationPrintsReviewableChanges(t *testing.T) {
+	var output bytes.Buffer
+	err := writeDefaultReconciliationResult(
+		&output,
+		"plan",
+		orglifecycle.ReconcileDefaultsResult{
+			Changes: []string{
+				"update model settings",
+				"clear request allowance",
+			},
+			Warnings: []string{
+				"configuration is referenced",
+			},
+		},
+	)
+	require.NoError(t, err)
+	want := "plan: change: update model settings\n" +
+		"plan: change: clear request allowance\n" +
+		"plan: warning: configuration is referenced\n" +
+		"plan: changes=2 warnings=1\n"
+	if output.String() != want {
+		t.Fatalf("output=%q", output.String())
+	}
+}

@@ -1,0 +1,274 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: Verify and Vulnerability Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - id: setup-go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            ~/.cache/golangci-lint
+          key: go-${{ runner.os }}-${{ runner.arch }}-verify-${{ hashFiles('**/go.mod', '**/go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-verify-
+
+      - id: golangci-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .tools/custom-golangci-lint
+          key: custom-golangci-lint-${{ runner.os }}-${{ runner.arch }}-go-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('.custom-gcl.yml', 'tools/ci/go.mod', 'tools/ci/go.sum', 'tools/omnaralint/go.mod', 'tools/omnaralint/go.sum', 'tools/omnaralint/**/*.go') }}
+
+      - run: touch .tools/custom-golangci-lint
+        if: steps.golangci-cache.outputs.cache-hit == 'true'
+
+      - run: make verify-static
+
+      - name: Protect released migrations and check API compatibility
+        if: github.event_name == 'pull_request' || github.event_name == 'push'
+        env:
+          COMPAT_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: make compatibility-check
+
+      - run: make govulncheck
+
+  go-tests:
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        include:
+          - label: Unit Tests
+            target: unit
+          - label: Unit Race Tests
+            target: race-unit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-tests-${{ matrix.target }}-${{ hashFiles('**/go.mod', '**/go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-tests-${{ matrix.target }}-
+
+      - name: Install test tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ripgrep gcc libc6-dev
+
+      - run: make ${{ matrix.target }}
+
+  worker-image:
+    name: Worker Image Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - run: make test-worker-image
+
+  daemon-darwin:
+    name: Daemon macOS Tests
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - run: go test ./internal/machinedaemon ./cmd/daemon ./internal/omnarad
+
+  frontend:
+    name: Frontend Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+        with:
+          node-version-file: .node-version
+
+      - run: corepack enable
+
+      - run: make web-static-check
+
+  web-e2e:
+    name: Frontend E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-frontend-${{ hashFiles('**/go.mod', '**/go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-frontend-
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+        with:
+          node-version-file: .node-version
+
+      - run: corepack enable
+
+      - run: make web-e2e
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-report
+          path: |
+            frontend/apps/web/playwright-report
+            frontend/apps/web/test-results
+          retention-days: 7
+
+      - run: make build-api-from-dist
+
+      - name: Show database logs on failure
+        if: failure()
+        run: docker compose logs postgres redis
+
+      - name: Stop test database
+        if: always()
+        run: docker compose down -v
+
+  integration:
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        include:
+          - label: Database Contract Checks
+            target: test-database-contracts
+          - label: Storage Integration Tests
+            target: test-integration-storage
+          - label: HTTP API Integration Tests
+            target: test-integration-httpapi
+          - label: Runtime Integration Tests
+            target: test-integration-runtime
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-integration-${{ matrix.target }}-${{ hashFiles('**/go.mod', '**/go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-integration-${{ matrix.target }}-
+
+      - name: Install file tools
+        if: matrix.target == 'test-integration-runtime'
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ripgrep sed libcap2-bin
+          make install-chroot-sandbox
+
+      - uses: ./.github/actions/setup-test-db
+
+      - run: make ${{ matrix.target }}
+
+      - name: Show database logs on failure
+        if: failure()
+        run: docker compose logs postgres redis
+
+      - name: Stop test database
+        if: always()
+        run: docker compose down -v
+
+  service-e2e:
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      matrix:
+        include:
+          - label: Service E2E A
+            shard: 0
+          - label: Service E2E B
+            shard: 1
+          - label: Service E2E C
+            shard: 2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-service-e2e-${{ hashFiles('**/go.mod', '**/go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-service-e2e-
+
+      - name: Install file tools
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ripgrep sed libcap2-bin
+          make install-chroot-sandbox
+
+      - uses: ./.github/actions/setup-test-db
+
+      - run: make test-service-e2e SERVICE_E2E_SHARD_INDEX=${{ matrix.shard }} SERVICE_E2E_SHARD_TOTAL=3
+
+      - name: Show database logs on failure
+        if: failure()
+        run: docker compose logs postgres redis
+
+      - name: Stop test database
+        if: always()
+        run: docker compose down -v

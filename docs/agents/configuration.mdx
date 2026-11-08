@@ -1,0 +1,369 @@
+---
+title: Configs & profiles
+description: Define agents with YAML or JSON
+icon: "file-code"
+---
+
+import AgentConfigCreate from '/snippets/agent-config-create.mdx'
+import AgentConfigProfileCreate from '/snippets/agent-config-profile-create.mdx'
+import AgentConfigProfileAdvance from '/snippets/agent-config-profile-advance.mdx'
+
+An agent config is a YAML or JSON document that defines the agent's instruction, model, tools, permissions, and machines.
+
+Configs are immutable: changing the source creates a new config ID (`acfg_…`). Submitting the same source again returns the same ID.
+
+YAML and JSON configs refer to model providers, configured models, BYO machines, and machine pools by their human-readable names. When a config is created, Omnara resolves those names and stores the resources' immutable IDs in the compiled config. Renaming a resource therefore does not change an existing config or an agent already using it. Recompiling saved source resolves its names again against the current resources, so an old name may stop resolving or may resolve to a different resource if that name has since been reused.
+
+Provider names are unique within an organization, model names within a provider, and BYO machine and machine-pool names within an organization. Machine and pool resolution also requires the project to have access to the selected resource.
+
+The example below includes every major section. If you are creating your first agent, start with the smaller config in the [Quickstart](/quickstart).
+
+```yaml
+version: v1
+instruction: |
+  Help engineers investigate issues in the acme/api repository.
+  Run read-only commands freely; ask before anything destructive.
+model:
+  provider_config: openai-prod
+  name: gpt-6-sol
+  reasoning:
+    effort: high
+tools:
+  web_search: {}
+  ask_question: {}
+  run_command:
+    permission:
+      mode: always_ask
+  write_process: {}
+  read_process: {}
+  stop_process: {}
+  watch_process: {}
+  list_processes: {}
+  list_machines: {}
+  inspect_machine: {}
+  create_ticket:
+    type: custom
+    description: File a ticket in our internal tracker.
+    input_schema:
+      type: object
+      properties:
+        title: { type: string }
+        body: { type: string }
+      required: [title]
+mcp:
+  linear:
+    url: https://mcp.linear.app/mcp
+    auth:
+      type: oauth
+      secret_id: sec_gik7mv4qtrwz3jehcyd5n6a2bf
+machine_sources:
+  - machine_pool_name: default-pool
+    cwd: /workspace
+skills:
+  - skl_ik7mv4qtrwz3jehcyd5n6a2bfg
+subagents:
+  researcher:
+    type: profile
+    profile: research-agent
+    description: Read-only codebase investigation.
+    max_instances: 4
+  fork:
+    type: self
+    instruction:
+      append: You are a subagent. Finish with a concise summary.
+max_subagents: 8
+max_depth: 2
+```
+
+## Instruction and identity
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `version` | no | Only `v1` today; include it for forward compatibility. |
+| `instruction` | **yes** | The system-level brief. This is the single highest-leverage field you control — be specific about the job, the boundaries, and when to ask a human. |
+
+## Model
+
+`model` selects a model configured in Omnara. `provider_config` is the name of a [model provider](/organization/model-providers), and `name` must exactly match one of its configured models. The model must also be available to the project.
+
+```yaml
+model:
+  provider_config: openai-prod
+  name: gpt-6-sol
+  cache_retention: short
+  reasoning:
+    effort: high
+```
+
+Most agents can use the configured model's defaults. Override these fields only when needed:
+
+| Field | What it does |
+| --- | --- |
+| `context_window_tokens` | Budget for input and output tokens. Triggers compaction when estimated input exceeds the remaining budget after output and safety reserves. The turn fails if compaction cannot make it fit. |
+| `default_max_output_tokens` | Per-request output-token cap sent to the provider. |
+| `cache_retention` | Prompt-cache preference: `none`, `short` (default), or `long`. |
+| `reasoning.effort` | Reasoning effort for models that support it (for example `low`, `medium`, `high`). |
+
+## Tools
+
+Add a tool under `tools:` to make it available to the agent. Use `{}` to accept its defaults. You can add **built-in tools** that Omnara runs or **custom tools** that your own system runs. MCP tools are configured separately.
+
+### Built-in tools
+
+Enable a built-in tool by name. The [Built-in tools](/tools/built-in) page explains the available tools and their inputs. You can also change a tool's default permission:
+
+```yaml
+tools:
+  web_search: {}                # enabled, default permission
+  run_command:
+    permission:
+      mode: always_ask          # a human approves every command
+  delete_machine:
+    enabled: false              # explicitly off
+```
+
+Permission modes decide whether a tool runs immediately, asks a person first, or is denied. See [Tools & permissions](/tools/permissions) for defaults and supported modes.
+
+When `machine_sources` is nonempty, Omnara adds missing entries for `run_command`, `write_process`, `read_process`, `stop_process`, `watch_process`, `list_processes`, `list_machines`, `inspect_machine`, `storage_upload`, and `storage_download` to the compiled config. If any source is a machine pool, it also adds `create_machine` and `delete_machine`, regardless of pool counts or machine availability. Attached skills similarly add `skill`, and [`git_credentials`](/integrations/github#git-credentials) adds `list_github_repositories`. Compilation leaves your YAML or JSON source unchanged. Explicit disables and permissions take precedence.
+
+The builder displays these defaults under **Tools → Other tools** without writing them into your source. Changing a permission or selecting **Disabled** saves an explicit override. Defaults disappear when their relevant source is removed; explicitly configured tools remain.
+
+Existing machine configs gain missing machine-tool defaults only when saved again. The builder previews that saved result, not the tools currently stored for an existing config.
+
+### Integration capabilities
+
+Create a project integration first, then reference its tools as
+`tools.int__<integration-name>__<operation>`. Tool entries contain enabled state, deferred
+loading and permissions; handler entries use `interaction_handlers: {integration-name: {}}`.
+The shipped tools use immutable integration-agent context established by a provider or
+scheduled launch. They fail before provider I/O if no conversation is assigned. Their interaction handlers use the same assigned conversation and accept empty
+selection arguments.
+Incoming subscriptions belong to the integration and are attached through launch requests
+or the integration subscriptions API, not config. Removing a tool or changing config does
+not remove subscriptions.
+
+Integration names resolve to immutable IDs when compiled, while credentials remain live
+on the integration. See [Integrations](/integrations/overview) for examples and provider launchers.
+Integration tools, subscriptions and interaction handlers are not inherited by spawned subagents.
+
+### Git credentials
+
+Use a connected GitHub integration for HTTPS Git authentication in the agent's
+machine processes:
+
+```yaml
+git_credentials:
+  integration: reviews
+  repository_ids: [123456789]  # optional
+  read_only: true              # optional
+```
+
+Compilation pins the integration's immutable
+ID. No assigned PR, integration tool or subscription is required. Credentials
+inherit the connected installation's granted repositories, or only those in `repository_ids`, and are read-only
+unless the integration allows pushing code and `read_only` isn't set; they are not restricted to an assigned PR. Manage those
+grants in GitHub. See [GitHub credentials](/integrations/github#git-credentials) for
+setup and daemon requirements.
+
+GitHub launchers add this capability automatically. An explicit profile choice
+wins as a whole, even when it references a different GitHub integration. Spawned
+subagents do not receive Git credentials, including those configured in their
+selected profile.
+
+### Deferred tools
+
+Set `deferred: true` on any tool (built-in, custom, or MCP) to keep its definition out of the model's context until the model asks for it. Deferring a tool implicitly enables the built-in `tool_search` tool, which the model calls with a regular expression to load matching deferred tools by name, description, and argument names. Keep the tools the agent needs on almost every turn loaded; defer large or rarely used tool sets.
+
+```yaml
+tools:
+  web_search: {}                # always loaded
+  web_fetch:
+    deferred: true              # loaded only after a tool_search match
+```
+
+Deferred loading keeps the provider's prompt cache intact on Anthropic Messages and OpenAI Responses. On Chat Completions the model calls loaded tools through `call_deferred_tool` with the tool's name and arguments, so `call_deferred_tool` is a reserved tool name.
+
+### Custom tools
+
+A custom tool describes an operation that your system performs. Its `description` tells the model when to use it, and its `input_schema` defines the arguments.
+
+The full example above defines `create_ticket` as a custom tool. When the agent calls it, Omnara waits for your system to submit the result. [Custom tools](/tools/custom) walks through that workflow.
+
+## MCP servers
+
+`mcp` connects the agent to [Model Context Protocol](https://modelcontextprotocol.io) servers. Each entry sets the server URL, authentication, and permissions. `auth.secret_id` points to the [secret](/organization/secrets) required by the selected authentication type. [MCP servers](/tools/mcp) explains the full setup.
+
+## Event webhooks
+
+[Event webhooks](/events/webhooks) are managed separately from agent configuration. Attach them to an agent, profile, or project to receive selected events at an HTTPS endpoint.
+
+## Machines
+
+For new agents only, the builder preselects a cluster-managed pool granted to the project if one exists; otherwise, it starts without a machine source.
+
+`machine_sources` provides execution environments for tools such as `run_command`. Use a machine you connected yourself or let Omnara create one from a pool:
+
+```yaml
+machine_sources:
+  - machine_name: build-server-1     # a specific BYO machine…
+    cwd: /srv/repo
+    env_overlay:
+      CI: "true"
+    secret_env_overlay:
+      GITHUB_TOKEN: sec_7jehcyd5n6a2bfgik7mv4qtrwz
+  - machine_pool_name: default-pool  # …or capacity from a pool
+    machine_memory_mb: 4096
+    max_machines: 3
+```
+
+`env_overlay` sets environment variables. `secret_env_overlay` references [secrets](/organization/secrets), whose values are resolved when they are injected. Both apply to every process the agent runs on the machine; for pool sources they also apply to the machine environment at provisioning, so the pool's startup script sees them. Pool sources can also set machine size and limits; supported fields vary by provider. See [Machine pools](/machines/pools#create-a-pool) and the [config schema](/api-reference/endpoints/configs-and-profiles/create-agent-config).
+
+If a referenced secret is deleted or its project grant is revoked, subsequent processes and pool provisioning omit that environment variable.
+
+Environment names beginning with `OMNARA_` are reserved case-insensitively and cannot be set through agent or machine configuration. Agent processes receive `OMNARA_HOME` from the daemon as the location for Omnara-managed files.
+
+## Skills
+
+`skills` attaches reusable instructions and files that the agent can load with the `skill` tool. The project must own or hold a [grant](/tools/skills#grant-it-to-projects) for each referenced skill.
+
+## Subagents
+
+`subagents` declares the helpers an agent may spawn, keyed by a name the agent passes to the `spawn_agent` tool. Declaring at least one key adds missing entries for the five subagent tools (`spawn_agent`, `read_agent`, `send_agent_message`, `stop_agent`, `list_agents`) to the compiled config without changing source; existing entries keep their enablement and permissions. `spawn_agent` requires at least one key, but the other four can be listed under `tools` without any keys, so an agent whose config dropped its `subagents` can still read, message, and stop the subagents it already has.
+
+```yaml
+subagents:
+  researcher:
+    type: profile
+    profile: research-agent
+    description: Read-only codebase investigation.
+    model:
+      provider_config: openai-prod
+      name: gpt-6-luna
+    instruction:
+      append: Report findings as a bullet list.
+    max_instances: 4
+    archive_after_idle_minutes: 60
+  fork:
+    type: self
+    model:
+      reasoning:
+        effort: medium
+max_subagents: 8
+max_depth: 2
+```
+
+| Field | What it does |
+|---|---|
+| `type` | `profile` launches from the named profile's current config. `self` launches from a copy of this agent's own config. |
+| `profile` | Profile name; required for `type: profile`, rejected for `type: self`. |
+| `description` | Shown to the model when it chooses a subagent key. |
+| `model` | Set both `provider_config` and `name` to select a model at compilation. Omit both to inherit the parent's model for `self` or the profile's current model for `profile`. Reasoning and token-limit overrides can be set independently. |
+| `instruction.append` | Text appended to the launched config's instruction. |
+| `max_instances` | Cap on active subagents spawned from this key. |
+| `archive_after_idle_minutes` | Archive subagents from this key once they have been idle this long. |
+| `max_subagents` | Top-level cap on active subagents across every key. |
+| `max_depth` | Top-level cap on how many levels of subagents can nest below this agent, at most 8. Defaults to 1, so subagents cannot spawn their own. The value is carried into every subagent config in the tree and cannot be raised by a subagent or by a profile it launches from. |
+
+Subagents start with a clean context: only the `task` passed to `spawn_agent` reaches them. Each subagent launches from a new config derived from its base with the key's overrides applied; a subagent at the tree's `max_depth` has `subagents` and `spawn_agent` removed. Subagents share the parent's attached machines, including its pool machines, instead of provisioning from the base config's `machine_sources`. A subagent's final answer, question, or failure arrives in the parent's timeline as a message from the subagent; `read_agent` reads its timeline on demand. Subagents appear in the console and API as agents with a `parent_agent_id`; listing agents returns top-level agents unless `include_subagents` or `parent_agent_id` is set. Archiving a parent archives its subagents.
+
+For a complete example you can deploy, with a `self` subagent whose copies each work in their own `git worktree` on the parent's machine, see [Coding agent in Slack](/examples/slack-coding-agent).
+
+## Memory stores
+
+`memory_stores` attaches project-owned stores where agents can keep files between conversations or share them with other agents. Reference each store by name:
+
+```yaml
+memory_stores:
+  - name: engineering
+    access: read_write
+```
+
+Store names are unique within a project and use 1–64 lowercase letters, digits, and single hyphens between groups of letters or digits.
+
+Each attachment requires `access: read` or `access: read_write`. Agent writes require both attachment `access` and store `agent_access` to be `read_write`. Project managers can edit files in read-only stores.
+
+Attached stores are available through the [file tools](/tools/built-in#files) at `/memory/<store-name>/<file-path>`. Paths can include nested directories. Files keep only their current contents; there is no edit history. Retrieval tools are added automatically; `read_write` attachments also add `storage_write`. Explicit tool disables still apply.
+
+The CLI's `omnara memory-stores` commands manage stores; `omnara memory-stores files` manages their files using a store ID and a path relative to its root. Replacing or deleting a file requires `--expected-digest`, returned by upload and download.
+
+## Create a config
+
+<Tabs>
+<Tab title="API">
+  The examples assume the client, `$ORG`/`orgID`, and `$PROJ`/`projectID` setup from the [quickstart](/quickstart).
+
+  Send the config in `source` with its `source_format`. With `source_format: json`, `source` can be JSON text or the config as a JSON object. Either way, the source is stored exactly as sent. `POST /agent-configs` returns `201` for a new config or `200` with the existing config when the same source was already saved and still compiles to the same definition. Configs whose sources differ only in formatting get their own IDs but share one compiled definition and the same `effective_definition_hash`. Responses include the saved `source` text and its `source_format`. The CLI has no separate config step: pass the config to the command that uses it — `--file` takes a `.yaml`, `.yml`, or `.json` file, `--source` takes inline YAML or JSON, and `--config` references an existing `acfg_…` ID.
+
+  <AgentConfigCreate />
+
+  The response includes the config ID and final model settings after config overrides and project limits are applied. Validation errors identify the field that needs to be fixed.
+
+  <Info>
+  Full schema and playground: [Create agent config](/api-reference/endpoints/configs-and-profiles/create-agent-config) · [Get agent config](/api-reference/endpoints/configs-and-profiles/get-agent-config).
+  </Info>
+</Tab>
+<Tab title="Dashboard">
+  There is no separate config step in the dashboard: writing a config in the **Builder** or **YAML** editor while creating an [agent](/agents/overview#launch-an-agent) or an [agent profile](#create-a-profile) creates it when you submit. Validation errors surface inline in the editor, pointing at the offending field.
+</Tab>
+</Tabs>
+
+## Profiles
+
+A **profile** gives a config a stable name, such as *Support triage*. Launching from that profile uses the config it currently points to.
+
+Updating a profile points it to a new immutable config. Future launches use the new config; existing agents keep the config they already use. Previous versions remain available in the profile's history.
+
+### Create a profile
+
+<Tabs>
+<Tab title="API">
+  Point a name at an existing config:
+
+  <AgentConfigProfileCreate />
+
+  The response starts with `current_generation: 1`; the generation increases each time the profile moves to a new config. With the CLI, pass `--file agent.yaml` instead of `--config` to create the config and the profile in one step.
+
+  <Info>
+  Full schema and playground: [Create agent profile](/api-reference/endpoints/configs-and-profiles/create-agent-profile).
+  </Info>
+</Tab>
+<Tab title="Dashboard">
+  Select your project in the project switcher, open **Agents**, and click **New agent**. Enter a **Name**, then define the config in the **Builder** form or the **YAML** editor — the dashboard creates the config and the profile in one step. Click **Create profile**.
+</Tab>
+</Tabs>
+
+### Advance a profile to a new config
+
+<Tabs>
+<Tab title="API">
+  With the REST API and the SDK, create the new config first, then update the profile, sending `expected_current_config_id` so the request fails with `409` if someone changed the profile after you read it. One CLI command does all of that — it creates the new config, reads the profile's current config, and points the profile at the new one:
+
+  <AgentConfigProfileAdvance />
+
+  With the CLI, pass `--expected-current-config-id acfg_…` to pin the expected version yourself.
+
+  <Info>
+  Full schema and playground: [Update agent profile](/api-reference/endpoints/configs-and-profiles/update-agent-profile).
+  </Info>
+</Tab>
+<Tab title="Dashboard">
+  On **Agents → Profiles**, open the profile and select **Configuration**. Edit it in **Builder** or **YAML**, then click **Save revision**. The dashboard creates a new config and updates the profile. If someone else updated it first, your save fails instead of overwriting their change.
+</Tab>
+</Tabs>
+
+### Use or delete a profile
+
+To launch from a profile, click **Launch** on its card under **Agents → Profiles**, pass `--profile` to `omnara agents launch`, or pass `profile` to the API. Add `config` or `config_source` to run a different config under the profile's name. See [Launch an agent](/agents/overview#launch-an-agent).
+
+Deleting a profile removes the profile and its version history, but agents launched from it keep running. In the dashboard, open the profile's **Configuration** tab and click **Delete profile**, or run `omnara profiles delete {agent-profile-id}`. Integration settings can retain its public ID; future launches report the profile as unavailable until you choose an available profile. See [Delete agent profile](/api-reference/endpoints/configs-and-profiles/delete-agent-profile).
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Agents" icon="robot" href="/agents/overview">
+    Launch agents from the config you just created
+  </Card>
+  <Card title="Tools & permissions" icon="shield-check" href="/tools/permissions">
+    Control which tools agents can use and which calls need approval
+  </Card>
+</CardGroup>

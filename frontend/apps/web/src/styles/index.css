@@ -1,0 +1,388 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import './palette.css';
+@import './theme.css';
+@import './typography.css';
+@import './interaction.css';
+@source '../../node_modules/streamdown/dist/*.js';
+
+@custom-variant dark (&:is(.dark *));
+
+.message-scroll-fade {
+  --message-scroll-fade-size: 2.5rem;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+}
+
+.message-scroll-fade[data-scrollable~='end'] {
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    #000 0,
+    #000 calc(100% - var(--message-scroll-fade-size)),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    #000 0,
+    #000 calc(100% - var(--message-scroll-fade-size)),
+    transparent 100%
+  );
+}
+
+.message-scroll-fade[data-scrollable~='start'] {
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 var(--message-scroll-fade-size),
+    #000 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 var(--message-scroll-fade-size),
+    #000 100%
+  );
+}
+
+.message-scroll-fade[data-scrollable~='start'][data-scrollable~='end'] {
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 var(--message-scroll-fade-size),
+    #000 calc(100% - var(--message-scroll-fade-size)),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    #000 var(--message-scroll-fade-size),
+    #000 calc(100% - var(--message-scroll-fade-size)),
+    transparent 100%
+  );
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-warning: var(--warning);
+  --color-success: var(--success);
+  --color-link: var(--link);
+  --color-link-hover: var(--link-hover);
+  --color-overlay: var(--overlay);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-chart-6: var(--chart-6);
+  --color-chart-7: var(--chart-7);
+  --color-chart-8: var(--chart-8);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+
+  --font-weight-normal: var(--type-weight-body);
+  --font-weight-medium: var(--type-weight-control);
+  --font-weight-semibold: var(--type-weight-emphasis);
+  --font-weight-heading: var(--type-weight-heading);
+  --text-xs: var(--type-size-fine);
+  --text-xs--line-height: var(--type-leading-body);
+  --text-sm: var(--type-size-small);
+  --text-sm--line-height: var(--type-leading-body);
+  --text-base: var(--type-size-body);
+  --text-base--line-height: var(--type-leading-body);
+  --text-caption: var(--type-size-caption);
+  --text-caption--line-height: var(--type-leading-body);
+  --leading-prose: var(--type-leading-prose);
+  --leading-control: var(--type-leading-control);
+  --tracking-eyebrow: var(--type-tracking-eyebrow);
+  --radius-sm: calc(var(--shape-radius-control) - 0.25rem);
+  --radius-md: var(--shape-radius-control);
+  --radius-lg: var(--shape-radius-card);
+  --radius-xl: var(--shape-radius-card);
+  --radius-control: var(--shape-radius-control);
+  --radius-card: var(--shape-radius-card);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans;
+    font-size: var(--type-size-body);
+    font-weight: var(--type-weight-body);
+    line-height: var(--type-leading-body);
+    letter-spacing: var(--type-tracking-body);
+    margin: 0;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizelegibility;
+  }
+
+  input[type='checkbox'],
+  input[type='radio'] {
+    accent-color: var(--primary);
+  }
+
+  /* Tailwind v4 preflight leaves buttons with the browser's default cursor. */
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+}
+
+::view-transition-group(*) {
+  animation-duration: var(--duration-page);
+  animation-timing-function: var(--ease-page);
+}
+
+::view-transition-old(*),
+::view-transition-new(*) {
+  animation-duration: var(--duration-page);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation-duration: 0s;
+  }
+}
+
+@property --code-ring-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+
+@keyframes code-ring-spin {
+  to {
+    --code-ring-angle: 360deg;
+  }
+}
+
+.code-panel-ring,
+.static-panel-ring {
+  padding: 1px;
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+}
+
+.static-panel-ring {
+  --ring-primary: 80%;
+  --ring-primary-soft: 35%;
+  background: conic-gradient(
+    from 200deg,
+    color-mix(in oklch, var(--primary) var(--ring-primary), transparent),
+    color-mix(in oklch, var(--border) 80%, transparent) 30%,
+    color-mix(in oklch, var(--primary) var(--ring-primary-soft), transparent) 55%,
+    color-mix(in oklch, var(--border) 80%, transparent) 75%,
+    color-mix(in oklch, var(--primary) var(--ring-primary), transparent)
+  );
+}
+
+.dark .static-panel-ring {
+  --ring-primary: 55%;
+  --ring-primary-soft: 20%;
+}
+
+.expanded-surface[data-state='open'] {
+  background: color-mix(in oklab, var(--muted) 35%, var(--card));
+}
+
+/* The auth panel is translucent card over a glow, so default inputs (card on card) vanish
+   into it; give their borders the weight of text and a lift off the panel. */
+.auth-panel {
+  --input: color-mix(in oklab, var(--foreground) 22%, transparent);
+}
+
+.auth-panel [data-slot='input'] {
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.06);
+}
+
+.dark .expanded-surface {
+  --color-border: color-mix(in oklab, var(--border) 60%, transparent);
+  --color-input: color-mix(in oklab, var(--input) 60%, transparent);
+}
+
+.code-panel-ring {
+  background: conic-gradient(
+    from var(--code-ring-angle),
+    color-mix(in oklch, var(--primary) 55%, transparent),
+    color-mix(in oklch, var(--border) 80%, transparent) 30%,
+    color-mix(in oklch, var(--primary) 20%, transparent) 55%,
+    color-mix(in oklch, var(--border) 80%, transparent) 75%,
+    color-mix(in oklch, var(--primary) 55%, transparent)
+  );
+  animation: code-ring-spin 14s linear infinite;
+}
+
+.code-panel-body {
+  transition: height 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .code-panel-ring {
+    animation: none;
+  }
+  .code-panel-body {
+    transition: none;
+  }
+}
+
+@property --ring-base {
+  syntax: '<number>';
+  inherits: false;
+  initial-value: 0.08;
+}
+
+/* Mirrors the omnara.com hero ring: aurora/auroraStore.ts sets the blob centers
+   relative to each ring, and the mask confines the highlight to its 1px border. */
+.aurora-ring {
+  --spec-ax: -9999px;
+  --spec-ay: -9999px;
+  --spec-bx: -9999px;
+  --spec-by: -9999px;
+  --ring-accent: var(--palette-light-accent);
+  --ring-accent-strong: var(--palette-light-accent-strong);
+  --ring-fg: var(--palette-light-fg);
+  padding: 1px;
+  background:
+    radial-gradient(
+      560px circle at var(--spec-ax) var(--spec-ay),
+      rgb(var(--ring-accent-strong) / 0.6),
+      rgb(var(--ring-accent) / 0.18) 45%,
+      transparent 70%
+    ),
+    radial-gradient(
+      560px circle at var(--spec-bx) var(--spec-by),
+      rgb(var(--ring-accent-strong) / 0.6),
+      rgb(var(--ring-accent) / 0.18) 45%,
+      transparent 70%
+    ),
+    rgb(var(--ring-fg) / var(--ring-base, 0.08));
+  transition: --ring-base 0.35s ease;
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+}
+
+.dark .aurora-ring {
+  --ring-accent: var(--palette-dark-accent);
+  --ring-accent-strong: var(--palette-dark-accent-strong);
+  --ring-fg: var(--palette-dark-fg);
+}
+
+.group:hover > .aurora-ring {
+  --ring-base: 0.14;
+}
+
+.code-highlight span {
+  color: var(--shiki-light);
+}
+
+.dark .code-highlight span {
+  color: var(--shiki-dark);
+}
+
+.collapse-body {
+  transition:
+    height 0.2s ease-out,
+    visibility 0.2s;
+}
+
+@theme {
+  --animate-agent-sweep: agent-sweep 2400ms linear infinite;
+
+  @keyframes agent-sweep {
+    from {
+      transform: translateY(0);
+    }
+    to {
+      transform: translateY(var(--agent-sweep-distance));
+    }
+  }
+}
+
+@keyframes collapsible-open {
+  from {
+    height: 0;
+  }
+  to {
+    height: var(--radix-collapsible-content-height);
+  }
+}
+
+@keyframes collapsible-close {
+  from {
+    height: var(--radix-collapsible-content-height);
+  }
+  to {
+    height: 0;
+  }
+}
+
+.collapsible-animate-height {
+  overflow: hidden;
+}
+
+.collapsible-animate-height[data-state='open'] {
+  animation: collapsible-open 0.2s ease-out;
+}
+
+.collapsible-animate-height[data-state='closed'] {
+  animation: collapsible-close 0.2s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .collapse-body {
+    transition: none;
+  }
+  .collapsible-animate-height[data-state='open'],
+  .collapsible-animate-height[data-state='closed'] {
+    animation: none;
+  }
+}

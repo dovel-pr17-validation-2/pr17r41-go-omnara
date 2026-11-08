@@ -1,0 +1,97 @@
+---
+title: Quickstart
+description: Define an agent config, grant the resources, and launch an agent with the dashboard, the CLI, the REST API, or the TypeScript SDK
+icon: "rocket"
+---
+
+import ApiSetup from '/snippets/api-setup.mdx'
+import ProjectGrants from '/snippets/project-grants.mdx'
+import QuickstartAgentConfig from '/snippets/quickstart-agent-config.mdx'
+import QuickstartLaunch from '/snippets/quickstart-launch.mdx'
+import QuickstartFollow from '/snippets/quickstart-follow.mdx'
+
+Launch your first agent with Omnara via the **dashboard**, or programmatically with the **CLI**, the **REST API**, or the **TypeScript SDK**.
+
+## Before you start
+
+Sign in at [app.omnara.com](https://app.omnara.com). When you sign in the first time, Omnara creates your first organization and project, plus two default resources this guide uses:
+
+- **`omnara-openrouter`** — a model provider with frontier models such as `anthropic/claude-fable-5.1` and `openai/gpt-6.1-sol`.
+- **`default-pool`** — a pool of Omnara-managed sandboxes with [common development tools preinstalled](/machines/pools#default-machine-environment).
+
+## Setup with a Skill
+
+Use [the skill located here](https://github.com/omnara-ai/omnara/tree/main/skills/setup-omnara-agent/SKILL.md) to setup Omnara for your project. Alternatively, send this prompt to your agent:
+
+```
+Help me setup Omnara by fetching the Skill file here: https://raw.githubusercontent.com/omnara-ai/omnara/main/skills/setup-omnara-agent/SKILL.md
+```
+
+## Create and launch the agent
+
+<Tabs>
+<Tab title="API">
+  You can interact with Omnara via the **CLI**, the **REST API**, or the **TypeScript SDK**.
+
+  <Steps>
+    <Step title="Set up">
+      The CLI signs in through your browser; if you have not logged in yet, the first command that needs your account starts the login for you. The REST API and the SDK authenticate with an API token. In the web browser, open your account menu at the bottom of the sidebar, choose **Personal tokens**, click **New token**, and save the value.
+
+      <ApiSetup />
+    </Step>
+    <Step title="Write the config">
+      Save this config as `agent.yaml`. The agent runs commands on the cloud machine that Omnara creates from `default-pool` at launch:
+
+      <QuickstartAgentConfig />
+    </Step>
+    <Step title="Upload the config and launch the agent">
+      <QuickstartLaunch />
+    </Step>
+    <Step title="Follow the agent and send input">
+      The event stream shows the tool calls and the reply as it is generated. Send a follow-up message while the stream runs:
+
+      <QuickstartFollow />
+
+      To watch the conversation live and send follow-up messages from the browser, open `https://app.omnara.com/projects/{project-id}/agents/{agent-id}`.
+    </Step>
+  </Steps>
+</Tab>
+<Tab title="Dashboard">
+  <Steps>
+    <Step title="Open the agent editor">
+      In your project, open **Agents** and click **New agent**.
+    </Step>
+    <Step title="Select a template">
+      In the **Builder** form, select the **Deep researcher** template. It fills the instruction and enables the tools the agent needs: `web_search`, `web_fetch`, `run_command`, the process and machine tools, and `ask_question`.
+    </Step>
+    <Step title="Grant and select the model">
+      Select your preferred model from the `omnara-openrouter` provider. Omnara automatically [grants](/concepts) models to the default project in your organization.
+    </Step>
+    <Step title="Grant and select the machine pool">
+      Select `default-pool` as a machine source, which provides your agent with a sandboxed environment. Omnara automatically [grants](/concepts) a machine pool to the default project in your organization.
+    </Step>
+    <Step title="Name the agent and launch">
+      Click **Create and launch agent**. The dashboard validates the config, launches the agent, and opens the conversation view.
+    </Step>
+  </Steps>
+</Tab>
+</Tabs>
+
+## Next steps
+
+Prefer a ready-made agent? The [examples](/examples/overview) deploy with one prompt to your coding agent.
+
+<CardGroup cols={2}>
+  <Card title="Concepts" icon="sitemap" href="/concepts">
+    The object model behind Omnara
+  </Card>
+  <Card title="Agents" icon="robot" href="/agents/overview">
+    Launch, update, cancel, and archive agents
+  </Card>
+  <Card title="Agent configuration" icon="file-code" href="/agents/configuration">
+    Define models, tools, permissions, and machines
+  </Card>
+  <Card title="Machine pools" icon="layer-group" href="/machines/pools">
+    Create machine pools and control their capacity
+  </Card>
+</CardGroup>

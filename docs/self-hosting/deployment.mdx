@@ -1,0 +1,93 @@
+---
+title: Deployment
+description: Steps to run Omnara on your own infrastructure
+icon: "cloud-arrow-up"
+---
+
+Self-hosting means running four long-lived Omnara services plus a one-shot migration job, pointed at your own Postgres, Redis, S3-compatible bucket, and persistent memory filesystem ([Architecture](/self-hosting/architecture)), with one public URL in front of them.
+
+## Quick start (local)
+
+The repository's compose file runs everything behind the `app` profile:
+
+```sh
+git clone https://github.com/omnara-ai/omnara && cd omnara
+docker compose --profile app up -d --build
+```
+
+That builds from source (a checkout auto-loads `compose.override.yaml`). To run published release images instead, use the base file alone, optionally pinning a release with `OMNARA_RELEASE`:
+
+```sh
+docker compose -f compose.yaml --profile app up -d
+```
+
+Open `http://localhost:8000` and sign up — the local email driver is `console`, so the verification link will appear in `docker compose logs api`.
+
+## Production database upgrades
+
+Run the release's one-shot `migrate` image before starting its API, worker, and
+maintenance services. Connect the migrator directly to the PostgreSQL writer;
+do not use RDS Proxy or transaction-pooling PgBouncer. Long-running services
+may use a compatible proxy. See [database configuration](/self-hosting/configuration#database-and-redis)
+for connection-pool defaults.
+
+## Memory storage
+
+Compose shares the persistent `memory-data` volume between API, worker, and maintenance at `/var/lib/omnara/memory`.
+
+Across hosts, mount the same shared filesystem into API, every worker, and maintenance and set `OMNARA_MEMORY_DIR` to its absolute mount path. Configure services to wait for the mount before starting, and verify shared locking and file visibility between hosts. See [Memory storage configuration](/self-hosting/configuration#memory-storage) for filesystem requirements.
+
+Keep the mount private to API, workers, and maintenance. Back up the entire memory directory alongside PostgreSQL.
+
+## Exposing the deployment publicly
+
+`OMNARA_PUBLIC_URL` is the public app origin used for email links, OAuth callbacks, and browser flows. The API defaults to the same deployment at `/api/v1`; set `OMNARA_PUBLIC_API_URL` when it is exposed at a different public URL. The daemon installer is served from the API origin at `/install/omnarad.sh`. These features will not function unless the configured URLs are publicly accessible.
+
+<Warning>
+  Set `OMNARA_PUBLIC_URL` on every backend service. Outside local development it is required.
+</Warning>
+
+### Cloudflare Tunnel
+
+One easy option to expose Omnara publicly is via a [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/).
+
+#### Persistent Tunnel (recommended)
+
+For a stable origin, add a domain to Cloudflare and create a named tunnel:
+
+```sh
+brew install cloudflared   # or see Cloudflare's install docs
+cloudflared tunnel login
+cloudflared tunnel create omnara
+cloudflared tunnel route dns omnara omnara.example.com # replace with your preferred domain
+cloudflared tunnel run --url http://localhost:8000 omnara
+```
+
+Then, restart the stack pointed at the tunnel's URL:
+
+```sh
+OMNARA_PUBLIC_URL=https://omnara.example.com docker compose --profile app up -d
+```
+
+`cloudflared service install` will keep a named tunnel running across reboots. Any other reverse proxy or tunnel (Caddy, nginx, Tailscale Funnel, ngrok) works the same way, as long as it forwards the public `Host` header — the API rejects hosts it doesn't recognize.
+
+#### Quick Tunnel
+
+For a temporary tunnel without a separate domain, you can use:
+
+```sh
+cloudflared tunnel --url http://localhost:8000
+```
+
+This prints a random `https://{subdomain}.trycloudflare.com` URL that changes every run. After starting the tunnel you can set `OMNARA_PUBLIC_URL` in the same way described above.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Configuration" icon="sliders" href="/self-hosting/configuration">
+    The full environment-variable reference
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/self-hosting/architecture">
+    The control-plane processes and stores
+  </Card>
+</CardGroup>

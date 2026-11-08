@@ -1,0 +1,105 @@
+import { useOrgApiKeys } from '@omnara/react'
+import { type ReactNode, useState } from 'react'
+
+import { CreateOrgApiKeyDialog } from '@/components/api-tokens/CreateOrgApiKeyDialog'
+import { OrgApiKeyDetailPanel } from '@/components/api-tokens/OrgApiKeyDetailPanel'
+import { DataTable } from '@/components/data-table/DataTable'
+import { SearchHeader } from '@/components/layout/SearchHeader'
+import { Button } from '@/components/ui/button'
+import { usePagedQuery } from '@/hooks/use-paged-query'
+import { guides } from '@/lib/docs'
+import { formatDateTime } from '@/lib/format'
+
+/** `actions` are extra header controls shown before the create button, e.g. tabs. */
+export function OrgApiKeysSection({ orgId, actions }: { orgId: string; actions?: ReactNode }) {
+  const query = useOrgApiKeys(orgId)
+  const paged = usePagedQuery(query, orgId)
+  const [createOpen, setCreateOpen] = useState(false)
+  const createButton = (
+    <Button
+      size="sm"
+      onClick={() => {
+        setCreateOpen(true)
+      }}
+    >
+      New token
+    </Button>
+  )
+
+  return (
+    <div className="flex flex-col gap-3">
+      <SearchHeader title="Organization API tokens" guide={guides.apiTokens}>
+        {actions}
+        {createButton}
+      </SearchHeader>
+      <DataTable
+        columns={[
+          {
+            id: 'name',
+            header: 'Name',
+            className: 'w-40 md:w-auto',
+            cell: (apiKey) => <span className="font-medium">{apiKey.name}</span>,
+          },
+          {
+            id: 'token-id',
+            header: 'Token ID',
+            className: 'w-44',
+            cell: (apiKey) => (
+              <span className="text-muted-foreground font-mono text-xs">{apiKey.token_id}</span>
+            ),
+          },
+          {
+            id: 'role',
+            header: 'Role',
+            className: 'w-24',
+            cell: (apiKey) =>
+              apiKey.org_role ? (
+                <span className="capitalize">{apiKey.org_role}</span>
+              ) : (
+                <span className="text-muted-foreground">—</span>
+              ),
+          },
+          {
+            id: 'created',
+            header: 'Created',
+            className: 'w-44',
+            cell: (apiKey) => (
+              <span className="text-muted-foreground">{formatDateTime(apiKey.created_at)}</span>
+            ),
+          },
+          {
+            id: 'last-used',
+            header: 'Last used',
+            className: 'w-44',
+            cell: (apiKey) => (
+              <span className="text-muted-foreground">
+                {formatDateTime(apiKey.last_used_at) ?? 'Never'}
+              </span>
+            ),
+          },
+          {
+            id: 'status',
+            header: 'Status',
+            className: 'w-24',
+            cell: (apiKey) =>
+              apiKey.revoked_at ? (
+                <span>Revoked</span>
+              ) : (
+                <span className="text-muted-foreground">Active</span>
+              ),
+          },
+        ]}
+        data={paged.rows}
+        pagination={paged.pagination}
+        getRowId={(apiKey) => apiKey.id}
+        rowExpanded={(apiKey) => <OrgApiKeyDetailPanel orgId={orgId} apiKey={apiKey} />}
+        isPending={query.isPending}
+        isError={query.isError}
+        onRetry={() => void query.refetch()}
+        emptyMessage="No organization API tokens yet. Create one to give an integration or automation its own org access."
+        emptyAction={createButton}
+      />
+      <CreateOrgApiKeyDialog open={createOpen} onOpenChange={setCreateOpen} orgId={orgId} />
+    </div>
+  )
+}

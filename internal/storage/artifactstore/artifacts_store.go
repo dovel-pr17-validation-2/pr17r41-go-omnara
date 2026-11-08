@@ -1,0 +1,346 @@
+package artifactstore
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/omnara-ai/omnara/internal/blobstore"
+	"github.com/omnara-ai/omnara/internal/dbsafe"
+	"github.com/omnara-ai/omnara/internal/publicid"
+	"github.com/omnara-ai/omnara/internal/storage/internal/dbsqlc"
+	"github.com/omnara-ai/omnara/internal/storage/internal/lifecyclelock"
+	"github.com/omnara-ai/omnara/internal/storage/internal/storeutil"
+	"github.com/omnara-ai/omnara/internal/storage/listing"
+	"github.com/omnara-ai/omnara/internal/storage/storeerr"
+	log "github.com/omnara-ai/omnara/observability/wideevent"
+)
+
+var ErrBlobStoreNotConfigured = errors.New("blob store is not configured")
+
+type ArtifactRecord struct {
+	ID             uuid.UUID `json:"id"`
+	ProjectID      uuid.UUID `json:"project_id"`
+	AgentID        uuid.UUID `json:"agent_id"`
+	ContentType    string    `json:"content_type"`
+	Filename       string    `json:"filename,omitempty"`
+	Digest         string    `json:"digest,omitempty"`
+	SizeBytes      *int64    `json:"size_bytes,omitempty"`
+	IdempotencyKey string    `json:"idempotency_key,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	Created        bool      `json:"-"`
+}
+
+type CreateArtifactInput struct {
+	ProjectID      uuid.UUID
+	AgentID        uuid.UUID
+	ContentType    string
+	Filename       string
+	Digest         string
+	SizeBytes      *int64
+	Content        []byte
+	MaxBytes       int64
+	IdempotencyKey string
+}
+
+func artifactObjectKey(agentID, artifactID uuid.UUID) string {
+	return "artifacts/" + agentID.String() + "/" + artifactID.String()
+}
+
+func (s *Store) CreateArtifact(
+	ctx context.Context,
+	input CreateArtifactInput,
+) (ArtifactRecord, error) {
+	if input.ProjectID == uuid.Nil || input.AgentID == uuid.Nil {
+		return ArtifactRecord{}, errors.New("project id and agent id are required")
+	}
+	if input.ContentType == "" {
+		return ArtifactRecord{}, errors.New("artifact content type is required")
+	}
+	if err := dbsafe.Text(input.ContentType); err != nil {
+		return ArtifactRecord{}, storeerr.InvalidRequest(
+			fmt.Errorf("artifact content type %w", err),
+		)
+	}
+	if err := dbsafe.Text(input.Filename); err != nil {
+		return ArtifactRecord{}, storeerr.InvalidRequest(
+			fmt.Errorf("artifact filename %w", err),
+		)
+	}
+	if len(input.Content) == 0 {
+		return ArtifactRecord{}, errors.New("artifact content is required")
+	}
+	if input.MaxBytes > 0 && int64(len(input.Content)) > input.MaxBytes {
+		return ArtifactRecord{}, fmt.Errorf("artifact content exceeds %d bytes", input.MaxBytes)
+	}
+	if s.blobs == nil {
+		return ArtifactRecord{}, ErrBlobStoreNotConfigured
+	}
+	if input.IdempotencyKey != "" {
+		input.Digest = blobstore.ContentDigest(input.Content)
+		replay, found, err := findArtifactReplay(ctx, s.q, input)
+		if err != nil || found {
+			return replay, err
+		}
+	}
+	id, err := uuid.NewV7()
+	if err != nil {
+		return ArtifactRecord{}, fmt.Errorf("generate artifact id: %w", err)
+	}
+	artifactID := id
+	artifactKey := artifactObjectKey(input.AgentID, artifactID)
+	metadata, err := s.blobs.PutBlob(ctx, artifactKey, input.Content)
+	if err != nil {
+		return ArtifactRecord{}, fmt.Errorf("upload artifact content: %w", err)
+	}
+	input.Digest = metadata.Digest
+	input.SizeBytes = &metadata.SizeBytes
+	record, err := s.createArtifactRecord(ctx, artifactID, input)
+	// The transaction has committed or rolled back before external cleanup starts.
+	if !record.Created || errors.Is(err, pgx.ErrTxCommitRollback) {
+		cleanupErr := s.blobs.DeleteBlob(context.WithoutCancel(ctx), artifactKey)
+		if err != nil && cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("cleanup uploaded artifact content: %w", cleanupErr))
+		} else if cleanupErr != nil {
+			event := log.NewEvent(ctx, "artifact.replay.cleanup", log.Fields{
+				"project.id":  input.ProjectID,
+				"agent.id":    input.AgentID,
+				"artifact.id": record.ID,
+				"blob.key":    artifactKey,
+			})
+			event.Level(log.WarnLevel)
+			event.Error(cleanupErr)
+			event.Done(ctx)
+		}
+	}
+	if err != nil {
+		return ArtifactRecord{}, err
+	}
+	return record, nil
+}
+
+func (s *Store) createArtifactRecord(
+	ctx context.Context,
+	artifactID uuid.UUID,
+	input CreateArtifactInput,
+) (ArtifactRecord, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return ArtifactRecord{}, fmt.Errorf("begin create artifact: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := dbsqlc.New(tx)
+	if err := lifecyclelock.Agents(ctx, tx, []lifecyclelock.AgentRef{{
+		ProjectID: input.ProjectID,
+		AgentID:   input.AgentID,
+	}}); err != nil {
+		return ArtifactRecord{}, err
+	}
+	if input.IdempotencyKey != "" {
+		replay, found, err := findArtifactReplay(ctx, qtx, input)
+		if err != nil {
+			return ArtifactRecord{}, err
+		}
+		if found {
+			if err := tx.Commit(ctx); err != nil {
+				return ArtifactRecord{}, fmt.Errorf("commit idempotent create artifact: %w", err)
+			}
+			return replay, nil
+		}
+	}
+	agent, err := qtx.GetAgentInProject(ctx, dbsqlc.GetAgentInProjectParams{
+		ProjectID: input.ProjectID,
+		ID:        input.AgentID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ArtifactRecord{}, storeerr.ErrNotFound
+	}
+	if err != nil {
+		return ArtifactRecord{}, fmt.Errorf("revalidate artifact agent: %w", err)
+	}
+	if agent.State != "active" {
+		return ArtifactRecord{}, storeerr.ErrStateTransitionConflict
+	}
+	record, err := insertArtifactTx(ctx, tx, artifactID, input)
+	if err != nil {
+		return ArtifactRecord{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return record, fmt.Errorf("commit create artifact: %w", err)
+	}
+	return record, nil
+}
+
+func findArtifactReplay(
+	ctx context.Context,
+	q *dbsqlc.Queries,
+	input CreateArtifactInput,
+) (ArtifactRecord, bool, error) {
+	row, err := q.GetArtifactByIdempotencyKey(ctx, dbsqlc.GetArtifactByIdempotencyKeyParams{
+		ProjectID:      input.ProjectID,
+		AgentID:        input.AgentID,
+		IdempotencyKey: input.IdempotencyKey,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ArtifactRecord{}, false, nil
+	}
+	if err != nil {
+		return ArtifactRecord{}, false, fmt.Errorf("load artifact replay: %w", err)
+	}
+	record := artifactRecordFromIdempotencySQLC(row)
+	if err := validateArtifactReplay(record, input); err != nil {
+		return ArtifactRecord{}, false, err
+	}
+	return record, true, nil
+}
+
+func (s *Store) GetArtifact(
+	ctx context.Context,
+	projectID, agentID, id uuid.UUID,
+) (ArtifactRecord, error) {
+	if projectID == uuid.Nil || agentID == uuid.Nil || id == uuid.Nil {
+		return ArtifactRecord{}, errors.New("project id, agent id, and artifact id are required")
+	}
+	record, err := loadArtifact(ctx, s.q, projectID, agentID, id)
+	if err != nil {
+		return ArtifactRecord{}, err
+	}
+	return record, nil
+}
+
+func (s *Store) GetArtifactBlob(
+	ctx context.Context,
+	projectID, agentID, id uuid.UUID,
+) ([]byte, ArtifactRecord, error) {
+	record, err := s.GetArtifact(ctx, projectID, agentID, id)
+	if err != nil {
+		return nil, ArtifactRecord{}, err
+	}
+	if s.blobs == nil {
+		return nil, ArtifactRecord{}, ErrBlobStoreNotConfigured
+	}
+	content, _, err := s.blobs.GetBlob(ctx, artifactObjectKey(record.AgentID, record.ID))
+	if err != nil {
+		if errors.Is(err, blobstore.ErrNotFound) {
+			return nil, ArtifactRecord{}, fmt.Errorf(
+				"load artifact %s content: %w",
+				record.ID,
+				storeerr.ErrNotFound,
+			)
+		}
+		return nil, ArtifactRecord{}, fmt.Errorf("load artifact %s content: %w", record.ID, err)
+	}
+	return content, record, nil
+}
+
+func (s *Store) ListFiles(
+	ctx context.Context, agentID uuid.UUID, artifactID *uuid.UUID, pattern string, offset, limit int32,
+) ([]listing.FileEntry, error) {
+	rows, err := s.q.ListAgentArtifacts(ctx, dbsqlc.ListAgentArtifactsParams{
+		AgentID: agentID, ArtifactID: artifactID, Pattern: pattern, RowLimit: limit, RowOffset: offset,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list artifact files: %w", err)
+	}
+	entries := make([]listing.FileEntry, 0, len(rows))
+	for _, row := range rows {
+		id, err := publicid.Encode(publicid.KindArtifact, row.ID)
+		if err != nil {
+			return nil, fmt.Errorf("list artifact files: %w", err)
+		}
+		entry := listing.FileEntry{Path: "/artifacts/" + id, Type: listing.FileTypeFile, SizeBytes: row.SizeBytes}
+		entry.ContentType, entry.CreatedAt = row.ContentType, &row.CreatedAt
+		if row.Filename != nil {
+			entry.Filename = *row.Filename
+		}
+		if row.Digest != nil {
+			entry.Digest = *row.Digest
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+func (s *Store) ListAgentArtifactsByIDs(
+	ctx context.Context,
+	projectID, agentID uuid.UUID,
+	ids []uuid.UUID,
+) ([]ArtifactRecord, error) {
+	if projectID == uuid.Nil || agentID == uuid.Nil {
+		return nil, errors.New("project id and agent id are required")
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	rows, err := s.q.ListArtifactsByIDs(
+		ctx,
+		dbsqlc.ListArtifactsByIDsParams{ProjectID: projectID, AgentID: agentID, Ids: ids},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list artifacts: %w", err)
+	}
+	records := make([]ArtifactRecord, 0, len(rows))
+	for _, row := range rows {
+		records = append(records, artifactRecordFromListSQLC(row))
+	}
+	return records, nil
+}
+
+func insertArtifactTx(
+	ctx context.Context,
+	tx dbsqlc.DBTX,
+	artifactID uuid.UUID,
+	input CreateArtifactInput,
+) (ArtifactRecord, error) {
+	row, err := dbsqlc.New(tx).InsertArtifact(ctx, dbsqlc.InsertArtifactParams{
+		ID:             artifactID,
+		ProjectID:      input.ProjectID,
+		AgentID:        input.AgentID,
+		ContentType:    input.ContentType,
+		Filename:       storeutil.TextFromEmpty(input.Filename),
+		Digest:         storeutil.TextFromEmpty(input.Digest),
+		SizeBytes:      input.SizeBytes,
+		IdempotencyKey: storeutil.TextFromEmpty(input.IdempotencyKey),
+	})
+	if err != nil {
+		if storeutil.IsUniqueViolation(err) {
+			return ArtifactRecord{}, storeerr.ErrIdempotencyConflict
+		}
+		return ArtifactRecord{}, fmt.Errorf("insert artifact: %w", err)
+	}
+	record := artifactRecordFromInsertSQLC(row)
+	record.Created = true
+	return record, nil
+}
+
+func loadArtifact(
+	ctx context.Context,
+	q *dbsqlc.Queries,
+	projectID, agentID, id uuid.UUID,
+) (ArtifactRecord, error) {
+	row, err := q.GetArtifact(
+		ctx,
+		dbsqlc.GetArtifactParams{ProjectID: projectID, AgentID: agentID, ID: id},
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ArtifactRecord{}, storeerr.ErrNotFound
+		}
+		return ArtifactRecord{}, fmt.Errorf("get artifact: %w", err)
+	}
+	return artifactRecordFromGetSQLC(row), nil
+}
+
+func validateArtifactReplay(record ArtifactRecord, input CreateArtifactInput) error {
+	if record.ProjectID == input.ProjectID &&
+		record.AgentID == input.AgentID &&
+		record.Digest == input.Digest &&
+		record.ContentType == input.ContentType &&
+		record.Filename == input.Filename {
+		return nil
+	}
+	return storeerr.ErrIdempotencyConflict
+}

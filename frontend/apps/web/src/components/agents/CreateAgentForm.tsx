@@ -1,0 +1,38 @@
+import { useToolCatalog } from '@omnara/react'
+import { useSearch } from '@tanstack/react-router'
+
+import { agentTemplates } from '@/components/agents/agentTemplates'
+import { CreateAgentFormView } from '@/components/agents/CreateAgentFormView'
+import { useProjectDefaults } from '@/components/agents/useProjectDefaults'
+import { FullPageSpinner } from '@/components/ui/spinner'
+import { useProjectPage } from '@/lib/use-project-page'
+
+export function CreateAgentForm() {
+  const { activeOrg, projectId } = useProjectPage()
+  const search = useSearch({ strict: false })
+
+  const toolCatalog = useToolCatalog()
+  const {
+    ready: templatesReady,
+    defaultPool,
+    defaultModel,
+  } = useProjectDefaults(activeOrg.id, projectId)
+  const catalog = toolCatalog.data
+  const linkedTemplate = agentTemplates.find((template) => template.id === search.template)
+
+  if (toolCatalog.isPending) return <FullPageSpinner />
+  if (toolCatalog.isError)
+    throw new Error('Failed to load tool catalog', { cause: toolCatalog.error })
+  if (!templatesReady) return <FullPageSpinner />
+
+  return (
+    <CreateAgentFormView
+      key={linkedTemplate?.id ?? ''}
+      catalog={catalog}
+      defaultPool={defaultPool}
+      defaultModel={defaultModel}
+      templatesReady={templatesReady}
+      initialTemplate={linkedTemplate}
+    />
+  )
+}

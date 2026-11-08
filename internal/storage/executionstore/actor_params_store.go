@@ -1,0 +1,164 @@
+package executionstore
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/omnara-ai/omnara/internal/integrationdefinition"
+	"github.com/omnara-ai/omnara/internal/publicid"
+	"github.com/omnara-ai/omnara/internal/resourcemeta"
+	"github.com/omnara-ai/omnara/internal/storage/identitystore"
+	"github.com/omnara-ai/omnara/internal/storage/integrationstore"
+	"github.com/omnara-ai/omnara/internal/storage/internal/dbsqlc"
+)
+
+type ActorParams struct {
+	Provider         ActorProvider         `json:"provider"`
+	ProviderTenantID string                `json:"provider_tenant_id"`
+	ProviderUserID   string                `json:"provider_user_id"`
+	DisplayName      *string               `json:"display_name,omitempty"`
+	Metadata         resourcemeta.Metadata `json:"metadata,omitempty"`
+}
+
+func IntegrationActorParams(
+	integration integrationstore.IntegrationRecord,
+	userID string,
+	displayName *string,
+) (ActorParams, error) {
+	definition, ok := integrationdefinition.Lookup(integration.IntegrationKind)
+	if !ok || definition.Provider != integration.Provider {
+		return ActorParams{}, errors.New("integration actor requires a matching integration kind and provider")
+	}
+	tenantID, sourceLabel, err := definition.ActorIdentity(integration.ProviderTenantID)
+	if err != nil {
+		return ActorParams{}, err
+	}
+	return ActorParams{
+		Provider: ActorProviderIntegration, ProviderTenantID: tenantID,
+		ProviderUserID: userID, DisplayName: displayName,
+		Metadata: resourcemeta.Metadata{"source_label": sourceLabel},
+	}, nil
+}
+
+func OmnaraActorParams(orgID uuid.UUID, principal identitystore.PrincipalRecord) (*ActorParams, error) {
+	tenantID, err := publicid.Encode(publicid.KindOrganization, orgID)
+	if err != nil {
+		return nil, fmt.Errorf("encode omnara actor tenant: %w", err)
+	}
+	if principal.ID == uuid.Nil {
+		return nil, errors.New("omnara actor principal id is required")
+	}
+	var providerUserID string
+	switch principal.Type {
+	case identitystore.PrincipalTypeUser:
+		providerUserID, err = publicid.Encode(publicid.KindUser, principal.ID)
+	case identitystore.PrincipalTypeOrgAPIKey:
+		providerUserID, err = publicid.Encode(publicid.KindOrgAPIKey, principal.ID)
+	default:
+		return nil, fmt.Errorf("unsupported omnara actor principal type %q", principal.Type)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("encode omnara actor principal: %w", err)
+	}
+	return &ActorParams{
+		Provider:         ActorProviderOmnara,
+		ProviderTenantID: tenantID,
+		ProviderUserID:   providerUserID,
+	}, nil
+}
+
+func omnaraActorDisplayNameTx(
+	ctx context.Context,
+	qtx *dbsqlc.Queries,
+	projectID uuid.UUID,
+	providerUserID string,
+) (string, error) {
+	if userID, err := publicid.Decode(publicid.KindUser, providerUserID); err == nil {
+		user, err := qtx.GetUser(ctx, dbsqlc.GetUserParams{ID: userID})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("load omnara actor user: %w", err)
+		}
+		return user.DisplayName, nil
+	}
+	if agentID, err := publicid.Decode(publicid.KindAgent, providerUserID); err == nil {
+		agent, err := qtx.GetAgentInProject(ctx, dbsqlc.GetAgentInProjectParams{ProjectID: projectID, ID: agentID})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("load omnara actor agent: %w", err)
+		}
+		return subagentDisplayName(agentRecordFromProjectSQLC(agent)), nil
+	}
+	keyID, err := publicid.Decode(publicid.KindOrgAPIKey, providerUserID)
+	if err != nil {
+		return "", fmt.Errorf("decode omnara actor principal: %w", err)
+	}
+	project, err := loadProjectTx(ctx, qtx, projectID)
+	if err != nil {
+		return "", err
+	}
+	key, err := qtx.GetOrgAPIKey(ctx, dbsqlc.GetOrgAPIKeyParams{OrgID: project.OrgID, ID: keyID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("load omnara actor org api key: %w", err)
+	}
+	return key.Name, nil
+}
+
+func resolveActorTx(
+	ctx context.Context,
+	qtx *dbsqlc.Queries,
+	projectID uuid.UUID,
+	params *ActorParams,
+) (uuid.UUID, error) {
+	if projectID == uuid.Nil {
+		return uuid.Nil, errors.New("project id is required for input actor")
+	}
+	if params == nil {
+		return uuid.Nil, nil
+	}
+	var actor ActorRecord
+	var err error
+	switch params.Provider {
+	case ActorProviderExternal:
+		actor, err = putActorTx(ctx, qtx, PutActorInput{
+			ProjectID:        projectID,
+			ProviderTenantID: params.ProviderTenantID,
+			ProviderUserID:   params.ProviderUserID,
+			DisplayName:      params.DisplayName,
+			Metadata:         params.Metadata,
+		})
+	default:
+		displayName := ""
+		if params.DisplayName != nil {
+			displayName = *params.DisplayName
+		}
+		if displayName == "" && params.Provider == ActorProviderOmnara {
+			displayName, err = omnaraActorDisplayNameTx(ctx, qtx, projectID, params.ProviderUserID)
+			if err != nil {
+				return uuid.Nil, err
+			}
+		}
+		actor, err = upsertActorIdentityTx(ctx, qtx, UpsertActorIdentityInput{
+			ProjectID:        projectID,
+			Provider:         params.Provider,
+			ProviderTenantID: params.ProviderTenantID,
+			ProviderUserID:   params.ProviderUserID,
+			DisplayName:      displayName,
+			Metadata:         params.Metadata,
+		})
+	}
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return actor.ID, nil
+}

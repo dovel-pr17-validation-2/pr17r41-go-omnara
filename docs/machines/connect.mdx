@@ -1,0 +1,106 @@
+---
+title: Connect a machine
+description: Register your own machine and grant it to projects
+icon: "plug-circle-plus"
+---
+
+import MachinesCreate from '/snippets/machines-create.mdx'
+import MachinesDaemonToken from '/snippets/machines-daemon-token.mdx'
+import MachinesGrant from '/snippets/machines-grant.mdx'
+
+Connecting a BYO machine is three moves: create the machine record, run a daemon on the computer, and grant the machine to the projects that should use it. The dashboard's **Connect a machine** dialog, the CLI's `omnara machines create-local`, and the API's connect endpoint each do the first two in one step, and can attach project grants at the same time.
+
+## Create the machine record
+
+A machine starts as a record in the control plane — the daemon attaches to it later using a **machine token**. The token is shown only once, so save the complete value and treat it as opaque.
+
+<Tabs>
+<Tab title="Dashboard">
+  With **All projects** selected in the project switcher, open **Machines** and click **Connect machine**. In the **Connect a machine** dialog, set the machine name — this is what agent configs reference as `machine_name`, so pick something stable — and optionally pick projects under **Share with**. Click **Connect machine**; the next screen shows the machine token alongside the install command for the daemon install step below.
+</Tab>
+<Tab title="CLI">
+  To connect the computer you are sitting at, one command creates the machine, mints its token, and runs the installer locally:
+
+  ```bash
+  npx omnara machines create-local --display-name build-server-1 --project-ids proj_7mv4qtrwz3jehcyd5n6a2bfgik
+  ```
+
+  It refuses to run if `~/.omnarad` (or `$OMNARA_HOME`) already holds a daemon install; run `omnarad uninstall` first to connect the computer as a new machine. If the installer fails after the machine was created, the command prints the token and the install command so you can finish by hand.
+
+  To connect a different computer, create the machine from anywhere and carry the output over:
+
+  ```bash
+  npx omnara machines create --display-name build-server-1 --project-ids proj_7mv4qtrwz3jehcyd5n6a2bfgik
+  ```
+
+  The output includes the one-time `token` plus an `install_command` to run on the target machine. Pass `--token-name` to label the daemon token (it defaults to `daemon`), and `--cwd`, `--env`, or `--secret-env` to set execution defaults.
+
+  `--project-ids` takes an ID from `npx omnara projects list`; repeat it for each project, or leave it off and [grant the machine later](#grant-the-machine-to-a-project).
+</Tab>
+<Tab title="API">
+  The examples assume the client, `$ORG`/`orgID`, and `$PROJ`/`projectID` setup from the [quickstart](/quickstart).
+
+  <MachinesCreate />
+
+  The response includes the plaintext `token` and its metadata in `token_record`. Store the token now; later API responses return only its metadata. `project_ids` is optional (in the CLI, repeat `--project-ids` for each project); omit it to grant the machine later. To create a record without a token, use the [create machine](/api-reference/endpoints/machines/create-machine) endpoint instead and mint tokens separately:
+
+  <MachinesDaemonToken />
+</Tab>
+</Tabs>
+
+`display_name` is what agent configs reference as `machine_name`, so pick something stable. `cwd`, `env`, and `secret_env` are execution defaults for every process on this machine; `secret_env` injects [secret](/organization/secrets) values by `sec_…` reference at process launch, so credentials never sit in the machine record.
+
+## Install the daemon
+
+`omnara machines create-local` runs this step for you. Otherwise, on the target computer, run the installer and paste the machine token when prompted:
+
+```sh
+curl -fsSL https://api.omnara.com/install/omnarad.sh | sh
+```
+
+The installer supports macOS and Linux on amd64 and arm64. It installs `omnarad` under `~/.omnarad` and registers it as a user service using systemd on Linux or launchd on macOS. When no launchd or systemd user service manager is available, `omnarad` runs in the foreground instead; press Ctrl-C to stop it and run `omnarad start` to launch it again. The daemon connects outbound and updates itself. Manage it with `omnarad start|stop|restart|status`, or remove it with `omnarad uninstall`.
+
+Once the daemon connects, the machine appears online.
+
+## Grant the machine to a project
+
+Machines are org-level; a project's agents can only target machines granted to that project.
+
+<Tabs>
+<Tab title="Dashboard">
+  If you didn't share the machine while connecting it, select **All projects** in the project switcher, open **Machines**, and click **BYO Machines**. Open the machine's row actions, click **Share with project**, and select the project.
+
+  From a project, open its **Machines** page and click **Share machines**. To see existing shares, click **BYO Machines**; open a row's actions and click **Stop sharing** to revoke one.
+</Tab>
+<Tab title="API">
+  If you didn't pass `project_ids` while connecting the machine, grant it afterwards:
+
+  <MachinesGrant />
+
+  List the project's explicit machine grants with `omnara grant machines list` or the [list endpoint](/api-reference/endpoints/machines/list-project-machine-grants), and revoke one by grant ID with `omnara grant machines delete {grant-id}` or the delete endpoint.
+
+  Revoking the grant stops that project's work on the machine but leaves the machine itself untouched. Grants created through a [pool grant](/machines/pools) are managed through the pool and cannot be revoked individually.
+</Tab>
+</Tabs>
+
+With the grant in place, configs in that project can reference the machine:
+
+```yaml
+machine_sources:
+  - machine_name: build-server-1
+    cwd: /srv/repo
+```
+
+## Manage a machine
+
+The dashboard's **Machines** page (with **All projects** selected in the project switcher) shows every machine you can access. `omnara machines list` and the org API provide the same view and explain whether access comes from your org role, having created the machine, or a project grant. The project API lists only machines that project's agents can use.
+
+You can update `cwd`, `env`, and `secret_env` with `omnara machines update {machine-id}` or through the API; machine names cannot be changed.
+
+Machine tokens can be created, listed, and revoked through the API.
+
+Deleting a BYO machine disconnects its daemon, revokes its tokens, removes its grants, and releases its agent bindings. In the dashboard, open the machine's row menu and click **Delete**; in the CLI, run `omnara machines delete {machine-id}`.
+
+<Info>
+Full schema and playground: [Connect a BYO machine](/api-reference/endpoints/machines/connect-a-byo-machine) · [Create machine](/api-reference/endpoints/machines/create-machine) · [List visible machines](/api-reference/endpoints/machines/list-visible-machines) · [Daemon tokens](/api-reference/endpoints/machines/list-byo-machine-daemon-tokens) · [Machine grants](/api-reference/endpoints/machines/create-project-machine-grant).
+</Info>

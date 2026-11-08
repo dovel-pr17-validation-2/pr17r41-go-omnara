@@ -1,0 +1,286 @@
+name: Release omnarad
+
+on:
+  push:
+    tags:
+      - 'omnarad-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version in X.Y.Z form for a non-publishing build, sign, and notarize run
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: omnarad-release
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  metadata:
+    name: Validate release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      release_sha: ${{ steps.release.outputs.release_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Validate source and version
+        id: release
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: go run ./tools/omnarad-release resolve
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: metadata
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            artifact_name: omnarad-linux-amd64
+            runner: ubuntu-24.04
+          - platform: linux-arm64
+            artifact_name: omnarad-linux-arm64
+            runner: ubuntu-24.04-arm
+          - platform: darwin-amd64
+            artifact_name: unsigned-omnarad-darwin-amd64
+            runner: macos-15-intel
+          - platform: darwin-arm64
+            artifact_name: unsigned-omnarad-darwin-arm64
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.metadata.outputs.release_sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build and verify
+        env:
+          GOFLAGS: -trimpath
+          OMNARAD_VERSION: ${{ needs.metadata.outputs.version }}
+          PLATFORM: ${{ matrix.platform }}
+        run: go run ./tools/omnarad-release build
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: release/omnarad-${{ matrix.platform }}
+          if-no-files-found: error
+          retention-days: 14
+
+  apple-signing:
+    name: Sign and notarize macOS binaries
+    needs:
+      - metadata
+      - build
+    runs-on: macos-15
+    timeout-minutes: 45
+    environment: apple-signing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.metadata.outputs.release_sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: unsigned-omnarad-darwin-*
+          path: release
+          merge-multiple: true
+
+      - name: Sign and notarize
+        env:
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: .github/scripts/sign-notarize-omnarad.sh release
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-omnarad-macos
+          path: |
+            release/omnarad-darwin-amd64
+            release/omnarad-darwin-arm64
+          if-no-files-found: error
+          retention-days: 14
+
+  bundle:
+    name: Build release bundle
+    needs:
+      - metadata
+      - build
+      - apple-signing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.metadata.outputs.release_sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: omnarad-linux-*
+          path: release
+          merge-multiple: true
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signed-omnarad-macos
+          path: release
+
+      - name: Generate and verify release bundle
+        env:
+          OMNARAD_VERSION: ${{ needs.metadata.outputs.version }}
+        run: go run ./tools/omnarad-release generate --dir release
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: omnarad-release-${{ needs.metadata.outputs.version }}
+          path: release
+          if-no-files-found: error
+          retention-days: 14
+
+  attest-and-publish:
+    name: Attest and publish release
+    needs:
+      - metadata
+      - bundle
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    env:
+      GH_REPO: ${{ github.repository }}
+    environment:
+      name: releases
+      url: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.metadata.outputs.release_sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: omnarad-release-${{ needs.metadata.outputs.version }}
+          path: release
+
+      - name: Verify release bundle
+        env:
+          OMNARAD_VERSION: ${{ needs.metadata.outputs.version }}
+        run: go run ./tools/omnarad-release verify --dir release
+
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release/*
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.metadata.outputs.release_sha }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Generate categorized release notes (.github/release.yml) against the
+          # previous omnarad tag. Tags from other release families (cluster-v*,
+          # cli-v*, sdk-v*) share this repo, so the baseline must be explicit.
+          # Search all published releases and select the greatest version below
+          # this tag, so reruns cannot diff against a newer release or a draft.
+          prev_tag=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' |
+            jq -Rrs --arg current "$GITHUB_REF_NAME" '
+              def version: ltrimstr("omnarad-v") | split(".") | map(tonumber);
+              ($current | version) as $current_version |
+              split("\n") | map(select(test("^omnarad-v[0-9]+\\.[0-9]+\\.[0-9]+$"))) |
+              map({tag: ., version: version}) | map(select(.version < $current_version)) |
+              sort_by(.version) | last.tag // empty
+            ')
+          {
+            echo "Canonical omnarad $VERSION binaries built from $RELEASE_SHA. macOS binaries require macOS 13 or later."
+            echo
+            gh api "repos/$GH_REPO/releases/generate-notes" -f tag_name="$GITHUB_REF_NAME" ${prev_tag:+-f previous_tag_name="$prev_tag"} --jq .body
+          } > "$RUNNER_TEMP/release-notes.md"
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release/* --clobber
+            gh release edit "$GITHUB_REF_NAME" --draft=false --latest=false --prerelease=false --notes-file "$RUNNER_TEMP/release-notes.md" --title "omnarad v$VERSION" --verify-tag
+          else
+            gh release create "$GITHUB_REF_NAME" release/* --latest=false --notes-file "$RUNNER_TEMP/release-notes.md" --title "omnarad v$VERSION" --verify-tag
+          fi
+
+  promote-stable:
+    name: Promote stable channel
+    needs:
+      - metadata
+      - attest-and-publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+    environment:
+      name: releases
+      url: https://github.com/${{ github.repository }}/releases/tag/omnarad-stable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.metadata.outputs.release_sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: omnarad-release-${{ needs.metadata.outputs.version }}
+          path: release
+
+      - name: Promote stable channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OMNARAD_VERSION: ${{ needs.metadata.outputs.version }}
+          RELEASE_SHA: ${{ needs.metadata.outputs.release_sha }}
+        run: |
+          go run ./tools/omnarad-release promote --dir release
+          gh release edit "$GITHUB_REF_NAME" --latest

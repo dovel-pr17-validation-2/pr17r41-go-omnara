@@ -1,0 +1,73 @@
+package model_test
+
+import (
+	"net/http"
+	"time"
+
+	"github.com/omnara-ai/omnara/internal/model"
+	"github.com/omnara-ai/omnara/internal/model/anthropicmessages"
+	"github.com/omnara-ai/omnara/internal/model/openaichatcompletions"
+	"github.com/omnara-ai/omnara/internal/model/openairesponses"
+)
+
+type wireClientConfig struct {
+	baseURL               string
+	modelProviderConfigID string
+	capabilities          model.Capabilities
+	httpClient            *http.Client
+	idleTimeout           time.Duration
+}
+
+func adapterWireClients(config wireClientConfig) []struct {
+	name, field string
+	client      model.Client
+} {
+	baseURL := config.baseURL
+	if baseURL == "" {
+		baseURL = "https://example.test"
+	}
+	return []struct {
+		name, field string
+		client      model.Client
+	}{
+		{
+			"chat",
+			"max_completion_tokens",
+			openaichatcompletions.Client{
+				ModelProviderConfigID: config.modelProviderConfigID,
+				EndpointPath:          "/chat/completions",
+				ProviderModelSlug:     "test-model",
+				ModelCapabilities:     config.capabilities,
+				BaseURL:               baseURL,
+				HTTPClient:            config.httpClient,
+				IdleTimeout:           config.idleTimeout,
+			},
+		},
+		{
+			"responses",
+			"max_output_tokens",
+			openairesponses.Client{
+				ModelProviderConfigID: config.modelProviderConfigID,
+				EndpointPath:          "/responses",
+				ProviderModelSlug:     "test-model",
+				ModelCapabilities:     config.capabilities,
+				BaseURL:               baseURL,
+				HTTPClient:            config.httpClient,
+				IdleTimeout:           config.idleTimeout,
+			},
+		},
+		{
+			"anthropic",
+			"max_tokens",
+			anthropicmessages.Client{
+				ModelProviderConfigID: config.modelProviderConfigID,
+				EndpointPath:          "/messages",
+				ProviderModelSlug:     "test-model",
+				ModelCapabilities:     config.capabilities,
+				BaseURL:               baseURL,
+				HTTPClient:            config.httpClient,
+				IdleTimeout:           config.idleTimeout,
+			},
+		},
+	}
+}

@@ -1,0 +1,39 @@
+package executionstore
+
+import (
+	"encoding/json"
+	"time"
+)
+
+func canonicalSourceTime(value time.Time) time.Time {
+	return time.UnixMicro(value.UnixMicro()).UTC()
+}
+
+func timePtr(value time.Time) *time.Time {
+	return &value
+}
+
+func rawMessageFromSQLCPtr(value *json.RawMessage) json.RawMessage {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func stringFromSQLCText(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
+}
+
+func sqlcStrings[T ~string](values []T) []string {
+	if values == nil {
+		return nil
+	}
+	out := make([]string, len(values))
+	for index, value := range values {
+		out[index] = string(value)
+	}
+	return out
+}

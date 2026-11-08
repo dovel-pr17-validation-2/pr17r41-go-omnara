@@ -1,0 +1,134 @@
+import { type ProjectAvailableSecretListSort, useProjectAvailableSecrets } from '@omnara/react'
+import type { ProjectSecretAccess } from '@omnara/sdk'
+import type { ReactNode } from 'react'
+
+import { DataTable } from '@/components/data-table/DataTable'
+import { DetailList } from '@/components/data-table/DetailList'
+import { ResourceListToolbar } from '@/components/data-table/ResourceListToolbar'
+import { SearchHeader } from '@/components/layout/SearchHeader'
+import { GrantProjectSecretsButton } from '@/components/projects/GrantProjectSecretsButton'
+import { SecretRowActions } from '@/components/secrets/SecretRowActions'
+import { usePagedQuery } from '@/hooks/use-paged-query'
+import {
+  resourceSortOptions,
+  useListToolbarVisibility,
+  useResourceList,
+} from '@/hooks/use-resource-list'
+import { guides } from '@/lib/docs'
+import { formatDateTime } from '@/lib/format'
+import { secretSubtitle } from '@/lib/secrets'
+
+function ownerLabel(access: ProjectSecretAccess) {
+  return access.secret.owner.kind === 'org' ? 'Organization' : access.secret.owner.kind
+}
+
+/**
+ * Secrets this project can use through a grant. Project-owned secrets live on
+ * the Project tab; managers share more from here or from each secret's owner page.
+ */
+export function ProjectSecretGrantsTable({
+  orgId,
+  projectId,
+  projectName,
+  canManage,
+  actions,
+}: {
+  orgId: string
+  projectId: string
+  projectName: string
+  /** Whether the viewer may share and stop sharing (requires managing the target project). */
+  canManage: boolean
+  /** Header controls, e.g. tabs. */
+  actions?: ReactNode
+}) {
+  const list = useResourceList<ProjectAvailableSecretListSort>('-updated_at')
+  const query = useProjectAvailableSecrets(orgId, projectId, {
+    filters: { ...list.apiFilters, availability_source: 'grant' },
+    sort: list.sort,
+  })
+  const paged = usePagedQuery(query, list.queryKey)
+  const showToolbar = useListToolbarVisibility(list, paged.pagination, query.isSuccess)
+  const shareButton = canManage && <GrantProjectSecretsButton orgId={orgId} projectId={projectId} />
+
+  return (
+    <div className="flex flex-col gap-3">
+      <SearchHeader
+        title="Shared secrets"
+        description="List of secrets accessible to agents in your current project"
+        guide={guides.secrets}
+        toolbar={
+          <ResourceListToolbar
+            search={list.search}
+            onSearchChange={list.setSearch}
+            sort={{ value: list.sort, options: resourceSortOptions, onChange: list.setSort }}
+            placeholder="Search shared secrets by name…"
+            showSearch={showToolbar}
+          />
+        }
+      >
+        {actions}
+        {shareButton}
+      </SearchHeader>
+      <DataTable
+        columns={[
+          {
+            id: 'secret',
+            header: 'Secret',
+            cell: (access) => <span className="font-medium">{access.secret.name}</span>,
+          },
+          {
+            id: 'type',
+            header: 'Type',
+            cell: (access) => (
+              <span className="text-muted-foreground">{secretSubtitle(access.secret)}</span>
+            ),
+          },
+          {
+            id: 'owner',
+            header: 'Owner',
+            className: 'w-32',
+            cell: (access) => <span className="capitalize">{ownerLabel(access)}</span>,
+          },
+          {
+            id: 'actions',
+            header: '',
+            className: 'w-14',
+            isActions: true,
+            cell: (access) => (
+              <SecretRowActions
+                orgId={orgId}
+                secret={access.secret}
+                availability={access.availability}
+                projectName={projectName}
+                canDelete={canManage}
+              />
+            ),
+          },
+        ]}
+        data={paged.rows}
+        isFiltered={list.isFiltering}
+        pagination={paged.pagination}
+        getRowId={(access) => access.secret.id}
+        rowExpanded={({ secret }) => (
+          <DetailList
+            items={[
+              { label: 'ID', value: secret.id, mono: true },
+              { label: 'MCP URL', value: secret.metadata.mcp_url, mono: true },
+              { label: 'Payload keys', value: secret.payload_keys.join(', '), mono: true },
+              { label: 'Version', value: secret.current_version_number },
+              { label: 'Created', value: formatDateTime(secret.created_at) },
+              { label: 'Updated', value: formatDateTime(secret.updated_at) },
+            ]}
+          />
+        )}
+        isPending={query.isPending}
+        isError={query.isError}
+        onRetry={() => {
+          void query.refetch()
+        }}
+        emptyMessage="No secrets shared with this project yet."
+        emptyAction={shareButton}
+      />
+    </div>
+  )
+}

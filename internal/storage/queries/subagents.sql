@@ -1,0 +1,192 @@
+-- name: ListChildAgents :many
+SELECT agent.id,
+       agent.name,
+       agent.state,
+       agent.subagent_key,
+       details.last_activity_at::timestamptz AS last_activity_at,
+       details.open_question_count::integer AS open_question_count,
+       details.open_permission_count::integer AS open_permission_count,
+       activity.state::text AS activity_state,
+       details.background_process_ids::uuid[] AS background_process_ids,
+       details.working_subagent_ids::uuid[] AS working_subagent_ids
+FROM agents agent
+CROSS JOIN LATERAL agent_activity_state(agent.id, agent.state) activity
+CROSS JOIN LATERAL agent_activity_details(agent.project_id, agent.id, agent.created_at) details
+WHERE agent.project_id = sqlc.arg(project_id)
+  AND agent.parent_agent_id = sqlc.arg(parent_agent_id)
+  AND (sqlc.arg(include_archived)::boolean OR agent.state = 'active')
+ORDER BY agent.created_at, agent.id;
+
+-- name: ListAgentActivityForAgents :many
+SELECT agent.id,
+       agent.state,
+       details.last_activity_at::timestamptz AS last_activity_at,
+       details.open_question_count::integer AS open_question_count,
+       details.open_permission_count::integer AS open_permission_count,
+       activity.state::text AS activity_state,
+       details.background_process_ids::uuid[] AS background_process_ids,
+       details.working_subagent_ids::uuid[] AS working_subagent_ids
+FROM agents agent
+CROSS JOIN LATERAL agent_activity_state(agent.id, agent.state) activity
+CROSS JOIN LATERAL agent_activity_details(agent.project_id, agent.id, agent.created_at) details
+WHERE agent.project_id = ANY(sqlc.arg(project_ids)::uuid[])
+  AND agent.id = ANY(sqlc.arg(agent_ids)::uuid[]);
+
+-- name: CountActiveChildAgentsForLaunch :one
+SELECT count(*)::integer AS total,
+       count(*) FILTER (WHERE agent.subagent_key = sqlc.arg(subagent_key)::text)::integer AS same_key
+FROM agents agent
+WHERE agent.project_id = sqlc.arg(project_id)
+  AND agent.parent_agent_id = sqlc.arg(parent_agent_id)
+  AND agent.state = 'active';
+
+-- name: ListActiveChildAgentIDs :many
+SELECT agent.id
+FROM agents agent
+WHERE agent.project_id = sqlc.arg(project_id)
+  AND agent.parent_agent_id = sqlc.arg(parent_agent_id)
+  AND agent.state = 'active'
+ORDER BY agent.created_at, agent.id;
+
+-- name: CountAgentAncestors :one
+WITH RECURSIVE ancestors AS (
+  SELECT agent.id, agent.parent_agent_id, 1 AS depth
+  FROM agents agent
+  WHERE agent.project_id = sqlc.arg(project_id)
+    AND agent.id = sqlc.arg(agent_id)
+  UNION ALL
+  SELECT parent.id, parent.parent_agent_id, ancestors.depth + 1
+  FROM agents parent
+  JOIN ancestors ON parent.id = ancestors.parent_agent_id
+  WHERE parent.project_id = sqlc.arg(project_id)
+    AND ancestors.depth < 64
+)
+SELECT count(*)::integer
+FROM ancestors
+WHERE ancestors.parent_agent_id IS NOT NULL;
+
+-- name: ListAgentDescendantIDs :many
+WITH RECURSIVE descendants AS (
+  SELECT agent.id, 1 AS depth
+  FROM agents agent
+  WHERE agent.project_id = sqlc.arg(project_id)
+    AND agent.parent_agent_id = sqlc.arg(agent_id)
+  UNION ALL
+  SELECT child.id, descendants.depth + 1
+  FROM agents child
+  JOIN descendants ON child.parent_agent_id = descendants.id
+  WHERE child.project_id = sqlc.arg(project_id)
+    AND descendants.depth < 64
+)
+SELECT descendants.id
+FROM descendants
+ORDER BY descendants.depth, descendants.id;
+
+-- name: ListParentMachineBindingsForSharing :many
+SELECT pmgrant.id AS project_machine_grant_id,
+       binding.machine_id,
+       binding.cwd,
+       binding.env_overlay,
+       binding.secret_env_overlay,
+       binding.description
+FROM agent_machine_bindings binding
+JOIN project_machine_grants pmgrant ON pmgrant.project_id = binding.project_id
+  AND pmgrant.machine_id = binding.machine_id
+JOIN machines machine ON machine.org_id = binding.org_id
+  AND machine.id = binding.machine_id
+  AND machine.deleted_at IS NULL
+  AND machine.lifecycle_state NOT IN ('deleting', 'delete_failed', 'deleted')
+WHERE binding.project_id = sqlc.arg(project_id)
+  AND binding.agent_id = sqlc.arg(agent_id)
+  AND binding.state = 'attached'
+ORDER BY binding.created_at, binding.id;
+
+-- name: ListAgentInteractionsForAgents :many
+SELECT interaction.id, interaction.project_id, interaction.agent_id, interaction.turn_id,
+       interaction.model_call_context_id, interaction.tool_call_id, interaction.provider_call_id,
+       interaction.interaction_kind, interaction.state, interaction.request, interaction.resolution,
+       interaction.resolved_by_input_id, interaction.created_at, interaction.resolved_at,
+       interaction.destination, interaction.presentation_receipt,
+       agent.name AS agent_name, agent.subagent_key
+FROM agent_interaction_read_projection interaction
+JOIN agents agent ON agent.project_id = interaction.project_id
+  AND agent.id = interaction.agent_id
+WHERE interaction.project_id = sqlc.arg(project_id)
+  AND interaction.agent_id = ANY(sqlc.arg(agent_ids)::uuid[])
+  AND (sqlc.arg(state)::text = '' OR interaction.state = sqlc.arg(state))
+  AND (
+    sqlc.narg(cursor_created_at)::timestamptz IS NULL
+    OR (interaction.created_at, interaction.id) > (sqlc.narg(cursor_created_at)::timestamptz, sqlc.narg(cursor_id)::uuid)
+  )
+ORDER BY interaction.created_at ASC, interaction.id ASC
+LIMIT sqlc.arg(row_limit)::bigint;
+
+-- name: ListIdleAgentsForArchive :many
+WITH candidate AS (
+  SELECT agent.project_id, agent.id, agent.created_at
+  FROM agents agent
+  WHERE agent.state = 'active'
+    AND agent.archive_after_idle_minutes IS NOT NULL
+    AND coalesce((
+      SELECT event.created_at
+      FROM agent_events event
+      WHERE event.agent_id = agent.id
+      ORDER BY event.sequence DESC
+      LIMIT 1
+    ), agent.created_at) < coalesce(sqlc.narg(as_of)::timestamptz, statement_timestamp())
+      - make_interval(mins => agent.archive_after_idle_minutes)
+)
+SELECT candidate.project_id, candidate.id
+FROM candidate
+WHERE NOT agent_subtree_has_work(candidate.project_id, candidate.id)
+ORDER BY candidate.created_at, candidate.id
+LIMIT sqlc.arg(row_limit)::integer;
+
+-- name: AgentIdleForArchive :one
+SELECT EXISTS (
+  SELECT 1
+  FROM agents agent
+  WHERE agent.project_id = sqlc.arg(project_id)
+    AND agent.id = sqlc.arg(agent_id)
+    AND agent.state = 'active'
+    AND agent.archive_after_idle_minutes IS NOT NULL
+    AND coalesce((
+      SELECT event.created_at
+      FROM agent_events event
+      WHERE event.agent_id = agent.id
+      ORDER BY event.sequence DESC
+      LIMIT 1
+    ), agent.created_at) < coalesce(sqlc.narg(as_of)::timestamptz, statement_timestamp())
+      - make_interval(mins => agent.archive_after_idle_minutes)
+    AND NOT agent_subtree_has_work(agent.project_id, agent.id)
+)::boolean AS idle;
+
+-- name: ListAgentTreeStates :many
+WITH RECURSIVE subtree AS (
+  SELECT agent.project_id, agent.id AS tracked_agent_id, agent.id, agent.state, 0 AS depth
+  FROM agents agent
+  WHERE agent.project_id = ANY(sqlc.arg(project_ids)::uuid[])
+    AND agent.id = ANY(sqlc.arg(agent_ids)::uuid[])
+  UNION ALL
+  SELECT child.project_id, subtree.tracked_agent_id, child.id, child.state, subtree.depth + 1
+  FROM agents child
+  JOIN subtree ON child.project_id = subtree.project_id AND child.parent_agent_id = subtree.id
+  WHERE child.state = 'active' AND subtree.depth < 64
+)
+SELECT subtree.tracked_agent_id AS id,
+       bool_or(subtree.depth = 0 AND subtree.state = 'archived')::boolean AS archived,
+       bool_or(EXISTS (
+         SELECT 1 FROM agent_interactions interaction
+         WHERE interaction.agent_id = subtree.id AND interaction.state = 'open'
+       ))::boolean AS waiting,
+       bool_or(
+         EXISTS (SELECT 1 FROM agent_runtime_locks runtime_lock WHERE runtime_lock.agent_id = subtree.id)
+         OR EXISTS (SELECT 1 FROM agent_wakeups wake WHERE wake.agent_id = subtree.id)
+         OR EXISTS (
+           SELECT 1 FROM agent_execution_state h
+           WHERE h.agent_id = subtree.id AND (h.logical_ready_at IS NOT NULL OR h.incomplete_tools)
+         )
+         OR EXISTS (SELECT 1 FROM agent_background_processes(subtree.project_id, subtree.id) process)
+       )::boolean AS working
+FROM subtree
+GROUP BY subtree.tracked_agent_id;

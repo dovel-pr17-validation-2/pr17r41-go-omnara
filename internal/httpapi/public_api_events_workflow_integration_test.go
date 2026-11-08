@@ -1,0 +1,2445 @@
+//go:build integration
+
+package httpapi
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/benbjohnson/clock"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/multitracer"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/omnara-ai/omnara/internal/model"
+	"github.com/omnara-ai/omnara/internal/notifications"
+	"github.com/omnara-ai/omnara/internal/publicid"
+	"github.com/omnara-ai/omnara/internal/storage"
+	"github.com/omnara-ai/omnara/internal/storage/executionstore"
+	"github.com/omnara-ai/omnara/internal/storage/identitystore"
+	"github.com/omnara-ai/omnara/internal/testutil"
+	"github.com/omnara-ai/omnara/internal/testutil/integrationredis"
+	"github.com/omnara-ai/omnara/internal/testutil/modeltest"
+	"github.com/omnara-ai/omnara/internal/testutil/storagetest"
+	"github.com/omnara-ai/omnara/internal/toolcatalog"
+)
+
+type controlledAgentNotificationSubscriber struct {
+	eventCallbacks chan func(context.Context)
+	deltaCallbacks chan func(context.Context, json.RawMessage)
+	toolCallbacks  chan func(context.Context, notifications.ToolCallUpdatedCommitted)
+}
+
+type eventProjectionQueryCounter struct {
+	count atomic.Int64
+}
+
+func (c *eventProjectionQueryCounter) TraceQueryStart(
+	ctx context.Context,
+	_ *pgx.Conn,
+	data pgx.TraceQueryStartData,
+) context.Context {
+	if strings.HasPrefix(data.SQL, "-- name: ListAgentEventsForRead :many") {
+		c.count.Add(1)
+	}
+	return ctx
+}
+
+func (*eventProjectionQueryCounter) TraceQueryEnd(
+	context.Context,
+	*pgx.Conn,
+	pgx.TraceQueryEndData,
+) {
+}
+
+func poolWithQueryTracer(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	tracer pgx.QueryTracer,
+) *pgxpool.Pool {
+	t.Helper()
+	config := pool.Config()
+	config.ConnConfig.Tracer = multitracer.New(config.ConnConfig.Tracer, tracer)
+	tracedPool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatalf("open traced integration database: %v", err)
+	}
+	t.Cleanup(tracedPool.Close)
+	return tracedPool
+}
+
+func withAgentEventReconciliationInterval(interval time.Duration) Option {
+	return func(server *Server) {
+		server.agentEventReconciliationInterval = interval
+	}
+}
+
+type droppingAgentEventWakeupPublisher struct {
+	attempts chan uuid.UUID
+}
+
+func (p *droppingAgentEventWakeupPublisher) PublishAgentEventWakeup(
+	ctx context.Context,
+	agentID uuid.UUID,
+) error {
+	select {
+	case p.attempts <- agentID:
+		return errors.New("simulated dropped agent event wakeup")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func waitForAgentEventWakeupAttempt(
+	t *testing.T,
+	ctx context.Context,
+	attempts <-chan uuid.UUID,
+	wantAgentID uuid.UUID,
+) {
+	t.Helper()
+	for {
+		select {
+		case agentID := <-attempts:
+			if agentID == wantAgentID {
+				return
+			}
+		case <-ctx.Done():
+			t.Fatalf("wait for dropped agent event wakeup: %v", ctx.Err())
+		}
+	}
+}
+
+func (s *controlledAgentNotificationSubscriber) SubscribeAgentEventWakeups(
+	_ context.Context,
+	_ uuid.UUID,
+	callback func(context.Context),
+) (notifications.Subscription, error) {
+	s.eventCallbacks <- callback
+	return noopSubscription{}, nil
+}
+
+func (s *controlledAgentNotificationSubscriber) SubscribeAgentStreamDeltas(
+	_ context.Context,
+	_ uuid.UUID,
+	callback func(context.Context, json.RawMessage),
+) (notifications.Subscription, error) {
+	s.deltaCallbacks <- callback
+	return noopSubscription{}, nil
+}
+
+func (s *controlledAgentNotificationSubscriber) SubscribeAgentToolCallUpdates(
+	_ context.Context,
+	_ uuid.UUID,
+	callback func(context.Context, notifications.ToolCallUpdatedCommitted),
+) (notifications.Subscription, error) {
+	s.toolCallbacks <- callback
+	return noopSubscription{}, nil
+}
+
+func TestPublicEventStreamHeartbeatsWaitForDurableWakeup(t *testing.T) {
+	t.Parallel()
+	setupCtx := context.Background()
+	basePool := openIntegrationDB(t, setupCtx)
+	queryCounter := &eventProjectionQueryCounter{}
+	pool := poolWithQueryTracer(t, setupCtx, basePool, queryCounter)
+	store := newIntegrationStore(pool)
+	timer := clock.NewMock()
+	subscriber := &controlledAgentNotificationSubscriber{
+		eventCallbacks: make(chan func(context.Context), 1),
+		deltaCallbacks: make(chan func(context.Context, json.RawMessage), 1),
+		toolCallbacks:  make(chan func(context.Context, notifications.ToolCallUpdatedCommitted), 1),
+	}
+	server := mustNewServer(
+		t,
+		store,
+		WithTimer(timer),
+		WithAgentEventWakeupSubscriber(subscriber),
+		WithAgentStreamDeltaSubscriber(subscriber),
+		WithAgentToolCallUpdateSubscriber(subscriber),
+		withAgentEventReconciliationInterval(time.Hour),
+	)
+	handler := newIntegrationHTTPHandler(server.Handler(), pool, store)
+	project := bootstrapPublicHTTPProject(t, handler, "sse-heartbeat")
+	launch := launchPublicHTTPAgent(
+		t,
+		handler,
+		project,
+		"sse-heartbeat",
+		project.AdminToken,
+		http.StatusCreated,
+	)
+	agentPublicID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, launch["agent"])["id"])
+	agentID, err := publicid.Decode(publicid.KindAgent, agentPublicID)
+	if err != nil {
+		t.Fatalf("decode agent id: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(setupCtx, 10*time.Second)
+	defer cancel()
+
+	httpServer := httptest.NewServer(handler)
+	defer httpServer.Close()
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		httpServer.URL+project.ProjectPath+"/agents/"+agentPublicID+"/events/stream?stream_deltas=true",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("build sse request: %v", err)
+	}
+	for key, value := range authHeaders(project.AdminToken) {
+		req.Header.Set(key, value)
+	}
+	// Launch creates the opening event at sequence 1; begin after it so the stream is idle.
+	req.Header.Set("Last-Event-ID", "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("sse request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sse status=%d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-cache, no-transform" {
+		t.Fatalf("sse Cache-Control=%q", got)
+	}
+	if got := resp.Header.Get("X-Accel-Buffering"); got != "no" {
+		t.Fatalf("sse X-Accel-Buffering=%q", got)
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	if !scanner.Scan() || scanner.Text() != ": ok" {
+		t.Fatalf("sse stream missing preamble: %q", scanner.Text())
+	}
+	wakeup := <-subscriber.eventCallbacks
+	delta := <-subscriber.deltaCallbacks
+	toolUpdate := <-subscriber.toolCallbacks
+	type scanResult struct {
+		line string
+		err  error
+	}
+	lines := make(chan scanResult, 16)
+	go func() {
+		defer close(lines)
+		for scanner.Scan() {
+			if line := scanner.Text(); line != "" {
+				lines <- scanResult{line: line}
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			lines <- scanResult{err: err}
+		}
+	}()
+
+	timer.Add(agentEventStreamHeartbeatInterval)
+	select {
+	case result, ok := <-lines:
+		if !ok || result.err != nil {
+			t.Fatalf("sse stream closed before heartbeat: %v", result.err)
+		}
+		if result.line != ": heartbeat" {
+			t.Fatalf("first idle stream frame=%q, want heartbeat comment", result.line)
+		}
+	case <-ctx.Done():
+		t.Fatalf("wait for heartbeat: %v", ctx.Err())
+	}
+	projectionQueriesAfterInitialDrain := queryCounter.count.Load()
+	if projectionQueriesAfterInitialDrain != 1 {
+		t.Fatalf(
+			"initial event projection queries=%d, want 1",
+			projectionQueriesAfterInitialDrain,
+		)
+	}
+
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentPublicID+"/inputs",
+		`{"content_blocks":[{"type":"text","text":"found after durable wakeup"}]}`,
+		"idem-sse-heartbeat",
+		http.StatusCreated,
+		authHeaders(project.AdminToken),
+	)
+	claim, found, err := store.Execution().ClaimNextAgentWork(ctx, httpTestClaimInput())
+	if err != nil {
+		t.Fatalf("claim agent work: %v", err)
+	}
+	if !found || len(claim.Model.AdmittedInputTurn.Events) != 1 {
+		t.Fatalf("claim did not admit heartbeat test input: found=%v claim=%+v", found, claim)
+	}
+	wantSequence := claim.Model.AdmittedInputTurn.Events[0].Sequence
+
+	toolCallID := uuid.New()
+	toolUpdate(ctx, notifications.ToolCallUpdatedCommitted{
+		AgentID:    agentID,
+		ToolCallID: toolCallID,
+		State:      string(executionstore.ToolCallStateReady),
+	})
+	for _, wantLine := range []string{"event: tool_call_update", "data: "} {
+		select {
+		case result, ok := <-lines:
+			if !ok || result.err != nil {
+				t.Fatalf("sse stream closed before tool update: %v", result.err)
+			}
+			if !strings.HasPrefix(result.line, wantLine) {
+				t.Fatalf("tool update line=%q, want prefix %q", result.line, wantLine)
+			}
+		case <-ctx.Done():
+			t.Fatalf("wait for tool update: %v", ctx.Err())
+		}
+	}
+
+	deltaTurnID := testPublicID(t, publicid.KindAgentTurn, uuid.New())
+	deltaModelCallContextID := testPublicID(t, publicid.KindModelCallContext, uuid.New())
+	delta(ctx, json.RawMessage(`{"turn_id":"`+deltaTurnID+
+		`","model_call_context_id":"`+deltaModelCallContextID+
+		`","seq":1,"source_seq_start":1,"source_seq_end":1,"coalesced_count":1,`+
+		`"event":{"kind":"text_delta","block_index":0,"delta":"ephemeral sentinel"}}`))
+	for _, wantLine := range []string{"event: model_output_delta", "data: "} {
+		select {
+		case result, ok := <-lines:
+			if !ok || result.err != nil {
+				t.Fatalf("sse stream closed before delta: %v", result.err)
+			}
+			if !strings.HasPrefix(result.line, wantLine) {
+				t.Fatalf("delta line=%q, want prefix %q", result.line, wantLine)
+			}
+		case <-ctx.Done():
+			t.Fatalf("wait for delta: %v", ctx.Err())
+		}
+	}
+
+	for heartbeatNumber := 1; heartbeatNumber <= 2; heartbeatNumber++ {
+		timer.Add(agentEventStreamHeartbeatInterval)
+		select {
+		case result, ok := <-lines:
+			if !ok || result.err != nil {
+				t.Fatalf("sse stream closed before heartbeat %d: %v", heartbeatNumber, result.err)
+			}
+			if result.line != ": heartbeat" {
+				t.Fatalf("idle stream frame=%q before wakeup, want heartbeat", result.line)
+			}
+		case <-ctx.Done():
+			t.Fatalf("wait for heartbeat %d: %v", heartbeatNumber, ctx.Err())
+		}
+	}
+	if got := queryCounter.count.Load(); got != projectionQueriesAfterInitialDrain {
+		t.Fatalf(
+			"event projection queries after tool update, delta, and heartbeats=%d, want %d",
+			got,
+			projectionQueriesAfterInitialDrain,
+		)
+	}
+	wakeup(ctx)
+	sawID := false
+	for {
+		select {
+		case result, ok := <-lines:
+			if !ok || result.err != nil {
+				t.Fatalf("sse stream closed before durable event %d: %v", wantSequence, result.err)
+			}
+			if result.line == "id: "+strconv.FormatInt(wantSequence, 10) {
+				sawID = true
+				continue
+			}
+			if sawID && strings.HasPrefix(result.line, "data: ") &&
+				strings.Contains(result.line, "found after durable wakeup") {
+				if got := queryCounter.count.Load(); got != projectionQueriesAfterInitialDrain+1 {
+					t.Fatalf(
+						"event projection queries after durable wakeup=%d, want %d",
+						got,
+						projectionQueriesAfterInitialDrain+1,
+					)
+				}
+				return
+			}
+		case <-ctx.Done():
+			t.Fatalf("wakeup did not deliver durable event %d: %v", wantSequence, ctx.Err())
+		}
+	}
+}
+
+func TestPublicEventStreamReconcilesDroppedRedisWakeup(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := openIntegrationDB(t, ctx)
+
+	redisClient := integrationredis.OpenClient(t)
+	bus, err := notifications.NewRedisBus(redisClient, nil)
+	if err != nil {
+		t.Fatalf("create redis bus: %v", err)
+	}
+	presence, err := notifications.NewRedisPresenceStore(redisClient)
+	if err != nil {
+		t.Fatalf("create presence store: %v", err)
+	}
+	droppedWakeups := &droppingAgentEventWakeupPublisher{attempts: make(chan uuid.UUID, 8)}
+	publisher, err := notifications.NewRoutedPublisher(
+		notifications.RoutedPublisherPorts{
+			DaemonWakeups:     bus,
+			AgentEventWakeups: droppedWakeups,
+			ToolCallUpdates:   bus,
+			WorkerControls:    bus,
+		},
+		presence,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("create routed publisher: %v", err)
+	}
+	t.Cleanup(publisher.Close)
+
+	timer := clock.NewMock()
+	keyWrapper := integrationKeyWrapper()
+	store := storage.NewStore(
+		pool,
+		storage.WithSecretKeyWrapper(keyWrapper),
+		storage.WithPostCommitPublisher(publisher),
+	)
+	server := mustNewServer(
+		t,
+		store,
+		WithSecretKeyWrapper(keyWrapper),
+		WithTimer(timer),
+		WithAgentEventWakeupSubscriber(bus),
+		WithAgentToolCallUpdateSubscriber(bus),
+		WithAgentStreamDeltaSubscriber(bus),
+		withAgentEventReconciliationInterval(time.Hour),
+	)
+	handler := newIntegrationHTTPHandler(server.Handler(), pool, store)
+	project := bootstrapPublicHTTPProject(t, handler, "sse-dropped-wakeup")
+	launch := launchPublicHTTPAgent(
+		t,
+		handler,
+		project,
+		"sse-dropped-wakeup",
+		project.AdminToken,
+		http.StatusCreated,
+	)
+	agentPublicID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, launch["agent"])["id"])
+	agentID, err := publicid.Decode(publicid.KindAgent, agentPublicID)
+	if err != nil {
+		t.Fatalf("decode agent id: %v", err)
+	}
+	waitForAgentEventWakeupAttempt(t, ctx, droppedWakeups.attempts, agentID)
+
+	httpServer := httptest.NewServer(handler)
+	defer httpServer.Close()
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		httpServer.URL+project.ProjectPath+"/agents/"+agentPublicID+"/events/stream",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("build sse request: %v", err)
+	}
+	for key, value := range authHeaders(project.AdminToken) {
+		req.Header.Set(key, value)
+	}
+	req.Header.Set("Last-Event-ID", "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("sse request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sse status=%d", resp.StatusCode)
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	if !scanner.Scan() || scanner.Text() != ": ok" {
+		t.Fatalf("sse stream missing preamble: %q", scanner.Text())
+	}
+	timer.Add(agentEventStreamHeartbeatInterval)
+	if !scanner.Scan() || scanner.Text() != "" ||
+		!scanner.Scan() || scanner.Text() != ": heartbeat" {
+		t.Fatalf("sse stream missing initial heartbeat: %q", scanner.Text())
+	}
+
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentPublicID+"/inputs",
+		`{"content_blocks":[{"type":"text","text":"recovered without redis"}]}`,
+		"idem-sse-dropped-wakeup",
+		http.StatusCreated,
+		authHeaders(project.AdminToken),
+	)
+	claim, found, err := store.Execution().ClaimNextAgentWork(ctx, httpTestClaimInput())
+	if err != nil {
+		t.Fatalf("claim agent work: %v", err)
+	}
+	if !found || len(claim.Model.AdmittedInputTurn.Events) != 1 {
+		t.Fatalf("claim did not admit dropped-wakeup input: found=%v claim=%+v", found, claim)
+	}
+	wantSequence := claim.Model.AdmittedInputTurn.Events[0].Sequence
+	waitForAgentEventWakeupAttempt(t, ctx, droppedWakeups.attempts, agentID)
+
+	timer.Add(agentEventStreamHeartbeatInterval)
+	if !scanner.Scan() || scanner.Text() != "" ||
+		!scanner.Scan() || scanner.Text() != ": heartbeat" {
+		t.Fatalf("same SSE connection did not remain idle and open: %q", scanner.Text())
+	}
+	if err := server.agentEventStreamReconciler.reconcile(ctx); err != nil {
+		t.Fatalf("reconcile event stream: %v", err)
+	}
+
+	sawID := false
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "id: "+strconv.FormatInt(wantSequence, 10) {
+			sawID = true
+			continue
+		}
+		if sawID && strings.HasPrefix(line, "data: ") &&
+			strings.Contains(line, "recovered without redis") {
+			return
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("read reconciled SSE event: %v", err)
+	}
+	t.Fatalf("reconciliation did not deliver durable event %d", wantSequence)
+}
+
+func TestPublicAuthenticatedInputFlow(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+
+	store := newIntegrationStore(pool)
+	handler := newIntegrationHTTPHandler(mustNewServer(t, store).Handler(), pool, store)
+	project := bootstrapPublicHTTPProject(t, handler, "input-flow")
+	author, err := storagetest.CreateVerifiedUser(
+		ctx, pool, storagetest.CreateVerifiedUserInput{Email: "input-author@example.com", DisplayName: "Author"},
+	)
+	if err != nil {
+		t.Fatalf("create author: %v", err)
+	}
+	other, err := storagetest.CreateVerifiedUser(
+		ctx, pool, storagetest.CreateVerifiedUserInput{Email: "input-other@example.com", DisplayName: "Other"},
+	)
+	if err != nil {
+		t.Fatalf("create other user: %v", err)
+	}
+	viewer, err := storagetest.CreateVerifiedUser(
+		ctx, pool, storagetest.CreateVerifiedUserInput{Email: "input-viewer@example.com", DisplayName: "Viewer"},
+	)
+	if err != nil {
+		t.Fatalf("create viewer: %v", err)
+	}
+	for _, membership := range []identitystore.AddProjectMembershipInput{
+		{OrgID: project.OrgUUID, ProjectID: project.ProjectUUID, UserID: author.ID, Role: "developer"},
+		{OrgID: project.OrgUUID, ProjectID: project.ProjectUUID, UserID: other.ID, Role: "developer"},
+		{OrgID: project.OrgUUID, ProjectID: project.ProjectUUID, UserID: viewer.ID, Role: "viewer"},
+	} {
+		if _, err := store.Identity().AddOrgMembership(ctx, identitystore.AddOrgMembershipInput{
+			OrgID:  membership.OrgID,
+			UserID: membership.UserID,
+			Role:   "member",
+		}); err != nil {
+			t.Fatalf("add org membership: %v", err)
+		}
+		if _, err := store.Identity().AddProjectMembership(ctx, membership); err != nil {
+			t.Fatalf("add project membership: %v", err)
+		}
+	}
+	authorPAT, err := store.Identity().CreatePersonalAccessTokenWithPlaintext(
+		ctx,
+		identitystore.CreatePersonalAccessTokenInput{
+			UserID: author.ID,
+			Name:   "Author",
+		},
+	)
+	if err != nil {
+		t.Fatalf("create author token: %v", err)
+	}
+	otherPAT, err := store.Identity().CreatePersonalAccessTokenWithPlaintext(
+		ctx,
+		identitystore.CreatePersonalAccessTokenInput{
+			UserID: other.ID,
+			Name:   "Other",
+		},
+	)
+	if err != nil {
+		t.Fatalf("create other token: %v", err)
+	}
+	viewerPAT, err := store.Identity().CreatePersonalAccessTokenWithPlaintext(
+		ctx,
+		identitystore.CreatePersonalAccessTokenInput{
+			UserID: viewer.ID,
+			Name:   "Viewer",
+		},
+	)
+	if err != nil {
+		t.Fatalf("create viewer token: %v", err)
+	}
+	launch := launchPublicHTTPAgent(
+		t,
+		handler,
+		project,
+		"input-flow-author",
+		authorPAT.Token,
+		http.StatusCreated,
+	)
+	agentID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, launch["agent"])["id"])
+
+	first := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/inputs",
+		`{"content_blocks":[{"type":"text","text":"first"}]}`,
+		"idem-input-first",
+		http.StatusCreated,
+		authHeaders(authorPAT.Token),
+	)
+	firstInput := testutil.RequireType[map[string]any](t, first["agent_input"])
+	if firstInput["state"] != "received" ||
+		firstInput["delivery_mode"] != string(executionstore.DeliveryModeQueued) ||
+		!publicEventTextEquals(firstInput, "first") {
+		t.Fatalf("unexpected created input response: %+v", firstInput)
+	}
+	if firstInput["actor_id"] != httpOmnaraActorPublicID(
+		t,
+		ctx,
+		store,
+		project.OrgUUID,
+		project.ProjectUUID,
+		author.ID,
+	) {
+		t.Fatalf(
+			"created input should echo the authenticated user's actor, got %+v",
+			firstInput,
+		)
+	}
+	firstInputID := testutil.RequireType[string](t, firstInput["id"])
+	second := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/inputs",
+		`{"content_blocks":[{"type":"text","text":"second"}]}`,
+		"idem-input-second",
+		http.StatusCreated,
+		authHeaders(authorPAT.Token),
+	)
+	secondInputID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, second["agent_input"])["id"])
+	third := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/inputs",
+		`{"content_blocks":[{"type":"text","text":"third"}],"delivery_mode":"`+string(executionstore.DeliveryModeSteering)+`"}`,
+		"idem-input-third",
+		http.StatusCreated,
+		authHeaders(authorPAT.Token),
+	)
+	thirdInputID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, third["agent_input"])["id"])
+	preAdmissionEvents := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentID+"/events",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(authorPAT.Token),
+	)
+	preAdmissionData := testutil.RequireType[[]any](t, preAdmissionEvents["data"])
+	if len(preAdmissionData) != 1 ||
+		testutil.RequireType[map[string]any](t, preAdmissionData[0])["input_kind"] != "config_change" {
+		t.Fatalf(
+			"received inputs must not appear in event history before admission except initial config change: %+v",
+			preAdmissionEvents,
+		)
+	}
+	if preAdmissionEvents["has_more"] != false || jsonInt64(t, preAdmissionEvents["next_after_sequence"]) != 1 {
+		t.Fatalf("single event page should expose terminal sequence metadata, got %+v", preAdmissionEvents)
+	}
+
+	backlog := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentID+"/inputs/backlog",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(authorPAT.Token),
+	)
+	backlogData := testutil.RequireType[[]any](t, backlog["data"])
+	if len(backlogData) != 3 ||
+		testutil.RequireType[map[string]any](t, backlogData[0])["id"] != thirdInputID ||
+		testutil.RequireType[map[string]any](t, backlogData[1])["id"] != firstInput["id"] ||
+		testutil.RequireType[map[string]any](t, backlogData[2])["id"] != secondInputID {
+		t.Fatalf(
+			"backlog should list steering before queued inputs, got %+v",
+			backlogData,
+		)
+	}
+	for index, wantKey := range []string{"idem-input-third", "idem-input-first", "idem-input-second"} {
+		if testutil.RequireType[map[string]any](t, backlogData[index])["input_idempotency_key"] != wantKey {
+			t.Fatalf("backlog input %d idempotency key = %+v, want %q", index, backlogData[index], wantKey)
+		}
+	}
+	viewerBacklog := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentID+"/inputs/backlog",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(viewerPAT.Token),
+	)
+	viewerBacklogData := testutil.RequireType[[]any](t, viewerBacklog["data"])
+	if len(viewerBacklogData) != 3 ||
+		!publicEventTextEquals(testutil.RequireType[map[string]any](t, viewerBacklogData[0]), "third") {
+		t.Fatalf(
+			"viewer should be able to read waiting backlog content, got %+v",
+			viewerBacklog,
+		)
+	}
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/inputs/"+firstInputID+"/move",
+		`{"position":"front"}`,
+		"",
+		http.StatusForbidden,
+		authHeaders(viewerPAT.Token),
+	)
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/inputs/"+firstInputID+"/promote_to_steering",
+		"",
+		"",
+		http.StatusForbidden,
+		authHeaders(viewerPAT.Token),
+	)
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/inputs/"+thirdInputID+"/demote_to_queued",
+		"",
+		"",
+		http.StatusForbidden,
+		authHeaders(viewerPAT.Token),
+	)
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/inputs/"+firstInputID+"/cancel",
+		"",
+		"",
+		http.StatusForbidden,
+		authHeaders(viewerPAT.Token),
+	)
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/inputs/"+secondInputID+"/move",
+		`{"position":"front"}`,
+		"",
+		http.StatusOK,
+		authHeaders(authorPAT.Token),
+	)
+	reordered := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentID+"/inputs/backlog",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(authorPAT.Token),
+	)
+	if testutil.RequireType[map[string]any](
+		t, testutil.RequireType[[]any](t, reordered["data"])[1],
+	)["id"] != secondInputID {
+		t.Fatalf("expected moved input at front, got %+v", reordered)
+	}
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/inputs/"+secondInputID+"/promote_to_steering",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(authorPAT.Token),
+	)
+	promoted := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentID+"/inputs/backlog",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(authorPAT.Token),
+	)
+	promotedData := testutil.RequireType[[]any](t, promoted["data"])
+	if len(promotedData) != 3 ||
+		testutil.RequireType[map[string]any](t, promotedData[0])["id"] != thirdInputID ||
+		testutil.RequireType[map[string]any](t, promotedData[1])["id"] != secondInputID ||
+		testutil.RequireType[map[string]any](t, promotedData[1])["delivery_mode"] != "steering" {
+		t.Fatalf("promoted input should remain in the steering backlog: %+v", promoted)
+	}
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/inputs/"+secondInputID+"/demote_to_queued",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(authorPAT.Token),
+	)
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/inputs/"+thirdInputID+"/demote_to_queued",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(authorPAT.Token),
+	)
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/inputs/"+firstInputID+"/cancel",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(authorPAT.Token),
+	)
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/inputs/"+firstInputID+"/cancel",
+		"",
+		"",
+		http.StatusConflict,
+		authHeaders(authorPAT.Token),
+	)
+	afterCancelBacklog := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentID+"/inputs/backlog",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(authorPAT.Token),
+	)
+	for _, item := range testutil.RequireType[[]any](t, afterCancelBacklog["data"]) {
+		if testutil.RequireType[map[string]any](t, item)["id"] == firstInputID {
+			t.Fatalf(
+				"canceled input must leave backlog: %+v",
+				afterCancelBacklog,
+			)
+		}
+	}
+
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/inputs",
+		`{"sender_type":"agent","content_blocks":[{"type":"text","text":"sender override"}]}`,
+		"idem-input-sender-override",
+		http.StatusBadRequest,
+		authHeaders(authorPAT.Token),
+	)
+	for index, metadata := range []string{
+		`{"flag":true}`,
+		`{"value":"` + strings.Repeat("v", 513) + `"}`,
+		`{"a":"","b":"","c":"","d":"","e":"","f":"","g":"","h":"","i":"","j":"","k":"","l":"","m":"","n":"","o":"","p":"","q":""}`,
+	} {
+		requestJSONWithHeaders(
+			t,
+			handler,
+			http.MethodPost,
+			project.ProjectPath+"/agents/"+agentID+"/inputs",
+			`{"content_blocks":[{"type":"text","text":"invalid metadata","metadata":`+metadata+`}]}`,
+			"idem-input-invalid-metadata-"+strconv.Itoa(index),
+			http.StatusBadRequest,
+			authHeaders(authorPAT.Token),
+		)
+	}
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/inputs",
+		`{"kind":"input","content_blocks":[{"type":"text","text":"kind override"}]}`,
+		"idem-input-kind-override",
+		http.StatusBadRequest,
+		authHeaders(authorPAT.Token),
+	)
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/inputs",
+		`{"content_blocks":[]}`,
+		"idem-input-empty-content",
+		http.StatusBadRequest,
+		authHeaders(authorPAT.Token),
+	)
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/inputs",
+		`{"content_blocks":[{"type":"text","text":"viewer write"}]}`,
+		"idem-input-viewer-write",
+		http.StatusForbidden,
+		authHeaders(viewerPAT.Token),
+	)
+
+	replayed := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/inputs",
+		`{"content_blocks":[{"type":"text","text":"first"}]}`,
+		"idem-input-first",
+		http.StatusOK,
+		authHeaders(authorPAT.Token),
+	)
+	if testutil.RequireType[map[string]any](t, replayed["agent_input"])["id"] != firstInputID {
+		t.Fatalf("expected idempotent replay, got %+v", replayed)
+	}
+	retried := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/inputs",
+		`{"content_blocks":[{"type":"text","text":"first"}]}`,
+		"idem-input-first",
+		http.StatusOK,
+		authHeaders(otherPAT.Token),
+	)
+	if !reflect.DeepEqual(replayed["agent_input"], retried["agent_input"]) {
+		t.Fatalf("different actor replay changed input: first=%+v replay=%+v", replayed, retried)
+	}
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentID+"/events?after_sequence=-1",
+		"",
+		"",
+		http.StatusBadRequest,
+		authHeaders(viewerPAT.Token),
+	)
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentID+"/events?limit=501",
+		"",
+		"",
+		http.StatusBadRequest,
+		authHeaders(viewerPAT.Token),
+	)
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentID+"/turns?cursor=bad",
+		"",
+		"",
+		http.StatusBadRequest,
+		authHeaders(viewerPAT.Token),
+	)
+}
+
+func TestPublicQueuedInputReorderControlsAdmittedEventOrder(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+
+	store := newIntegrationStore(pool)
+	server := mustNewServer(t, store)
+	handler := newIntegrationHTTPHandler(server.Handler(), pool, store)
+	project := bootstrapPublicHTTPProject(t, handler, "queued-order")
+	launch := launchPublicHTTPAgent(
+		t,
+		handler,
+		project,
+		"queued-order",
+		project.AdminToken,
+		http.StatusCreated,
+	)
+	agentPublicID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, launch["agent"])["id"])
+
+	first := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentPublicID+"/inputs",
+		`{"content_blocks":[{"type":"text","text":"first queued"}]}`,
+		"idem-queued-order-first",
+		http.StatusCreated,
+		authHeaders(project.AdminToken),
+	)
+	second := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentPublicID+"/inputs",
+		`{"content_blocks":[{"type":"text","text":"second queued"}]}`,
+		"idem-queued-order-second",
+		http.StatusCreated,
+		authHeaders(project.AdminToken),
+	)
+	firstID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, first["agent_input"])["id"])
+	secondID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, second["agent_input"])["id"])
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentPublicID+"/inputs/"+secondID+"/move",
+		`{"position":"front"}`,
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+
+	claim, found, err := store.Execution().ClaimNextAgentWork(
+		ctx,
+		httpTestClaimInput(),
+	)
+	if err != nil {
+		t.Fatalf("claim reordered input: %v", err)
+	}
+	admitted := claim.Model.AdmittedInputTurn
+	secondUUID, err := publicid.Decode(publicid.KindAgentInput, secondID)
+	if err != nil {
+		t.Fatalf("decode second input id: %v", err)
+	}
+	if !found || admitted.Inputs[0].ID != secondUUID {
+		t.Fatalf(
+			"admitted input id=%s found=%v, want reordered front input %s (first was %s)",
+			admitted.Inputs[0].ID,
+			found,
+			secondUUID,
+			firstID,
+		)
+	}
+
+	events := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentPublicID+"/events",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	eventData := testutil.RequireType[[]any](t, events["data"])
+	if len(eventData) != 2 ||
+		testutil.RequireType[map[string]any](t, eventData[0])["input_kind"] != "config_change" ||
+		!publicEventTextEquals(testutil.RequireType[map[string]any](t, eventData[1]), "second queued") {
+		t.Fatalf(
+			"static events should expose reordered input first, got %+v",
+			eventData,
+		)
+	}
+	adminActorPublicID := httpOmnaraActorPublicID(
+		t,
+		ctx,
+		store,
+		project.OrgUUID,
+		project.ProjectUUID,
+		project.AdminUserUUID,
+	)
+	if testutil.RequireType[map[string]any](t, eventData[1])["actor_id"] != adminActorPublicID {
+		t.Fatalf(
+			"admitted input event should be attributed to the authenticated user's actor, got %+v",
+			eventData[1],
+		)
+	}
+	if testutil.RequireType[map[string]any](t, eventData[1])["agent_input_id"] != secondID {
+		t.Fatalf(
+			"admitted input event should correlate back to input %s, got %+v",
+			secondID,
+			eventData[1],
+		)
+	}
+	if testutil.RequireType[map[string]any](t, eventData[1])["input_idempotency_key"] != "idem-queued-order-second" {
+		t.Fatalf(
+			"admitted input event should echo the sender's idempotency key, got %+v",
+			eventData[1],
+		)
+	}
+	if _, hasKey := testutil.RequireType[map[string]any](t, eventData[0])["input_idempotency_key"]; hasKey {
+		t.Fatalf(
+			"config change event must not echo an idempotency key, got %+v",
+			eventData[0],
+		)
+	}
+	turns := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentPublicID+"/turns",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	turnData := testutil.RequireType[[]any](t, turns["data"])
+	if len(turnData) != 2 ||
+		!publicEventTextEquals(
+			testutil.RequireType[map[string]any](
+				t,
+				testutil.RequireType[[]any](t, testutil.RequireType[map[string]any](t, turnData[0])["opening_events"])[0],
+			),
+			"second queued",
+		) ||
+		testutil.RequireType[map[string]any](
+			t, testutil.RequireType[[]any](t, testutil.RequireType[map[string]any](t, turnData[1])["opening_events"])[0],
+		)["input_kind"] != "config_change" {
+		t.Fatalf("turn opening event should be reordered input, got %+v", turnData)
+	}
+	if turns["next_before_turn_sequence"] != nil {
+		t.Fatalf("full turn page should not advertise older turns, got %+v", turns)
+	}
+	firstTurnPage := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentPublicID+"/turns?limit=1",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	firstTurnData := testutil.RequireType[[]any](t, firstTurnPage["data"])
+	if len(firstTurnData) != 1 ||
+		jsonInt64(
+			t,
+			firstTurnPage["next_before_turn_sequence"],
+		) != jsonInt64(
+			t,
+			testutil.RequireType[map[string]any](t, firstTurnData[0])["turn_sequence"],
+		) {
+		t.Fatalf("single turn page should expose older continuation, got %+v", firstTurnPage)
+	}
+	secondTurnPage := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentPublicID+"/turns?limit=1&before_turn_sequence="+int64String(
+			jsonInt64(t, firstTurnPage["next_before_turn_sequence"]),
+		),
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	if len(testutil.RequireType[[]any](t, secondTurnPage["data"])) != 1 ||
+		secondTurnPage["next_before_turn_sequence"] != nil {
+		t.Fatalf("second turn page should drain the sequence, got %+v", secondTurnPage)
+	}
+
+	httpServer := httptest.NewServer(handler)
+	defer httpServer.Close()
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		httpServer.URL+project.ProjectPath+"/agents/"+agentPublicID+"/events/stream",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("build sse request: %v", err)
+	}
+	for key, value := range authHeaders(project.AdminToken) {
+		req.Header.Set(key, value)
+	}
+	req.Header.Set("Last-Event-ID", "0")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("sse request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sse status=%d", resp.StatusCode)
+	}
+	scanner := bufio.NewScanner(resp.Body)
+	if !scanner.Scan() || scanner.Text() != ": ok" {
+		t.Fatalf("sse stream should flush initial comment before events")
+	}
+	sawID := false
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "id: 1") {
+			sawID = true
+			continue
+		}
+		if sawID && strings.HasPrefix(line, "data: ") &&
+			strings.Contains(line, "second queued") {
+			return
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("read sse: %v", err)
+	}
+	t.Fatalf("sse catch-up did not expose reordered input as first event")
+}
+
+func TestPublicTurnsEventsAndSSEUseCanonicalEvents(t *testing.T) {
+	t.Parallel()
+	eventSequence := func(raw any) int64 {
+		t.Helper()
+		event := testutil.RequireType[map[string]any](t, raw)
+		return jsonInt64(t, event["sequence"])
+	}
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+
+	store := newIntegrationStore(pool)
+	server := mustNewServer(t, store)
+	handler := newIntegrationHTTPHandler(server.Handler(), pool, store)
+	project := bootstrapPublicHTTPProject(t, handler, "events-content-blocks")
+	launch := launchPublicHTTPAgent(
+		t,
+		handler,
+		project,
+		"events-content-blocks",
+		project.AdminToken,
+		http.StatusCreated,
+	)
+	agentPublicID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, launch["agent"])["id"])
+	agentID, err := publicid.Decode(publicid.KindAgent, agentPublicID)
+	if err != nil {
+		t.Fatalf("decode agent id: %v", err)
+	}
+
+	created := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentPublicID+"/inputs",
+		`{"content_blocks":[{"type":"text","text":"visible user input","metadata":{"omnara_hidden":"true","source":"test"}}]}`,
+		"idem-visible-input",
+		http.StatusCreated,
+		authHeaders(project.AdminToken),
+	)
+	inputPublicID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, created["agent_input"])["id"])
+	inputID, err := publicid.Decode(publicid.KindAgentInput, inputPublicID)
+	if err != nil {
+		t.Fatalf("decode agent input id: %v", err)
+	}
+
+	claim, found, err := store.Execution().ClaimNextAgentWork(
+		ctx,
+		httpTestClaimInput(),
+	)
+	if err != nil {
+		t.Fatalf("claim public input: %v", err)
+	}
+	admitted := claim.Model.AdmittedInputTurn
+	runtime := claim.RuntimeLock
+	if !found || admitted.Inputs[0].ID != inputID {
+		t.Fatalf("admitted input found=%v id=%s want %s", found, admitted.Inputs[0].ID, inputID)
+	}
+	snapshot, err := store.Execution().CaptureAgentConfigForEventWatermark(
+		ctx,
+		project.ProjectUUID,
+		agentID,
+		admitted.Events[0].Sequence,
+	)
+	if err != nil {
+		t.Fatalf("capture config snapshot: %v", err)
+	}
+	modelCall := claimNormalModelCallForHTTPTest(
+		t,
+		ctx,
+		store,
+		project.ProjectUUID,
+		agentID,
+		runtime,
+		[]uuid.UUID{admitted.Inputs[0].ID},
+		snapshot.AgentConfig.ID,
+		admitted.Events[0].Sequence,
+	)
+	contextRow := modelCall.Context
+	toolCall := model.ToolCall{
+		ID:    "call_events_projection",
+		Name:  "read_process",
+		Input: json.RawMessage(`{}`),
+	}
+	providerIdentity := loadModelCallProviderIdentityForHTTPTest(
+		t, ctx, store, project.ProjectUUID, modelCall.Context,
+	)
+	providerResponse, err := model.NewResponseEnvelopeForStorage(
+		providerIdentity.Slug,
+		providerIdentity.APIFormat,
+		providerIdentity.APIVariant,
+		model.Response{
+			ID: "resp_events_projection",
+			Content: append(
+				[]model.ResponsePart{{Type: "text", Text: "visible assistant output"}},
+				modeltest.ResponsePartsForToolCalls([]model.ToolCall{toolCall})...,
+			),
+			StopReason: model.StopReasonToolUse,
+		},
+	)
+	if err != nil {
+		t.Fatalf("build provider response: %v", err)
+	}
+	responseToolCalls := model.ToolCallsFromEnvelope(providerResponse)
+	if len(responseToolCalls) != 1 {
+		t.Fatalf("provider tool calls = %d, want 1", len(responseToolCalls))
+	}
+	responseToolCall := responseToolCalls[0]
+	_, toolCalls, err := store.Execution().RecordToolCallSourceAndCompleteContext(
+		ctx,
+		executionstore.RecordToolCallSourceAndCompleteContextInput{
+			ProjectID:          project.ProjectUUID,
+			AgentID:            agentID,
+			RuntimeLockID:      runtime.ID,
+			ModelCallContextID: contextRow.ID,
+			ProviderResponse:   providerResponse,
+			ToolCallBindings: []executionstore.ToolCallBindingInput{
+				{
+					ProviderCallID: responseToolCall.ID,
+					Type:           toolcatalog.ToolTypeBuiltIn,
+				},
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("record model tool source: %v", err)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("tool calls = %d, want 1", len(toolCalls))
+	}
+	if _, err := store.Execution().MarkToolCallReady(ctx, executionstore.MarkToolCallReadyInput{
+		ProjectID:     project.ProjectUUID,
+		AgentID:       agentID,
+		ID:            toolCalls[0].ID,
+		RuntimeLockID: runtime.ID,
+	}); err != nil {
+		t.Fatalf("authorize tool call: %v", err)
+	}
+	completedToolCall, err := store.Execution().CompleteToolCall(ctx, executionstore.CompleteToolCallInput{
+		ProjectID:          project.ProjectUUID,
+		AgentID:            agentID,
+		ID:                 toolCalls[0].ID,
+		RuntimeLockID:      runtime.ID,
+		Outcome:            executionstore.ToolResultOutcomeSucceeded,
+		ResultContentParts: json.RawMessage(`[{"type":"text","text":"visible tool result","metadata":{"tool_result":"true"}}]`),
+	})
+	if err != nil {
+		t.Fatalf("complete tool call: %v", err)
+	}
+
+	events := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentPublicID+"/events",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	eventData := testutil.RequireType[[]any](t, events["data"])
+	if len(eventData) != 4 ||
+		testutil.RequireType[map[string]any](t, eventData[0])["input_kind"] != "config_change" {
+		t.Fatalf(
+			"expected user input, model output, and tool result events, got %+v",
+			eventData,
+		)
+	}
+	if events["has_more"] != false ||
+		jsonInt64(t, events["next_after_sequence"]) != eventSequence(eventData[3]) {
+		t.Fatalf("full event page should expose terminal sequence metadata, got %+v", events)
+	}
+	firstEventPage := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentPublicID+"/events?limit=2",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	firstEventData := testutil.RequireType[[]any](t, firstEventPage["data"])
+	if len(firstEventData) != 2 || firstEventPage["has_more"] != true ||
+		jsonInt64(t, firstEventPage["next_after_sequence"]) != eventSequence(firstEventData[1]) {
+		t.Fatalf("first event page should expose forward continuation, got %+v", firstEventPage)
+	}
+	secondEventPage := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentPublicID+"/events?limit=2&after_sequence="+int64String(
+			jsonInt64(t, firstEventPage["next_after_sequence"]),
+		),
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	secondEventData := testutil.RequireType[[]any](t, secondEventPage["data"])
+	if len(secondEventData) != 2 || secondEventPage["has_more"] != false ||
+		jsonInt64(t, secondEventPage["next_after_sequence"]) != eventSequence(secondEventData[1]) {
+		t.Fatalf("second event page should drain forward continuation, got %+v", secondEventPage)
+	}
+	latestEventPage := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentPublicID+"/events?limit=2&before_sequence=0",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	latestEventData := testutil.RequireType[[]any](t, latestEventPage["data"])
+	if len(latestEventData) != 2 || latestEventPage["has_more"] != true ||
+		eventSequence(latestEventData[0]) != eventSequence(eventData[2]) ||
+		eventSequence(latestEventData[1]) != eventSequence(eventData[3]) ||
+		jsonInt64(t, latestEventPage["next_before_sequence"]) != eventSequence(eventData[2]) {
+		t.Fatalf("latest event page should expose backward continuation, got %+v", latestEventPage)
+	}
+	olderEventPage := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentPublicID+"/events?limit=2&before_sequence="+int64String(
+			jsonInt64(t, latestEventPage["next_before_sequence"]),
+		),
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	olderEventData := testutil.RequireType[[]any](t, olderEventPage["data"])
+	if len(olderEventData) != 2 || olderEventPage["has_more"] != false ||
+		olderEventPage["next_before_sequence"] != nil ||
+		eventSequence(olderEventData[0]) != eventSequence(eventData[0]) ||
+		eventSequence(olderEventData[1]) != eventSequence(eventData[1]) {
+		t.Fatalf("older event page should drain backward continuation, got %+v", olderEventPage)
+	}
+	if !publicEventTextEquals(testutil.RequireType[map[string]any](t, eventData[1]), "visible user input") ||
+		!publicEventContainsText(testutil.RequireType[map[string]any](t, eventData[2]), "visible assistant output") ||
+		!publicEventTextEquals(testutil.RequireType[map[string]any](t, eventData[3]), "visible tool result") {
+		t.Fatalf("events should expose canonical content blocks: %+v", eventData)
+	}
+	inputMetadata := testutil.RequireType[map[string]any](
+		t,
+		testutil.RequireType[map[string]any](
+			t,
+			testutil.RequireType[[]any](t, testutil.RequireType[map[string]any](t, eventData[1])["content_blocks"])[0],
+		)["metadata"],
+	)
+	if inputMetadata["omnara_hidden"] != "true" || inputMetadata["source"] != "test" {
+		t.Fatalf("input content block metadata = %+v", inputMetadata)
+	}
+	toolResultMetadata := testutil.RequireType[map[string]any](
+		t,
+		testutil.RequireType[map[string]any](
+			t,
+			testutil.RequireType[[]any](t, testutil.RequireType[map[string]any](t, eventData[3])["content_blocks"])[0],
+		)["metadata"],
+	)
+	if toolResultMetadata["tool_result"] != "true" {
+		t.Fatalf("tool result content block metadata = %+v", toolResultMetadata)
+	}
+	contextEvents, err := store.Execution().ListContextEvents(
+		ctx,
+		project.ProjectUUID,
+		agentID,
+		0,
+		eventSequence(eventData[3]),
+		100,
+	)
+	if err != nil {
+		t.Fatalf("list model context events: %v", err)
+	}
+	sawInput := false
+	for _, contextEvent := range contextEvents {
+		contentParts := string(contextEvent.ContentParts)
+		if strings.Contains(contentParts, `"metadata"`) {
+			t.Fatalf("model context exposed content block metadata: %s", contentParts)
+		}
+		sawInput = sawInput || strings.Contains(contentParts, "visible user input")
+	}
+	if !sawInput {
+		t.Fatal("model context omitted input content")
+	}
+	toolCallPublicID, err := publicID(
+		publicid.KindToolCall,
+		completedToolCall.ID,
+	)
+	if err != nil {
+		t.Fatalf("encode tool call id: %v", err)
+	}
+	if !publicEventContainsToolCall(
+		testutil.RequireType[map[string]any](t, eventData[2]),
+		toolCallPublicID,
+	) {
+		t.Fatalf(
+			"model output should expose public tool_call block id: %+v",
+			eventData[2],
+		)
+	}
+	if testutil.RequireType[map[string]any](t, eventData[2])["stop_reason"] != "tool_use" {
+		t.Fatalf("model output should expose its stop reason, got %+v", eventData[2])
+	}
+	toolResultEvent := testutil.RequireType[map[string]any](t, eventData[3])
+	if toolResultEvent["event_kind"] != "tool_result" ||
+		toolResultEvent["tool_call_id"] != toolCallPublicID ||
+		toolResultEvent["outcome"] != "succeeded" {
+		t.Fatalf(
+			"tool result event should be publicly attributed to the tool call, got %+v",
+			toolResultEvent,
+		)
+	}
+	if _, hasActor := toolResultEvent["actor_id"]; hasActor {
+		t.Fatalf("tool result event must not carry an actor_id, got %+v", toolResultEvent)
+	}
+	turns := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentPublicID+"/turns",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	turnData := testutil.RequireType[[]any](t, turns["data"])
+	if len(turnData) != 2 {
+		t.Fatalf("expected config and content turns, got %+v", turnData)
+	}
+	if turns["next_before_turn_sequence"] != nil {
+		t.Fatalf("full turn page should not advertise older turns, got %+v", turns)
+	}
+	turnID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, turnData[0])["id"])
+	if len(testutil.RequireType[[]any](t, testutil.RequireType[map[string]any](t, turnData[0])["opening_events"])) != 1 {
+		t.Fatalf("turn should include opening events: %+v", turnData[0])
+	}
+	missingTurnID := testPublicID(t, publicid.KindAgentTurn, httpTestID("missing-turn-events"))
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentPublicID+"/turns/"+missingTurnID+"/events",
+		"",
+		"",
+		http.StatusNotFound,
+		authHeaders(project.AdminToken),
+	)
+	otherLaunch := launchPublicHTTPAgent(
+		t,
+		handler,
+		project,
+		"events-content-blocks-other",
+		project.AdminToken,
+		http.StatusCreated,
+	)
+	otherAgentPublicID := testutil.RequireType[string](
+		t, testutil.RequireType[map[string]any](t, otherLaunch["agent"])["id"],
+	)
+	otherTurns := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+otherAgentPublicID+"/turns",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	otherTurnData := testutil.RequireType[[]any](t, otherTurns["data"])
+	if len(otherTurnData) == 0 {
+		t.Fatalf("other agent should have a config-change turn, got %+v", otherTurns)
+	}
+	foreignTurnID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, otherTurnData[0])["id"])
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentPublicID+"/turns/"+foreignTurnID+"/events",
+		"",
+		"",
+		http.StatusNotFound,
+		authHeaders(project.AdminToken),
+	)
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentPublicID+"/turns/"+turnID+"/events?cursor=bad",
+		"",
+		"",
+		http.StatusBadRequest,
+		authHeaders(project.AdminToken),
+	)
+	turnEventsPath := project.ProjectPath + "/agents/" + agentPublicID + "/turns/" + turnID + "/events"
+	gotTurnEventSequences := pageThroughTurnEventSequences(t, handler, turnEventsPath, project.AdminToken, 1)
+	wantTurnEventSequences := []int64{
+		eventSequence(eventData[3]),
+		eventSequence(eventData[2]),
+		eventSequence(eventData[1]),
+	}
+	assertInt64SliceEqual(t, gotTurnEventSequences, wantTurnEventSequences)
+
+	httpServer := httptest.NewServer(handler)
+	defer httpServer.Close()
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		httpServer.URL+project.ProjectPath+"/agents/"+agentPublicID+"/events/stream",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("build sse request: %v", err)
+	}
+	for key, value := range authHeaders(project.AdminToken) {
+		req.Header.Set(key, value)
+	}
+	req.Header.Set("Last-Event-ID", "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("sse request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sse status=%d", resp.StatusCode)
+	}
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "id: 2") {
+			return
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("read sse: %v", err)
+	}
+	t.Fatalf("sse catch-up did not include event sequence 2")
+}
+
+func TestPublicMaxTokensModelOutputReplaysAcrossEventAPIs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+
+	store := newIntegrationStore(pool)
+	handler := newIntegrationHTTPHandler(mustNewServer(t, store).Handler(), pool, store)
+	project := bootstrapPublicHTTPProject(t, handler, "max-tokens-event-replay")
+	launch := launchPublicHTTPAgent(
+		t,
+		handler,
+		project,
+		"max-tokens-event-replay",
+		project.AdminToken,
+		http.StatusCreated,
+	)
+	agentPublicID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, launch["agent"])["id"])
+	agentID, err := publicid.Decode(publicid.KindAgent, agentPublicID)
+	if err != nil {
+		t.Fatalf("decode agent id: %v", err)
+	}
+
+	created := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentPublicID+"/inputs",
+		`{"content_blocks":[{"type":"text","text":"write until the output limit"}]}`,
+		"idem-max-tokens-input",
+		http.StatusCreated,
+		authHeaders(project.AdminToken),
+	)
+	inputPublicID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, created["agent_input"])["id"])
+	inputID, err := publicid.Decode(publicid.KindAgentInput, inputPublicID)
+	if err != nil {
+		t.Fatalf("decode input id: %v", err)
+	}
+
+	work, found, err := store.Execution().ClaimNextAgentWork(ctx, httpTestClaimInput())
+	if err != nil {
+		t.Fatalf("claim input: %v", err)
+	}
+	if !found || len(work.Model.AdmittedInputTurn.Inputs) != 1 ||
+		work.Model.AdmittedInputTurn.Inputs[0].ID != inputID {
+		t.Fatalf("claim did not admit max_tokens test input: found=%v claim=%+v", found, work)
+	}
+	admitted := work.Model.AdmittedInputTurn
+	snapshot, err := store.Execution().CaptureAgentConfigForEventWatermark(
+		ctx,
+		project.ProjectUUID,
+		agentID,
+		admitted.Events[0].Sequence,
+	)
+	if err != nil {
+		t.Fatalf("capture config snapshot: %v", err)
+	}
+	modelCall := claimNormalModelCallForHTTPTest(
+		t,
+		ctx,
+		store,
+		project.ProjectUUID,
+		agentID,
+		work.RuntimeLock,
+		[]uuid.UUID{inputID},
+		snapshot.AgentConfig.ID,
+		admitted.Events[0].Sequence,
+	)
+	providerIdentity := loadModelCallProviderIdentityForHTTPTest(
+		t, ctx, store, project.ProjectUUID, modelCall.Context,
+	)
+	providerResponse, err := model.NewResponseEnvelopeForStorage(
+		providerIdentity.Slug,
+		providerIdentity.APIFormat,
+		providerIdentity.APIVariant,
+		model.Response{
+			ID:         "resp_max_tokens_event_replay",
+			Content:    []model.ResponsePart{{Type: "text", Text: "partial but durable output"}},
+			StopReason: model.StopReasonMaxTokens,
+		},
+	)
+	if err != nil {
+		t.Fatalf("build max_tokens provider response: %v", err)
+	}
+	outputEvent, err := store.Execution().RecordModelOutputAndCompleteContext(
+		ctx,
+		executionstore.RecordModelOutputAndCompleteContextInput{
+			ProjectID:          project.ProjectUUID,
+			AgentID:            agentID,
+			RuntimeLockID:      work.RuntimeLock.ID,
+			ModelCallContextID: modelCall.Context.ID,
+			ProviderResponse:   providerResponse,
+		},
+	)
+	if err != nil {
+		t.Fatalf("record max_tokens model output: %v", err)
+	}
+
+	events := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentPublicID+"/events",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	assertPublicMaxTokensEvent(t, testutil.RequireType[[]any](t, events["data"]))
+
+	turns := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentPublicID+"/turns",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	turnData := testutil.RequireType[[]any](t, turns["data"])
+	if len(turnData) < 1 {
+		t.Fatalf("max_tokens output turn missing: %+v", turns)
+	}
+	turnID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, turnData[0])["id"])
+	turnEvents := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+agentPublicID+"/turns/"+turnID+"/events",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	assertPublicMaxTokensEvent(t, testutil.RequireType[[]any](t, turnEvents["data"]))
+
+	streamCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	httpServer := httptest.NewServer(handler)
+	defer httpServer.Close()
+	req, err := http.NewRequestWithContext(
+		streamCtx,
+		http.MethodGet,
+		httpServer.URL+project.ProjectPath+"/agents/"+agentPublicID+"/events/stream",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("build sse request: %v", err)
+	}
+	for key, value := range authHeaders(project.AdminToken) {
+		req.Header.Set(key, value)
+	}
+	req.Header.Set("Last-Event-ID", strconv.FormatInt(outputEvent.Sequence-1, 10))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("sse request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sse status=%d", resp.StatusCode)
+	}
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "data: ") &&
+			strings.Contains(line, `"stop_reason":"max_tokens"`) &&
+			strings.Contains(line, "partial but durable output") {
+			return
+		}
+	}
+	if err := scanner.Err(); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("read sse: %v", err)
+	}
+	t.Fatal("sse catch-up did not replay max_tokens model output")
+}
+
+func TestPublicEventStreamDeliversLiveWakeupAndToolCallUpdateViaRedis(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := openIntegrationDB(t, ctx)
+
+	redisClient := integrationredis.OpenClient(t)
+	bus, err := notifications.NewRedisBus(redisClient, nil)
+	if err != nil {
+		t.Fatalf("create redis bus: %v", err)
+	}
+	presence, err := notifications.NewRedisPresenceStore(redisClient)
+	if err != nil {
+		t.Fatalf("create presence store: %v", err)
+	}
+	publisher, err := notifications.NewRoutedPublisher(
+		notifications.RoutedPublisherPorts{
+			DaemonWakeups:     bus,
+			AgentEventWakeups: bus,
+			ToolCallUpdates:   bus,
+			WorkerControls:    bus,
+		},
+		presence,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("create routed publisher: %v", err)
+	}
+	t.Cleanup(publisher.Close)
+
+	keyWrapper := integrationKeyWrapper()
+	store := storage.NewStore(pool, storage.WithSecretKeyWrapper(keyWrapper), storage.WithPostCommitPublisher(publisher))
+	server := mustNewServer(
+		t,
+		store,
+		WithSecretKeyWrapper(keyWrapper),
+		WithAgentEventWakeupSubscriber(bus),
+		WithAgentToolCallUpdateSubscriber(bus),
+		WithAgentStreamDeltaSubscriber(bus),
+	)
+	handler := newIntegrationHTTPHandler(server.Handler(), pool, store)
+	project := bootstrapPublicHTTPProject(t, handler, "sse-live-wakeup")
+	launch := launchPublicHTTPAgent(t, handler, project, "sse-live-wakeup", project.AdminToken, http.StatusCreated)
+	agentPublicID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, launch["agent"])["id"])
+
+	initial := requestJSONWithHeaders(
+		t, handler, http.MethodGet, project.ProjectPath+"/agents/"+agentPublicID+"/events", "", "", http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	initialData := testutil.RequireType[[]any](t, initial["data"])
+	if len(initialData) != 1 {
+		t.Fatalf("expected one initial config change event, got %d", len(initialData))
+	}
+	startingSeq := int64(1)
+
+	httpServer := httptest.NewServer(handler)
+	defer httpServer.Close()
+	req, err := http.NewRequestWithContext(
+		ctx, http.MethodGet, httpServer.URL+project.ProjectPath+"/agents/"+agentPublicID+"/events/stream", nil,
+	)
+	if err != nil {
+		t.Fatalf("build sse request: %v", err)
+	}
+	for key, value := range authHeaders(project.AdminToken) {
+		req.Header.Set(key, value)
+	}
+	req.Header.Set("Last-Event-ID", "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("sse request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sse status=%d", resp.StatusCode)
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	if !scanner.Scan() || !strings.HasPrefix(scanner.Text(), ":") {
+		t.Fatalf("sse stream missing preamble: %q", scanner.Text())
+	}
+
+	postStart := time.Now()
+	createInputResp := requestJSONWithHeaders(
+		t, handler, http.MethodPost, project.ProjectPath+"/agents/"+agentPublicID+"/inputs",
+		`{"content_blocks":[{"type":"text","text":"live wakeup payload"}]}`, "idem-sse-live", http.StatusCreated,
+		authHeaders(project.AdminToken),
+	)
+	_ = createInputResp
+
+	claim, found, err := store.Execution().ClaimNextAgentWork(ctx, httpTestClaimInput())
+	if err != nil {
+		t.Fatalf("claim agent work: %v", err)
+	}
+	if !found {
+		t.Fatalf("no work claimed for live wakeup")
+	}
+	admitted := claim.Model.AdmittedInputTurn
+	if len(admitted.Events) != 1 || admitted.Events[0].Sequence <= startingSeq {
+		t.Fatalf("admission did not append an agent event past startingSeq=%d: %+v", startingSeq, admitted.Events)
+	}
+
+	deadline := time.After(5 * time.Second)
+	frames := make(chan string, 8)
+	go func() {
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				continue
+			}
+			frames <- line
+		}
+	}()
+	sawDataFrame := false
+	for !sawDataFrame {
+		select {
+		case line := <-frames:
+			if strings.HasPrefix(line, "data: ") && strings.Contains(line, "live wakeup payload") {
+				sawDataFrame = true
+			}
+		case <-deadline:
+			t.Fatalf("sse did not receive live wakeup frame within 5s; live publish/subscribe path is not working")
+		}
+	}
+	elapsed := time.Since(postStart)
+	if elapsed > 3*time.Second {
+		t.Logf("warning: live wakeup arrived in %s (publish path may be slow)", elapsed)
+	}
+
+	toolCallID := uuid.New()
+	publicToolCallID, err := publicid.Encode(publicid.KindToolCall, toolCallID)
+	if err != nil {
+		t.Fatalf("encode tool call id: %v", err)
+	}
+	agentID, err := publicid.Decode(publicid.KindAgent, agentPublicID)
+	if err != nil {
+		t.Fatalf("decode agent id: %v", err)
+	}
+	if err := bus.PublishAgentToolCallUpdate(ctx, notifications.ToolCallUpdatedCommitted{
+		AgentID:    agentID,
+		ToolCallID: toolCallID,
+		State:      string(executionstore.ToolCallStateReady),
+		InteractionUpdate: &notifications.AgentInteractionUpdate{
+			ID: httpTestInteractionID, InteractionKind: "permission", State: "resolved",
+		},
+	}); err != nil {
+		t.Fatalf("publish tool call update: %v", err)
+	}
+
+	deadline = time.After(5 * time.Second)
+	sawToolCallEvent := false
+	for {
+		select {
+		case line := <-frames:
+			if line == "event: tool_call_update" {
+				sawToolCallEvent = true
+				continue
+			}
+			if !sawToolCallEvent || !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var update struct {
+				ToolCallID        string `json:"tool_call_id"`
+				State             string `json:"state"`
+				InteractionUpdate *struct {
+					ID              string `json:"id"`
+					InteractionKind string `json:"interaction_kind"`
+					State           string `json:"state"`
+				} `json:"interaction_update"`
+			}
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &update); err != nil {
+				t.Fatalf("decode tool call update: %v", err)
+			}
+			if update.ToolCallID != publicToolCallID || update.State != string(executionstore.ToolCallStateReady) {
+				t.Fatalf("tool call update = %+v, want id=%s state=ready", update, publicToolCallID)
+			}
+			if interaction := update.InteractionUpdate; interaction == nil ||
+				interaction.ID != testPublicID(t, publicid.KindAgentInteraction, httpTestInteractionID) ||
+				interaction.InteractionKind != "permission" || interaction.State != "resolved" {
+				t.Fatalf("unexpected interaction update: %+v", interaction)
+			}
+			return
+		case <-deadline:
+			t.Fatal("sse did not receive default tool call update within 5s")
+		}
+	}
+}
+
+func TestPublicEventStreamDeliversStreamDeltasViaRedis(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool := openIntegrationDB(t, ctx)
+
+	redisClient := integrationredis.OpenClient(t)
+	bus, err := notifications.NewRedisBus(redisClient, nil)
+	if err != nil {
+		t.Fatalf("create redis bus: %v", err)
+	}
+	presence, err := notifications.NewRedisPresenceStore(redisClient)
+	if err != nil {
+		t.Fatalf("create presence store: %v", err)
+	}
+	publisher, err := notifications.NewRoutedPublisher(
+		notifications.RoutedPublisherPorts{
+			DaemonWakeups:     bus,
+			AgentEventWakeups: bus,
+			ToolCallUpdates:   bus,
+			WorkerControls:    bus,
+		},
+		presence,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("create routed publisher: %v", err)
+	}
+	t.Cleanup(publisher.Close)
+
+	keyWrapper := integrationKeyWrapper()
+	store := storage.NewStore(pool, storage.WithSecretKeyWrapper(keyWrapper), storage.WithPostCommitPublisher(publisher))
+	server := mustNewServer(
+		t,
+		store,
+		WithSecretKeyWrapper(keyWrapper),
+		WithAgentEventWakeupSubscriber(bus),
+		WithAgentToolCallUpdateSubscriber(bus),
+		WithAgentStreamDeltaSubscriber(bus),
+	)
+	handler := newIntegrationHTTPHandler(server.Handler(), pool, store)
+	project := bootstrapPublicHTTPProject(t, handler, "sse-stream-delta")
+	launch := launchPublicHTTPAgent(t, handler, project, "sse-stream-delta", project.AdminToken, http.StatusCreated)
+	agentPublicID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, launch["agent"])["id"])
+	agentID, err := publicid.Decode(publicid.KindAgent, agentPublicID)
+	if err != nil {
+		t.Fatalf("decode agent public id: %v", err)
+	}
+
+	httpServer := httptest.NewServer(handler)
+	defer httpServer.Close()
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		httpServer.URL+project.ProjectPath+"/agents/"+agentPublicID+"/events/stream?stream_deltas=true",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("build sse request: %v", err)
+	}
+	for key, value := range authHeaders(project.AdminToken) {
+		req.Header.Set(key, value)
+	}
+	req.Header.Set("Last-Event-ID", "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("sse request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sse status=%d", resp.StatusCode)
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	if !scanner.Scan() || !strings.HasPrefix(scanner.Text(), ":") {
+		t.Fatalf("sse stream missing preamble: %q", scanner.Text())
+	}
+
+	deltaTurnID := testPublicID(t, publicid.KindAgentTurn, uuid.New())
+	deltaModelCallContextID := testPublicID(t, publicid.KindModelCallContext, uuid.New())
+	payload := json.RawMessage(`{"turn_id":"` + deltaTurnID +
+		`","model_call_context_id":"` + deltaModelCallContextID +
+		`","seq":1,"source_seq_start":1,"source_seq_end":1,"coalesced_count":1,` +
+		`"event":{"kind":"text_delta","block_index":0,"delta":"stream hello"}}`)
+	if err := bus.PublishAgentStreamDelta(ctx, agentID, payload); err != nil {
+		t.Fatalf("publish stream delta: %v", err)
+	}
+
+	deadline := time.After(5 * time.Second)
+	frames := make(chan string, 8)
+	go func() {
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				continue
+			}
+			frames <- line
+		}
+	}()
+	sawEvent := false
+	sawData := false
+	for !(sawEvent && sawData) {
+		select {
+		case line := <-frames:
+			if line == "event: model_output_delta" {
+				sawEvent = true
+			}
+			if strings.HasPrefix(line, "data: ") && strings.Contains(line, "stream hello") {
+				sawData = true
+			}
+		case <-deadline:
+			t.Fatalf(
+				"sse did not receive stream delta frame within 5s; saw event=%v data=%v",
+				sawEvent,
+				sawData,
+			)
+		}
+	}
+}
+
+func publicEventTextEquals(record map[string]any, want string) bool {
+	blocks, ok := record["content_blocks"].([]any)
+	if !ok || len(blocks) != 1 {
+		return false
+	}
+	block, ok := blocks[0].(map[string]any)
+	return ok && block["type"] == "text" && block["text"] == want
+}
+
+func jsonInt64(t *testing.T, value any) int64 {
+	t.Helper()
+	number, ok := value.(float64)
+	if !ok {
+		t.Fatalf("value %v (%T) is not a JSON number", value, value)
+	}
+	return int64(number)
+}
+
+func pageThroughTurnEventSequences(t *testing.T, handler http.Handler, path, token string, limit int) []int64 {
+	t.Helper()
+	got := make([]int64, 0)
+	seen := map[int64]bool{}
+	before := ""
+	for pages := 0; ; pages++ {
+		pagePath := path + "?limit=" + strconv.Itoa(limit)
+		if before != "" {
+			pagePath += "&before_sequence=" + before
+		}
+		page := requestJSONWithHeaders(t, handler, http.MethodGet, pagePath, "", "", http.StatusOK, authHeaders(token))
+		rows := testutil.RequireType[[]any](t, page["data"])
+		if len(rows) > limit {
+			t.Fatalf("turn event page returned %d rows, want <= %d: %+v", len(rows), limit, page)
+		}
+		for _, raw := range rows {
+			sequence := jsonInt64(t, testutil.RequireType[map[string]any](t, raw)["sequence"])
+			if seen[sequence] {
+				t.Fatalf("turn event pagination returned duplicate sequence %d; got=%v", sequence, got)
+			}
+			seen[sequence] = true
+			got = append(got, sequence)
+		}
+		if pages > 10 {
+			t.Fatalf("turn event pagination did not terminate; got=%v", got)
+		}
+		next, ok := page["next_before_sequence"]
+		if !ok {
+			t.Fatalf("turn event response missing next_before_sequence: %+v", page)
+		}
+		if next == nil {
+			break
+		}
+		before = int64String(jsonInt64(t, next))
+	}
+	return got
+}
+
+func assertInt64SliceEqual(t *testing.T, got, want []int64) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got sequences %v, want %v", got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("got sequences %v, want %v", got, want)
+		}
+	}
+}
+
+func int64String(value int64) string {
+	return strconv.FormatInt(value, 10)
+}
+
+func publicEventContainsText(record map[string]any, want string) bool {
+	blocks, ok := record["content_blocks"].([]any)
+	if !ok {
+		return false
+	}
+	for _, raw := range blocks {
+		block, ok := raw.(map[string]any)
+		if ok && block["type"] == "text" && block["text"] == want {
+			return true
+		}
+	}
+	return false
+}
+
+func publicEventContainsToolCall(record map[string]any, wantID string) bool {
+	blocks, ok := record["content_blocks"].([]any)
+	if !ok {
+		return false
+	}
+	for _, raw := range blocks {
+		block, ok := raw.(map[string]any)
+		if ok && block["type"] == "tool_call" &&
+			block["tool_call_id"] == wantID {
+			return true
+		}
+	}
+	return false
+}
+
+func assertPublicMaxTokensEvent(t *testing.T, records []any) {
+	t.Helper()
+	for _, raw := range records {
+		record := testutil.RequireType[map[string]any](t, raw)
+		if record["event_kind"] == "model_output" &&
+			record["stop_reason"] == "max_tokens" &&
+			publicEventContainsText(record, "partial but durable output") {
+			return
+		}
+	}
+	t.Fatalf("max_tokens model output missing from public events: %+v", records)
+}
+
+func TestPublicEventStreamDeliversSubagentToolCallUpdates(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	pool := openIntegrationDB(t, ctx)
+
+	redisClient := integrationredis.OpenClient(t)
+	bus, err := notifications.NewRedisBus(redisClient, nil)
+	if err != nil {
+		t.Fatalf("create redis bus: %v", err)
+	}
+	presence, err := notifications.NewRedisPresenceStore(redisClient)
+	if err != nil {
+		t.Fatalf("create presence store: %v", err)
+	}
+	publisher, err := notifications.NewRoutedPublisher(
+		notifications.RoutedPublisherPorts{
+			DaemonWakeups:     bus,
+			AgentEventWakeups: bus,
+			ToolCallUpdates:   bus,
+			WorkerControls:    bus,
+		},
+		presence,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("create routed publisher: %v", err)
+	}
+	t.Cleanup(publisher.Close)
+
+	keyWrapper := integrationKeyWrapper()
+	store := storage.NewStore(pool, storage.WithSecretKeyWrapper(keyWrapper), storage.WithPostCommitPublisher(publisher))
+	server := mustNewServer(
+		t,
+		store,
+		WithSecretKeyWrapper(keyWrapper),
+		WithAgentEventWakeupSubscriber(bus),
+		WithAgentToolCallUpdateSubscriber(bus),
+		WithAgentStreamDeltaSubscriber(bus),
+	)
+	handler := newIntegrationHTTPHandler(server.Handler(), pool, store)
+	project := bootstrapPublicHTTPProject(t, handler, "sse-subagents")
+	user := createHTTPInteractionUser(t, ctx, pool, store, project.OrgUUID, project.ProjectUUID, "sse-subagents")
+	parentLaunch := createHTTPRuntimeAgent(t, ctx, store, project.OrgUUID, project.ProjectUUID, user.ID, "sse-subagents")
+	parent := parentLaunch.Agent
+	asker := spawnHTTPSubagentForTest(t, ctx, store, parent, parentLaunch.AgentConfig.ID, "asker", "worker")
+	caller := spawnHTTPSubagentForTest(t, ctx, store, parent, parentLaunch.AgentConfig.ID, "caller", "worker")
+	parentPublicID := testPublicID(t, publicid.KindAgent, parent.ID)
+	askerPublicID := testPublicID(t, publicid.KindAgent, asker.ID)
+	callerPublicID := testPublicID(t, publicid.KindAgent, caller.ID)
+
+	httpServer := httptest.NewServer(handler)
+	defer httpServer.Close()
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		httpServer.URL+project.ProjectPath+"/agents/"+parentPublicID+"/events/stream",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("build sse request: %v", err)
+	}
+	for key, value := range authHeaders(project.AdminToken) {
+		req.Header.Set(key, value)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("sse request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sse status=%d", resp.StatusCode)
+	}
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	if !scanner.Scan() || !strings.HasPrefix(scanner.Text(), ":") {
+		t.Fatalf("sse stream missing preamble: %q", scanner.Text())
+	}
+	frames := make(chan [2]string, 64)
+	go func() {
+		var eventName string
+		for scanner.Scan() {
+			line := scanner.Text()
+			switch {
+			case strings.HasPrefix(line, "event: "):
+				eventName = strings.TrimPrefix(line, "event: ")
+			case strings.HasPrefix(line, "data: "):
+				frames <- [2]string{eventName, strings.TrimPrefix(line, "data: ")}
+				eventName = ""
+			}
+		}
+	}()
+	nextFrame := func(wantEvent string) map[string]any {
+		t.Helper()
+		deadline := time.After(10 * time.Second)
+		for {
+			select {
+			case frame := <-frames:
+				if frame[0] != wantEvent {
+					continue
+				}
+				var decoded map[string]any
+				if err := json.Unmarshal([]byte(frame[1]), &decoded); err != nil {
+					t.Fatalf("decode %s frame: %v", wantEvent, err)
+				}
+				return decoded
+			case <-deadline:
+				t.Fatalf("sse did not deliver a %s frame within 10s", wantEvent)
+			}
+		}
+	}
+
+	question := json.RawMessage(`{"questions":[{"prompt":"Ship?","options":[{"label":"Yes"},{"label":"No"}]}]}`)
+	interactionID := createHTTPInteractionForAgent(
+		t, ctx, store, project.OrgUUID, project.ProjectUUID, user.ID, asker, "question", "", question,
+	)
+	interaction, found, err := store.Execution().GetAgentInteraction(ctx, project.ProjectUUID, asker.ID, interactionID)
+	if err != nil || !found {
+		t.Fatalf("load subagent question: found=%v err=%v", found, err)
+	}
+	awaitToolCallUpdate := func(toolCallPublicID, agentPublicID, state string) {
+		t.Helper()
+		for {
+			frame := nextFrame("tool_call_update")
+			if frame["tool_call_id"] != toolCallPublicID {
+				continue
+			}
+			if frame["agent_id"] != agentPublicID {
+				t.Fatalf("tool call update = %+v, want agent %s", frame, agentPublicID)
+			}
+			if state == "" || frame["state"] == state {
+				return
+			}
+		}
+	}
+	awaitToolCallUpdate(testPublicID(t, publicid.KindToolCall, interaction.ToolCallID), askerPublicID, "")
+
+	toolCallID := createHTTPCustomToolCallForAgent(t, ctx, store, project.OrgUUID, project.ProjectUUID, user.ID, caller)
+	toolCallPublicID := testPublicID(t, publicid.KindToolCall, toolCallID)
+	awaitToolCallUpdate(toolCallPublicID, callerPublicID, "ready")
+
+	grandchild := spawnHTTPSubagentForTest(t, ctx, store, caller, parentLaunch.AgentConfig.ID, "grandchild", "helper")
+	grandchildPublicID := testPublicID(t, publicid.KindAgent, grandchild.ID)
+	if _, err := store.Execution().CompleteCustomToolCall(ctx, executionstore.CompleteCustomToolCallInput{
+		ProjectID:     project.ProjectUUID,
+		AgentID:       caller.ID,
+		ID:            toolCallID,
+		Outcome:       executionstore.ToolResultOutcomeSucceeded,
+		ContentBlocks: json.RawMessage(`[{"type":"text","text":"done"}]`),
+	}); err != nil {
+		t.Fatalf("complete subagent custom tool call: %v", err)
+	}
+	awaitToolCallUpdate(toolCallPublicID, callerPublicID, "completed")
+	grandchildToolCallID := createHTTPCustomToolCallForAgent(
+		t, ctx, store, project.OrgUUID, project.ProjectUUID, user.ID, grandchild,
+	)
+	awaitToolCallUpdate(testPublicID(t, publicid.KindToolCall, grandchildToolCallID), grandchildPublicID, "ready")
+
+	listed := requestJSONWithHeaders(
+		t, handler, http.MethodGet,
+		project.ProjectPath+"/agents/"+parentPublicID+"/tool-calls?include_subagents=true&type=custom",
+		"", "", http.StatusOK, authHeaders(project.AdminToken),
+	)
+	rows := testutil.RequireType[[]any](t, listed["data"])
+	if len(rows) != 2 {
+		t.Fatalf("subagent custom tool calls = %+v, want the caller's and the grandchild's", rows)
+	}
+	listedAgents := map[any]any{}
+	for _, entry := range rows {
+		row := testutil.RequireType[map[string]any](t, entry)
+		listedAgents[row["id"]] = row["agent_id"]
+	}
+	if listedAgents[toolCallPublicID] != callerPublicID ||
+		listedAgents[testPublicID(t, publicid.KindToolCall, grandchildToolCallID)] != grandchildPublicID {
+		t.Fatalf("listed subagent tool calls = %+v", listedAgents)
+	}
+	own := requestJSONWithHeaders(
+		t, handler, http.MethodGet,
+		project.ProjectPath+"/agents/"+parentPublicID+"/tool-calls?type=custom",
+		"", "", http.StatusOK, authHeaders(project.AdminToken),
+	)
+	if rows := testutil.RequireType[[]any](t, own["data"]); len(rows) != 0 {
+		t.Fatalf("parent custom tool calls without include_subagents = %+v, want none", rows)
+	}
+}

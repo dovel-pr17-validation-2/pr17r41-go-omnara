@@ -1,0 +1,71 @@
+---
+title: Architecture
+description: Under the Hood
+icon: "sitemap"
+---
+
+```mermaid
+flowchart LR
+  clients["Browsers & API clients"] -- "HTTPS + SSE" --> ingress["Public origin / ingress"]
+  daemon["daemon<br/>(on your machines)"] -- "HTTPS + WebSocket<br/>(dials out)" --> ingress
+
+  subgraph cp["Control plane"]
+    web["web"]
+    migrate["migrate<br/>(one shot)"]
+    api["api"]
+    worker["worker ×N"]
+    maintenance["maintenance"]
+  end
+
+  ingress -- "default routes" --> web
+  ingress -- "/api/*, /install/*,<br/>/.well-known/*" --> api
+  migrate --> pg[("Postgres")]
+  api --> pg
+  api --> redis[("Redis")]
+  api --> blob[("Blob storage")]
+  api --> memory[("Memory filesystem")]
+  worker --> pg
+  worker --> redis
+  worker --> blob
+  worker --> memory
+  worker -- "model calls" --> providers["Model providers"]
+  maintenance --> pg
+  maintenance --> redis
+  maintenance --> memory
+  maintenance -- "provision / clean up" --> mp["Machine providers"]
+```
+
+## Processes
+
+**web** serves the compiled single-page application
+
+**api** (`cmd/api`) serves the public API surface
+
+**worker** (`cmd/worker`) executes agent turns: it claims ready agent work, builds the model context, calls the model provider, and runs tools. Workers are stateless and scale horizontally.
+
+**maintenance** (`cmd/maintenance`) reaps expired locks and runtimes, times out stuck work, reconciles machine pools toward their targets, and removes the memory files of deleted stores, projects, and organizations
+
+**migrate** (`cmd/migrate`) applies the release's schema migrations and exits. Run it successfully before starting or updating the long-running services.
+
+**omnarad** (`cmd/daemon`) runs on each machine agents execute tool calls on. It installs under `~/.omnarad` with a user systemd or launchd service when available, and self-updates from its installer-recorded release manifest.
+
+## Stores
+
+**Postgres** stores all persistent data for the service, like organizations, projects, agents, events, machines, secrets.
+
+**Redis** carries notifications and rate limits, this is primarily for SSE streaming and notifications.
+
+**Blob storage** holds artifact content, like file attachments and tool outputs.
+
+**Memory filesystem** stores memory files on a persistent filesystem shared by API, workers, and maintenance.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Deployment" icon="cloud-arrow-up" href="/self-hosting/deployment">
+    Public origin, reverse proxy rules, and health checks
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/self-hosting/configuration">
+    Every environment variable, grouped
+  </Card>
+</CardGroup>

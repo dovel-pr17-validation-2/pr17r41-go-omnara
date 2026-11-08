@@ -1,0 +1,165 @@
+---
+title: Authentication
+description: Personal and organization API keys, device login for CLIs, and token management
+icon: "key"
+---
+
+Two kinds of API keys exist, and both are sent the same way:
+
+| Credential | Shape | Acts as |
+| --- | --- | --- |
+| Personal API key | `omnara_pat_v1_…` | You — your roles, your project access |
+| Org API key | `omnara_org_v1_…` | The org itself — a service account for integrations and automations |
+
+(Connected machines authenticate with their own daemon tokens, minted in the [connect flow](/machines/connect#install-the-daemon) and valid only on daemon routes.)
+
+Treat bearer tokens as opaque: store and send the complete value without
+parsing its prefix, version, or checksum.
+
+## Using an API key
+
+Send either key as a bearer token. This example uses a personal key because `/me` is a user-only endpoint:
+
+```bash
+curl https://api.omnara.com/v1/me \
+  -H "Authorization: Bearer $OMNARA_TOKEN"
+```
+
+```json
+{
+  "user": { "id": "usr_ehcyd5n6a2bfgik7mv4qtrwz3j", "email": "you@example.com", "display_name": "You" },
+  "orgs": [ { "id": "org_k7mv4qtrwz3jehcyd5n6a2bfgi", "name": "Acme", "role": "owner", "created_at": "2026-08-01T17:02:11Z" } ]
+}
+```
+
+A personal API key authenticates as you and carries exactly your roles and project access — no more, no less. There are no separate API scopes to configure; what you can do in the dashboard, your token can do through the API. For service integrations, use an [org API key](#org-api-keys-for-services) instead, so access doesn't hinge on one person's account.
+
+A missing or invalid token returns `401` with code `unauthorized`. A valid token used on something your roles don't permit returns `403` — or `404` if you can't even see the resource. Details in [Errors](/api/overview#errors).
+
+## Creating personal keys
+
+Tokens are minted where a human can approve them — creating one is deliberately *not* possible with another API key:
+
+- **Dashboard** — open your account menu at the bottom of the sidebar, choose **Personal tokens**, and click **New token**. The full token is shown once.
+- **Device login** — for CLIs and dev tools, below.
+
+Only a hash is stored server-side, so save the token when it is shown.
+
+## Org API keys for services
+
+Services shouldn't run as a person — when that person leaves or their access changes, the integration breaks. An org API key is its own principal: it holds an org role (`admin` or `member`) and per-project roles, granted exactly like a member's.
+
+Create one in the dashboard: with **All projects** selected in the project switcher, open **API Tokens** under **Access** (org admins only) and click **New token**. Pick a name and org role; the `omnara_org_v1_…` token is shown once. Then grant the key project roles from its detail panel — a member-role key sees nothing until you do, same as a human member.
+
+Key management stays human-gated: creating, renaming, changing roles, and revoking all require a dashboard session, so one API key can never mint or escalate another. Listing and reading key metadata work with regular API auth ([List org API keys](/api-reference/endpoints/users-and-api-keys/list-org-api-keys)). Revocation is permanent, drops the key's org and project roles, and cancels invitations it sent ([Revoke](/api-reference/endpoints/users-and-api-keys/revoke-an-org-api-key)).
+
+## Device login for CLIs
+
+Omnara supports the [OAuth 2.0 Device Authorization Grant](https://www.rfc-editor.org/rfc/rfc8628.html). The returned access token is a regular Omnara personal access token.
+
+Start by discovering the endpoints for the Omnara installation:
+
+```bash
+curl https://app.omnara.com/.well-known/oauth-authorization-server
+```
+
+Use the endpoint URLs returned by this metadata rather than constructing them.
+
+**1. Start the flow:**
+
+```bash
+curl https://app.omnara.com/api/auth/device/code \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "client_id=omnara-cli" \
+  --data-urlencode "token_name=laptop of dana"
+```
+
+`client_id` must be `omnara-cli`; other public clients are not currently registered. `token_name` is an optional Omnara extension for naming the resulting PAT; it uses the 64-character resource-name policy and defaults to `Device login`.
+
+```json
+{
+  "device_code": "b62d4cb3…",
+  "user_code": "A1B2C-D3E4F",
+  "verification_uri": "https://app.omnara.com/device",
+  "verification_uri_complete": "https://app.omnara.com/device?user_code=A1B2C-D3E4F",
+  "expires_in": 900,
+  "interval": 5
+}
+```
+
+**2. Send the user to approve.** Open `verification_uri_complete` (or show `user_code` and point them at `verification_uri`). They sign in and approve — or deny — on the dashboard's **Approve device login** page.
+
+**3. Poll for the token** every `interval` seconds with the private `device_code`:
+
+```bash
+curl https://app.omnara.com/api/auth/device/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:device_code" \
+  --data-urlencode "device_code=b62d4cb3…" \
+  --data-urlencode "client_id=omnara-cli"
+```
+
+While the user hasn't decided, the token endpoint returns `400`:
+
+```json
+{ "error": "authorization_pending" }
+```
+
+Keep polling at the returned interval. After `slow_down`, add five seconds to the interval for this and later requests. On approval, `200` returns the PAT:
+
+```json
+{ "access_token": "omnara_pat_v1_…", "token_type": "Bearer" }
+```
+
+A denied or expired flow returns `400` with `"access_denied"` or `"expired_token"`. The PAT does not expire automatically; it appears in the approving user's token list, where it can be revoked, and is used as a bearer token for subsequent API calls.
+
+## Connecting MCP clients
+
+The Omnara API is also exposed as an MCP server at `https://app.omnara.com/mcp`. MCP clients that support the [MCP authorization spec](https://modelcontextprotocol.io/specification/draft/basic/authorization) discover the OAuth endpoints themselves and sign you in through the browser, so no token needs to be pasted into the client.
+
+In Claude, add Omnara from the [connectors directory](https://claude.ai/directory/app-omnara-com). In Claude Code or Codex, add it from the terminal:
+
+<CodeGroup>
+```bash Claude Code
+claude mcp add --transport http omnara https://app.omnara.com/mcp
+```
+
+```bash Codex
+codex mcp add omnara --url https://app.omnara.com/mcp
+```
+</CodeGroup>
+
+Then sign in with `/mcp` in Claude Code or `codex mcp login omnara` in Codex.
+
+For other clients, add the server to your client's `mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "omnara": {
+      "type": "http",
+      "url": "https://app.omnara.com/mcp"
+    }
+  }
+}
+```
+
+On first use the client opens the dashboard's **Authorize access to Omnara** page. Approve it and the client stores its own short-lived tokens, refreshing them in the background.
+
+A client you sign in this way acts as you, with your roles in every organization you belong to. To limit a client to specific projects, use a member-role [org API key](#org-api-keys-for-services) with roles on only those projects. Clients without OAuth support can also use a personal access token. Either one goes in the `Authorization` header:
+
+```json
+{
+  "mcpServers": {
+    "omnara": {
+      "type": "http",
+      "url": "https://app.omnara.com/mcp",
+      "headers": { "Authorization": "Bearer omnara_pat_v1_…" }
+    }
+  }
+}
+```
+
+## Managing tokens
+
+The **Personal tokens** page in your account menu — or [List personal access tokens](/api-reference/endpoints/users-and-api-keys/list-the-authenticated-users-personal-access-tokens) — shows your tokens with creation and last-used times, metadata only: the secret is never shown again. `last_used_at` tells you which tokens are actually alive; prune the rest, and [revoke](/api-reference/endpoints/users-and-api-keys/revoke-a-personal-access-token) immediately if a token leaks — revocation is permanent.

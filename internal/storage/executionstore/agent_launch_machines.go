@@ -1,0 +1,434 @@
+package executionstore
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/omnara-ai/omnara/internal/agentconfig"
+	"github.com/omnara-ai/omnara/internal/storage/internal/agentexecution"
+	"github.com/omnara-ai/omnara/internal/storage/internal/dbsqlc"
+	"github.com/omnara-ai/omnara/internal/storage/internal/lifecyclelock"
+	"github.com/omnara-ai/omnara/internal/storage/internal/resourceguard"
+	"github.com/omnara-ai/omnara/internal/storage/internal/storeutil"
+	"github.com/omnara-ai/omnara/internal/storage/storeerr"
+)
+
+type launchMachineSource struct {
+	Index              int
+	Contract           agentconfig.RuntimeMachine
+	GrantID            uuid.UUID
+	PoolGrantForLaunch dbsqlc.GetActiveProjectMachinePoolGrantForLaunchRow
+	Provisioning       MachineProvisioningConfig
+	MachineCwd         string
+	MachineEnvironment MachineEnvironment
+	BindingConfig      MachineBindingConfig
+}
+
+type launchMachineBindingRequest struct {
+	Source        launchMachineSource
+	PoolSlotIndex int
+}
+
+func decodeLaunchMachineSources(
+	contract agentconfig.RuntimeContract,
+) ([]launchMachineSource, error) {
+	if len(contract.MachineSources) == 0 {
+		return nil, nil
+	}
+	out := make([]launchMachineSource, 0, len(contract.MachineSources))
+	for index, machine := range contract.MachineSources {
+		source := launchMachineSource{Index: index, Contract: machine}
+		if err := validateRuntimeMachineSource(index, machine); err != nil {
+			return nil, err
+		}
+		out = append(out, source)
+	}
+	return out, nil
+}
+
+func expandLaunchMachineBindingRequests(
+	sources []launchMachineSource,
+) ([]launchMachineBindingRequest, error) {
+	var bindings []launchMachineBindingRequest
+	for _, source := range sources {
+		if source.Contract.MachineID != uuid.Nil {
+			bindings = append(bindings, launchMachineBindingRequest{Source: source})
+			continue
+		}
+		if source.Contract.MachinePoolID == uuid.Nil {
+			return nil, fmt.Errorf("machine_sources[%d] has no machine source", source.Index)
+		}
+		for slotIndex := range source.Contract.InitialNumMachines {
+			bindings = append(
+				bindings,
+				launchMachineBindingRequest{Source: source, PoolSlotIndex: slotIndex},
+			)
+		}
+	}
+	return bindings, nil
+}
+
+func (s *Store) resolveLaunchMachineSourcesTx(
+	ctx context.Context,
+	tx dbsqlc.DBTX,
+	qtx *dbsqlc.Queries,
+	orgID, projectID uuid.UUID,
+	sources []launchMachineSource,
+) error {
+	if err := s.resolveLaunchPoolMachineSourcesTx(ctx, tx, qtx, orgID, projectID, sources); err != nil {
+		return err
+	}
+	if err := lockLaunchMachineSourcesTx(ctx, tx, orgID, sources, nil); err != nil {
+		return err
+	}
+	return s.resolveLaunchExplicitMachineSourcesTx(ctx, qtx, projectID, sources)
+}
+
+func (s *Store) resolveLaunchPoolMachineSourcesTx(
+	ctx context.Context,
+	tx dbsqlc.DBTX,
+	qtx *dbsqlc.Queries,
+	orgID, projectID uuid.UUID,
+	sources []launchMachineSource,
+) error {
+	var poolIndexes []int
+	poolRefs := make([]lifecyclelock.PoolRef, 0, len(sources))
+	for index := range sources {
+		if sources[index].Contract.MachinePoolID != uuid.Nil {
+			poolIndexes = append(poolIndexes, index)
+			poolRefs = append(poolRefs, lifecyclelock.PoolRef{
+				OrgID:  orgID,
+				PoolID: sources[index].Contract.MachinePoolID,
+			})
+		}
+	}
+	if err := lifecyclelock.Pools(ctx, tx, poolRefs); err != nil {
+		return err
+	}
+	sort.Slice(poolIndexes, func(i, j int) bool {
+		left := sources[poolIndexes[i]]
+		right := sources[poolIndexes[j]]
+		return bytes.Compare(left.Contract.MachinePoolID[:], right.Contract.MachinePoolID[:]) < 0
+	})
+	for _, index := range poolIndexes {
+		poolGrant, err := qtx.GetActiveProjectMachinePoolGrantForLaunch(
+			ctx,
+			dbsqlc.GetActiveProjectMachinePoolGrantForLaunchParams{
+				OrgID:         orgID,
+				ProjectID:     projectID,
+				MachinePoolID: sources[index].Contract.MachinePoolID,
+			},
+		)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf(
+					"machine_sources[%d].machine_pool_id does not have an active project pool grant: %w",
+					sources[index].Index,
+					storeerr.ErrNotFound,
+				)
+			}
+			return fmt.Errorf("load launch machine pool grant: %w", err)
+		}
+		resolved, err := s.ResolvePoolMachine(
+			poolGrant,
+			sources[index].Contract,
+		)
+		if err != nil {
+			return fmt.Errorf("machine_sources[%d] configuration: %w", sources[index].Index, err)
+		}
+		sources[index].PoolGrantForLaunch = poolGrant
+		sources[index].Provisioning = resolved.Provisioning
+		sources[index].MachineCwd = resolved.MachineCwd
+		sources[index].MachineEnvironment = resolved.MachineEnvironment
+		sources[index].BindingConfig = resolved.BindingConfig
+	}
+	return nil
+}
+
+func lockLaunchMachineSourcesTx(
+	ctx context.Context,
+	tx dbsqlc.DBTX,
+	orgID uuid.UUID,
+	sources []launchMachineSource,
+	additionalMachineIDs []uuid.UUID,
+) error {
+	refs := make([]lifecyclelock.MachineRef, 0, len(sources)+len(additionalMachineIDs))
+	for _, source := range sources {
+		if source.Contract.MachineID != uuid.Nil {
+			refs = append(refs, lifecyclelock.MachineRef{OrgID: orgID, MachineID: source.Contract.MachineID})
+		}
+	}
+	for _, machineID := range additionalMachineIDs {
+		refs = append(refs, lifecyclelock.MachineRef{OrgID: orgID, MachineID: machineID})
+	}
+	if err := lifecyclelock.Machines(ctx, tx, refs); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) resolveLaunchExplicitMachineSourcesTx(
+	ctx context.Context,
+	qtx *dbsqlc.Queries,
+	projectID uuid.UUID,
+	sources []launchMachineSource,
+) error {
+	machineIDs := make([]uuid.UUID, 0, len(sources))
+	for _, source := range sources {
+		if source.Contract.MachineID != uuid.Nil {
+			machineIDs = append(machineIDs, source.Contract.MachineID)
+		}
+	}
+	sort.Slice(machineIDs, func(i, j int) bool {
+		return bytes.Compare(machineIDs[i][:], machineIDs[j][:]) < 0
+	})
+	for _, machineID := range machineIDs {
+		if err := qtx.LockMachineEnvironmentKey(
+			ctx,
+			dbsqlc.LockMachineEnvironmentKeyParams{MachineID: machineID},
+		); err != nil {
+			return fmt.Errorf("lock machine environment: %w", err)
+		}
+	}
+	for index := range sources {
+		if sources[index].Contract.MachineID == uuid.Nil {
+			continue
+		}
+		grant, err := qtx.GetActiveProjectMachineGrantForMachine(
+			ctx,
+			dbsqlc.GetActiveProjectMachineGrantForMachineParams{
+				ProjectID: projectID,
+				MachineID: sources[index].Contract.MachineID,
+			},
+		)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf(
+					"machine_sources[%d].machine_id does not have an active project grant: %w",
+					sources[index].Index,
+					storeerr.ErrNotFound,
+				)
+			}
+			return fmt.Errorf("resolve launch machine grant: %w", err)
+		}
+		sources[index].GrantID = grant.ID
+		machineEnvironment, err := MachineEnvironmentFromColumns(grant.MachineEnv, grant.MachineSecretEnv)
+		if err != nil {
+			return fmt.Errorf("machine_sources[%d] machine environment: %w", sources[index].Index, err)
+		}
+		environmentOverlay := runtimeMachineEnvironmentOverlay(sources[index].Contract)
+		if _, err := resolveMachineEnvironment(
+			machineEnvironment,
+			environmentOverlay,
+		); err != nil {
+			return fmt.Errorf("machine_sources[%d] environment: %w", sources[index].Index, err)
+		}
+		sources[index].BindingConfig = MachineBindingConfig{
+			Cwd:                sources[index].Contract.Cwd,
+			EnvironmentOverlay: environmentOverlay,
+		}
+	}
+	return nil
+}
+
+func ensurePoolCapacityForConfigTx(
+	ctx context.Context,
+	qtx *dbsqlc.Queries,
+	orgID, projectID uuid.UUID,
+	poolGrant dbsqlc.GetActiveProjectMachinePoolGrantForLaunchRow,
+	machineProvisioning MachineProvisioningConfig,
+	requestedMachines int,
+) error {
+	if requestedMachines <= 0 {
+		return nil
+	}
+	if !poolGrant.NewManagedWorkAllowed {
+		return storeerr.ErrManagedWorkAdmissionDenied
+	}
+	requested, err := resourcesFromMachineProvisioning(machineProvisioning)
+	if err != nil {
+		return err
+	}
+	poolUsage, err := qtx.GetActivePoolMachineUsage(
+		ctx,
+		dbsqlc.GetActivePoolMachineUsageParams{OrgID: orgID, MachinePoolID: &poolGrant.MachinePoolID},
+	)
+	if err != nil {
+		return fmt.Errorf("get active pool machine usage: %w", err)
+	}
+	if int(poolUsage.Machines)+requestedMachines > int(poolGrant.PoolMaxTotalMachines) {
+		return capacityConflict("machine pool capacity exceeded")
+	}
+	if err := checkLaunchResourceCaps(
+		poolUsage.Cpu,
+		poolUsage.MemoryMb,
+		requested,
+		requestedMachines,
+		knownResourceCaps(requested, MachineResourceLimits{
+			MaxTotalCPU:        storeutil.IntPtr(poolGrant.PoolMaxTotalCpu),
+			MaxTotalMemoryMB:   storeutil.IntPtr(poolGrant.PoolMaxTotalMemoryMb),
+			MinMachineCPU:      storeutil.IntPtr(poolGrant.PoolMinMachineCpu),
+			MinMachineMemoryMB: storeutil.IntPtr(poolGrant.PoolMinMachineMemoryMb),
+			MaxMachineCPU:      storeutil.IntPtr(poolGrant.PoolMaxMachineCpu),
+			MaxMachineMemoryMB: storeutil.IntPtr(poolGrant.PoolMaxMachineMemoryMb),
+		}),
+	); err != nil {
+		return fmt.Errorf("machine pool %w", err)
+	}
+	projectPoolUsage, err := qtx.GetActiveProjectMachinePoolUsage(
+		ctx,
+		dbsqlc.GetActiveProjectMachinePoolUsageParams{
+			OrgID:         orgID,
+			ProjectID:     projectID,
+			MachinePoolID: &poolGrant.MachinePoolID,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("get active project machine pool usage: %w", err)
+	}
+	if poolGrant.GrantMaxTotalMachines != nil &&
+		int(projectPoolUsage.Machines)+requestedMachines > int(*poolGrant.GrantMaxTotalMachines) {
+		return capacityConflict("project machine pool capacity exceeded")
+	}
+	if err := checkLaunchResourceCaps(
+		projectPoolUsage.Cpu,
+		projectPoolUsage.MemoryMb,
+		requested,
+		requestedMachines,
+		knownResourceCaps(requested, MachineResourceLimits{
+			MaxTotalCPU:        storeutil.IntPtr(poolGrant.GrantMaxTotalCpu),
+			MaxTotalMemoryMB:   storeutil.IntPtr(poolGrant.GrantMaxTotalMemoryMb),
+			MinMachineCPU:      storeutil.IntPtr(poolGrant.GrantMinMachineCpu),
+			MinMachineMemoryMB: storeutil.IntPtr(poolGrant.GrantMinMachineMemoryMb),
+			MaxMachineCPU:      storeutil.IntPtr(poolGrant.GrantMaxMachineCpu),
+			MaxMachineMemoryMB: storeutil.IntPtr(poolGrant.GrantMaxMachineMemoryMb),
+		}),
+	); err != nil {
+		return fmt.Errorf("project machine pool %w", err)
+	}
+	return nil
+}
+
+func insertAgentMachineBindingTx(
+	ctx context.Context,
+	qtx *dbsqlc.Queries,
+	input insertAgentMachineBindingInput,
+) (AgentMachineBindingRecord, error) {
+	row, err := qtx.InsertAgentMachineBinding(
+		ctx,
+		dbsqlc.InsertAgentMachineBindingParams{
+			ProjectID:              input.ProjectID,
+			AgentID:                input.AgentID,
+			CreateToolCallID:       storeutil.IDFromNil(input.CreateToolCallID),
+			ProjectMachineGrantID:  input.ProjectMachineGrantID,
+			BindingKind:            string(input.BindingKind),
+			Description:            input.Description,
+			Cwd:                    input.Cwd,
+			EnvOverlay:             normalizedJSON(input.EnvOverlay),
+			SecretEnvOverlay:       normalizedJSON(input.SecretEnvOverlay),
+			DeleteAfterIdleMinutes: storeutil.Int32Ptr(input.DeleteAfterIdleMinutes),
+			Metadata:               normalizedJSON(input.Metadata),
+		},
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return AgentMachineBindingRecord{}, storeerr.ErrIdempotencyConflict
+		}
+		if storeutil.IsUniqueViolation(err) {
+			return AgentMachineBindingRecord{}, storeerr.ErrIdempotencyConflict
+		}
+		return AgentMachineBindingRecord{}, fmt.Errorf("upsert launch agent machine binding: %w", err)
+	}
+	return agentMachineBindingRecordFromSQLC(row), nil
+}
+
+func allocateNewPoolMachineForAgentTx(
+	ctx context.Context,
+	unit *agentexecution.Unit,
+	qtx *dbsqlc.Queries,
+	orgID, projectID, agentID uuid.UUID,
+	binding launchMachineBindingRequest,
+) (AgentMachineBindingRecord, error) {
+	source := binding.Source
+	poolGrant := source.PoolGrantForLaunch
+	if poolGrant.ID == uuid.Nil {
+		return AgentMachineBindingRecord{}, errors.New("launch machine pool grant was not resolved")
+	}
+	provisioningColumns, err := machineProvisioningToColumns(source.Provisioning)
+	if err != nil {
+		return AgentMachineBindingRecord{}, fmt.Errorf("prepare launch machine columns: %w", err)
+	}
+	machineEnv, machineSecretEnv, err := machineEnvironmentToColumns(source.MachineEnvironment)
+	if err != nil {
+		return AgentMachineBindingRecord{}, fmt.Errorf("prepare launch machine environment: %w", err)
+	}
+	bindingEnvOverlay, bindingSecretEnvOverlay, err := MachineEnvironmentOverlayToColumns(
+		source.BindingConfig.EnvironmentOverlay,
+	)
+	if err != nil {
+		return AgentMachineBindingRecord{}, fmt.Errorf("prepare launch binding environment: %w", err)
+	}
+	machineRow, err := qtx.InsertMachine(ctx, dbsqlc.InsertMachineParams{
+		OrgID:                  orgID,
+		MachinePoolID:          &poolGrant.MachinePoolID,
+		SourceKind:             string(MachineSourceKindPool),
+		DisplayName:            poolMachineDisplayName(poolGrant.PoolName),
+		Description:            source.Contract.Description,
+		Provider:               poolGrant.Provider,
+		LifecycleState:         string(MachineLifecycleStateProvisioning),
+		Cpu:                    provisioningColumns.CPU,
+		MemoryMb:               provisioningColumns.MemoryMB,
+		Cwd:                    source.MachineCwd,
+		Env:                    machineEnv,
+		SecretEnv:              machineSecretEnv,
+		ProviderOptions:        &provisioningColumns.ProviderOptions,
+		LifecycleReasonMessage: "",
+		Metadata:               normalizedJSON(poolGrant.Metadata),
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return AgentMachineBindingRecord{}, storeerr.ErrIdempotencyConflict
+		}
+		return AgentMachineBindingRecord{}, fmt.Errorf("insert pool machine for launch: %w", err)
+	}
+	unit.TrackCreation(resourceguard.Creation{Kind: resourceguard.Machines, OrgID: orgID})
+	grantRow, err := qtx.UpsertProjectMachineGrant(ctx, dbsqlc.UpsertProjectMachineGrantParams{
+		OrgID:                     orgID,
+		ProjectID:                 projectID,
+		MachineID:                 machineRow.ID,
+		SourceKind:                string(ProjectMachineGrantSourceKindPool),
+		ProjectMachinePoolGrantID: &poolGrant.ID,
+		Description:               poolGrant.Description,
+		IdempotencyKey: storeutil.TextFromEmpty(
+			machineSourceSlotChildIdempotencyKey(agentID, source.Index, binding.PoolSlotIndex, "machine-grant"),
+		),
+		Metadata: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return AgentMachineBindingRecord{}, storeerr.ErrIdempotencyConflict
+		}
+		return AgentMachineBindingRecord{}, fmt.Errorf(
+			"insert generated project machine grant: %w",
+			err,
+		)
+	}
+	return insertAgentMachineBindingTx(ctx, qtx, insertAgentMachineBindingInput{
+		ProjectID:              projectID,
+		AgentID:                agentID,
+		ProjectMachineGrantID:  grantRow.ID,
+		BindingKind:            MachineBindingKindPool,
+		Description:            source.Contract.Description,
+		Cwd:                    source.BindingConfig.Cwd,
+		EnvOverlay:             bindingEnvOverlay,
+		SecretEnvOverlay:       bindingSecretEnvOverlay,
+		DeleteAfterIdleMinutes: source.BindingConfig.DeleteAfterIdleMinutes,
+		Metadata:               json.RawMessage(`{}`),
+	})
+}

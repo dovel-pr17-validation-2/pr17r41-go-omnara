@@ -1,0 +1,861 @@
+package tools
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"slices"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/omnara-ai/omnara/internal/machinepool"
+	"github.com/omnara-ai/omnara/internal/publicid"
+	"github.com/omnara-ai/omnara/internal/storage/executionstore"
+	"github.com/omnara-ai/omnara/internal/storage/listing"
+	"github.com/omnara-ai/omnara/internal/storage/storeerr"
+	"github.com/omnara-ai/omnara/internal/toolcatalog"
+)
+
+var ErrNoMachine = errors.New("no_machine")
+
+type createMachineRequest struct {
+	MachinePoolID string `json:"machine_pool_id,omitempty"`
+	CPU           *int   `json:"cpu,omitempty"`
+	MemoryMB      *int   `json:"memory_mb,omitempty"`
+}
+
+type listMachinesRequest struct {
+	Offset *int `json:"offset,omitempty"`
+	Limit  *int `json:"limit,omitempty"`
+}
+
+func resolveListMachinesRequest(raw json.RawMessage) (int, int, error) {
+	var request listMachinesRequest
+	if err := decodeSingleStrictJSON(raw, &request, "list_machines request"); err != nil {
+		return 0, 0, err
+	}
+	offset, limit := 0, toolcatalog.ListMachinesDefaultLimit
+	if request.Offset != nil {
+		if *request.Offset < 0 {
+			return 0, 0, errors.New("offset must be non-negative")
+		}
+		offset = *request.Offset
+	}
+	if request.Limit != nil {
+		if *request.Limit < 1 || *request.Limit > toolcatalog.ListMachinesMaxLimit {
+			return 0, 0, fmt.Errorf("limit must be between 1 and %d", toolcatalog.ListMachinesMaxLimit)
+		}
+		limit = *request.Limit
+	}
+	return offset, limit, nil
+}
+
+type machineObservationMode string
+
+const (
+	machineObservationList    machineObservationMode = "list"
+	machineObservationInspect machineObservationMode = "inspect"
+)
+
+type machineObservationAuthorization struct {
+	Mode      machineObservationMode `json:"mode"`
+	MachineID string                 `json:"machine_id,omitempty"`
+}
+
+func validateCreateMachineInput(input json.RawMessage) error {
+	_, err := resolveCreateMachineRequest(input)
+	return err
+}
+
+func validateDeleteMachineInput(input json.RawMessage) error {
+	_, err := resolveMachineIDRequest(input, false)
+	return err
+}
+
+func validateInspectMachineInput(input json.RawMessage) error {
+	_, err := resolveMachineIDRequest(input, true)
+	return err
+}
+
+func validateListMachinesInput(input json.RawMessage) error {
+	_, _, err := resolveListMachinesRequest(input)
+	return err
+}
+
+func createMachine(
+	ctx context.Context,
+	call transactionalToolContext,
+) (transactionalPhaseResult, error) {
+	input, err := resolveCreateMachineRequest(call.Call.Input)
+	if err != nil {
+		return nil, err
+	}
+	agentConfigID, err := agentConfigIDForModelContext(
+		ctx,
+		call.Reader,
+		call.Turn.ModelCallContextID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	sources, err := call.Reader.ListMachinePoolSources(ctx, agentConfigID)
+	if err != nil {
+		return nil, err
+	}
+	source, err := selectPoolForMachineCreate(sources, input)
+	if err != nil {
+		return failMachineTransaction("create_machine_failed", err, false)
+	}
+	authorizationInput, err := machineCreateAuthorizationInput(source.MachinePoolID, input)
+	if err != nil {
+		return nil, err
+	}
+	if err := authorizeToolExecution(
+		ctx,
+		call.Reader,
+		call.Turn,
+		call.Call,
+		authorizationInput,
+	); err != nil {
+		return nil, fmt.Errorf("authorize %s: %w", call.Call.Name, err)
+	}
+	command := executionstore.CreatePoolMachineForToolCall(
+		executionstore.CreatePoolMachineInput{
+			MachinePoolID: source.MachinePoolID,
+			CPU:           input.CPU,
+			MemoryMB:      input.MemoryMB,
+		},
+		func(created executionstore.CreatePoolMachineResult) (executionstore.ToolCallCompletionInput, error) {
+			content, err := machineProvisioningAcceptedResult(created.Machine)
+			if err != nil {
+				return executionstore.ToolCallCompletionInput{}, err
+			}
+			return successfulToolCallCompletion(content)
+		},
+	)
+	return executeInTransaction(
+		command,
+		func(err error) (transactionalPhaseResult, error) {
+			return failMachineTransactionForStorageError(
+				"create_machine_failed",
+				err,
+				false,
+			)
+		},
+	), nil
+}
+
+func deleteMachine(
+	ctx context.Context,
+	call transactionalToolContext,
+) (transactionalPhaseResult, error) {
+	machineID, err := resolveMachineIDRequest(call.Call.Input, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := authorizeToolExecution(
+		ctx,
+		call.Reader,
+		call.Turn,
+		call.Call,
+		call.Call.Input,
+	); err != nil {
+		return nil, fmt.Errorf("authorize %s: %w", call.Call.Name, err)
+	}
+	command := executionstore.DeletePoolMachineForToolCall(
+		executionstore.DeletePoolMachineInput{
+			MachineID: machineID,
+		},
+		func(record executionstore.PoolMachineRecord) (executionstore.ToolCallCompletionInput, error) {
+			content, err := machineDeletionAcceptedResult(record)
+			if err != nil {
+				return executionstore.ToolCallCompletionInput{}, err
+			}
+			return successfulToolCallCompletion(content)
+		},
+	)
+	return executeInTransaction(
+		command,
+		func(err error) (transactionalPhaseResult, error) {
+			retryable := errors.Is(err, storeerr.ErrStateTransitionConflict)
+			return failMachineTransactionForStorageError(
+				"delete_machine_failed",
+				err,
+				retryable,
+			)
+		},
+	), nil
+}
+
+func listMachines(
+	ctx context.Context,
+	call transactionalToolContext,
+) (transactionalPhaseResult, error) {
+	offset, limit, err := resolveListMachinesRequest(call.Call.Input)
+	if err != nil {
+		return nil, err
+	}
+	authorizationInput, err := machineObservationAuthorizationInput(machineObservationList, "")
+	if err != nil {
+		return nil, err
+	}
+	if err := authorizeToolExecution(
+		ctx,
+		call.Reader,
+		call.Turn,
+		call.Call,
+		authorizationInput,
+	); err != nil {
+		return nil, err
+	}
+	machines, err := call.Reader.ListAgentMachineObservations(ctx)
+	if err != nil {
+		return nil, err
+	}
+	agentConfigID, err := agentConfigIDForModelContext(ctx, call.Reader, call.Turn.ModelCallContextID)
+	if err != nil {
+		return nil, err
+	}
+	pools, err := call.Reader.ListMachinePoolSources(ctx, agentConfigID)
+	if err != nil {
+		return nil, err
+	}
+	return machineListPage(machines, pools, offset, limit)
+}
+
+func machineListPage(
+	machines []executionstore.AgentMachineObservationRecord,
+	pools []executionstore.MachinePoolSourceRecord,
+	offset, limit int,
+) (transactionalPhaseResult, error) {
+	slices.SortFunc(pools, func(a, b executionstore.MachinePoolSourceRecord) int {
+		return bytes.Compare(a.MachinePoolID[:], b.MachinePoolID[:])
+	})
+	slices.SortFunc(machines, func(a, b executionstore.AgentMachineObservationRecord) int {
+		return bytes.Compare(a.MachineID[:], b.MachineID[:])
+	})
+	total := len(pools) + len(machines)
+	end := listing.PageEnd(offset, limit, total)
+	page := machineListResult{Machines: []machineObservationPayload{}, MachinePools: []machinePoolPayload{}}
+	entryBytes := 0
+	reserveEntry := func(entry any, collectionSize int) (bool, error) {
+		encoded, err := marshalJSON(entry)
+		if err != nil {
+			return false, err
+		}
+		nextBytes := entryBytes + len(encoded)
+		if collectionSize > 0 {
+			nextBytes++
+		}
+		envelope, err := structuredToolResultContent(machineListResult{
+			Machines: []machineObservationPayload{}, MachinePools: []machinePoolPayload{},
+			OffsetPage: listing.ContinueAt(total, true),
+		})
+		if err != nil {
+			return false, err
+		}
+		parts, err := envelope.contentParts()
+		if err != nil {
+			return false, err
+		}
+		if len(parts)+nextBytes > executionstore.ToolResultInlineBudgetBytes {
+			return false, nil
+		}
+		entryBytes = nextBytes
+		return true, nil
+	}
+	finish := func(next int) (transactionalPhaseResult, error) {
+		page.OffsetPage = listing.ContinueAt(next, next < total)
+		content, err := structuredToolResultContent(page)
+		if err != nil {
+			return nil, err
+		}
+		return completeInTransaction(content), nil
+	}
+	for position := offset; position < end; position++ {
+		if position < len(pools) {
+			pool := pools[position]
+			poolID, err := publicid.Encode(publicid.KindMachinePool, pool.MachinePoolID)
+			if err != nil {
+				return nil, err
+			}
+			entry := machinePoolPayload{
+				MachinePoolID: poolID, MachinePoolName: pool.MachinePoolName, Description: pool.Description,
+				SupportedOverrides: pool.SupportedOverrides,
+				DefaultCPU:         pool.DefaultCPU,
+				DefaultMemoryMB:    pool.DefaultMemoryMB,
+				MinCPU:             pool.MinCPU,
+				MaxCPU:             pool.MaxCPU,
+				MinMemoryMB:        pool.MinMemoryMB,
+				MaxMemoryMB:        pool.MaxMemoryMB,
+			}
+			fits, err := reserveEntry(entry, len(page.MachinePools))
+			if err != nil {
+				return nil, err
+			}
+			if !fits {
+				if position == offset {
+					return failMachineTransaction("machine_pool_details_too_large", fmt.Errorf(
+						"details for machine pool %s exceed the list_machines size limit; call list_machines with offset %d to continue",
+						poolID, position+1,
+					), false)
+				}
+				return finish(position)
+			}
+			page.MachinePools = append(page.MachinePools, entry)
+			continue
+		}
+		observation, err := agentMachineObservation(machines[position-len(pools)])
+		if err != nil {
+			return nil, err
+		}
+		fits, err := reserveEntry(observation, len(page.Machines))
+		if err != nil {
+			return nil, err
+		}
+		if !fits {
+			if position == offset {
+				return failMachineTransaction("machine_details_too_large", fmt.Errorf(
+					"details for machine %s exceed the list_machines size limit; use inspect_machine for details, or call list_machines with offset %d to continue",
+					observation.MachineID, position+1,
+				), false)
+			}
+			return finish(position)
+		}
+		page.Machines = append(page.Machines, observation)
+	}
+	return finish(end)
+}
+
+func inspectMachine(
+	ctx context.Context,
+	call transactionalToolContext,
+) (transactionalPhaseResult, error) {
+	machineID, err := resolveMachineIDRequest(call.Call.Input, true)
+	if err != nil {
+		return nil, err
+	}
+	var record executionstore.AgentMachineObservationRecord
+	if machineID != uuid.Nil {
+		record, err = call.Reader.GetAgentMachineObservationByMachineID(ctx, machineID)
+	} else {
+		var machines []executionstore.AgentMachineObservationRecord
+		machines, err = call.Reader.ListAgentMachineObservations(ctx)
+		if err == nil {
+			record, err = selectOnlyMachine(machines)
+		}
+	}
+	if err != nil {
+		if machineID != uuid.Nil && errors.Is(err, storeerr.ErrNotFound) {
+			err = ErrMachineIDUnavailable
+		}
+		if errors.Is(err, ErrMachineSelectionRequired) ||
+			errors.Is(err, ErrMachineIDUnavailable) {
+			unavailable, resultErr := machineUnavailableToolResult(err)
+			if resultErr != nil {
+				return nil, resultErr
+			}
+			return failInTransaction(unavailable.Content, unavailable.Cause), nil
+		}
+		if errors.Is(err, ErrNoMachine) {
+			return failMachineTransactionWithMessage(
+				"inspect_machine_failed",
+				"no machines are associated with this agent",
+				err,
+				false,
+			)
+		}
+		if !errors.Is(err, storeerr.ErrNotFound) {
+			return nil, err
+		}
+		return failMachineTransaction("inspect_machine_failed", err, false)
+	}
+	machinePublicID, err := publicid.Encode(publicid.KindMachine, record.MachineID)
+	if err != nil {
+		return nil, err
+	}
+	authorizationInput, err := machineObservationAuthorizationInput(
+		machineObservationInspect,
+		machinePublicID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := authorizeToolExecution(
+		ctx,
+		call.Reader,
+		call.Turn,
+		call.Call,
+		authorizationInput,
+	); err != nil {
+		return nil, err
+	}
+	payload, err := agentMachineInspection(record)
+	if err != nil {
+		return nil, err
+	}
+	content, err := structuredToolResultContent(payload)
+	if err != nil {
+		return nil, err
+	}
+	return completeInTransaction(content), nil
+}
+
+func provisionMachineInBackground(
+	ctx context.Context,
+	call backgroundToolContext,
+) error {
+	return call.Executor.provisionMachineForToolCall(ctx, call.Turn, call.ToolCallID)
+}
+
+func deleteMachineInBackground(
+	ctx context.Context,
+	call backgroundToolContext,
+) error {
+	return call.Executor.deleteMachineForToolCall(ctx, call.Turn, call.ToolCallID)
+}
+
+func (e Executor) provisionMachineForToolCall(
+	ctx context.Context,
+	turn Turn,
+	toolCallID uuid.UUID,
+) error {
+	record, err := e.Store.Execution().GetPoolMachineByCreateToolCall(
+		ctx,
+		turn.ProjectID,
+		turn.AgentID,
+		toolCallID,
+	)
+	if err != nil {
+		return err
+	}
+	if e.MachinePoolManager == nil {
+		return errors.New("pool machine manager is required")
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, machinepool.DefaultImmediateProvisioningTimeout)
+	defer cancel()
+	return e.MachinePoolManager.ProvisionMachine(
+		attemptCtx,
+		record.Machine.OrgID,
+		record.Machine.ID,
+	)
+}
+
+func (e Executor) deleteMachineForToolCall(
+	ctx context.Context,
+	turn Turn,
+	toolCallID uuid.UUID,
+) error {
+	record, err := e.Store.Execution().GetPoolMachineByDeleteToolCall(
+		ctx,
+		turn.ProjectID,
+		turn.AgentID,
+		toolCallID,
+	)
+	if err != nil {
+		return err
+	}
+	if e.MachinePoolManager == nil {
+		return errors.New("pool machine manager is required")
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, machinepool.DefaultImmediateDeletionTimeout)
+	defer cancel()
+	return e.MachinePoolManager.DeleteMachine(
+		attemptCtx,
+		executionstore.PoolMachineCleanupCandidate{Machine: record.Machine},
+	)
+}
+
+func resolveCreateMachineRequest(raw json.RawMessage) (createMachineRequest, error) {
+	var input createMachineRequest
+	if err := json.Unmarshal(raw, &input); err != nil {
+		return createMachineRequest{}, fmt.Errorf("parse create_machine request: %w", err)
+	}
+	if input.MachinePoolID != "" {
+		if _, err := publicid.Decode(publicid.KindMachinePool, input.MachinePoolID); err != nil {
+			return createMachineRequest{}, fmt.Errorf("machine_pool_id must be a valid public machine pool ID: %w", err)
+		}
+	}
+	return input, nil
+}
+
+func agentConfigIDForModelContext(
+	ctx context.Context,
+	reader *executionstore.ToolCallReader,
+	modelCallContextID uuid.UUID,
+) (uuid.UUID, error) {
+	contextRecord, found, err := reader.GetModelCallContext(ctx, modelCallContextID)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	if !found {
+		return uuid.Nil, fmt.Errorf("model call context not found: %w", storeerr.ErrNotFound)
+	}
+	return contextRecord.AgentConfigID, nil
+}
+
+func machineCreateAuthorizationInput(
+	machinePoolID uuid.UUID,
+	input createMachineRequest,
+) (json.RawMessage, error) {
+	poolID, err := publicid.Encode(publicid.KindMachinePool, machinePoolID)
+	if err != nil {
+		return nil, err
+	}
+	return marshalJSON(createMachineRequest{MachinePoolID: poolID, CPU: input.CPU, MemoryMB: input.MemoryMB})
+}
+
+func machineObservationAuthorizationInput(
+	mode machineObservationMode,
+	machineID string,
+) (json.RawMessage, error) {
+	return marshalJSON(machineObservationAuthorization{
+		Mode:      mode,
+		MachineID: machineID,
+	})
+}
+
+func selectPoolForMachineCreate(
+	sources []executionstore.MachinePoolSourceRecord,
+	input createMachineRequest,
+) (executionstore.MachinePoolSourceRecord, error) {
+	if input.MachinePoolID != "" {
+		poolID, err := publicid.Decode(publicid.KindMachinePool, input.MachinePoolID)
+		if err != nil {
+			return executionstore.MachinePoolSourceRecord{}, err
+		}
+		for _, source := range sources {
+			if source.MachinePoolID == poolID {
+				return source, validateCreateMachineOverrides(source, input)
+			}
+		}
+		return executionstore.MachinePoolSourceRecord{}, errors.New(
+			"machine_pool_id is not available to this agent; use list_machines to discover pools",
+		)
+	}
+	switch len(sources) {
+	case 0:
+		return executionstore.MachinePoolSourceRecord{}, errors.New("no machine pools are configured for this agent")
+	case 1:
+		return sources[0], validateCreateMachineOverrides(sources[0], input)
+	default:
+		return executionstore.MachinePoolSourceRecord{}, errors.New(
+			"machine_pool_id is required when multiple machine pools are available; use list_machines to discover pools",
+		)
+	}
+}
+
+func validateCreateMachineOverrides(source executionstore.MachinePoolSourceRecord, input createMachineRequest) error {
+	for _, resource := range []struct {
+		name            string
+		value, min, max *int
+	}{
+		{"cpu", input.CPU, source.MinCPU, source.MaxCPU},
+		{"memory_mb", input.MemoryMB, source.MinMemoryMB, source.MaxMemoryMB},
+	} {
+		if resource.value == nil {
+			continue
+		}
+		if !slices.Contains(source.SupportedOverrides, resource.name) {
+			return fmt.Errorf("machine pool does not support %s overrides", resource.name)
+		}
+		if resource.min != nil && *resource.value < *resource.min {
+			return fmt.Errorf("%s must be at least %d for this machine pool", resource.name, *resource.min)
+		}
+		if resource.max != nil && *resource.value > *resource.max {
+			return fmt.Errorf("%s must be at most %d for this machine pool", resource.name, *resource.max)
+		}
+	}
+	return nil
+}
+
+func resolveOptionalMachineID(raw json.RawMessage) (uuid.UUID, error) {
+	if len(raw) == 0 {
+		return uuid.Nil, nil
+	}
+	var value *string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return uuid.Nil, fmt.Errorf("parse machine_id: %w", err)
+	}
+	if value == nil {
+		return uuid.Nil, errors.New("machine_id cannot be null")
+	}
+	id, err := publicid.Decode(publicid.KindMachine, *value)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("machine_id must be a valid public machine ID: %w", err)
+	}
+	return id, nil
+}
+
+func resolveMachineIDRequest(raw json.RawMessage, optional bool) (uuid.UUID, error) {
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return uuid.Nil, fmt.Errorf("parse machine request: %w", err)
+	}
+	for field := range body {
+		if field != "machine_id" {
+			return uuid.Nil, fmt.Errorf("machine request has unsupported field \"%s\"", field)
+		}
+	}
+	machineID, err := resolveOptionalMachineID(body["machine_id"])
+	if err != nil {
+		return uuid.Nil, err
+	}
+	if machineID == uuid.Nil && !optional {
+		return uuid.Nil, errors.New("machine_id is required")
+	}
+	return machineID, nil
+}
+
+func selectOnlyMachine[T any](machines []T) (T, error) {
+	var zero T
+	switch len(machines) {
+	case 0:
+		return zero, ErrNoMachine
+	case 1:
+		return machines[0], nil
+	default:
+		return zero, ErrMachineSelectionRequired
+	}
+}
+
+type machineObservationPayload struct {
+	MachineID              string    `json:"machine_id"`
+	SourceKind             string    `json:"source_kind,omitempty"`
+	BindingKind            string    `json:"binding_kind,omitempty"`
+	BindingState           string    `json:"binding_state"`
+	DisplayName            string    `json:"display_name,omitempty"`
+	MachinePoolID          string    `json:"machine_pool_id,omitempty"`
+	MachinePoolName        string    `json:"machine_pool_name,omitempty"`
+	CPU                    *int      `json:"cpu,omitempty"`
+	MemoryMB               *int      `json:"memory_mb,omitempty"`
+	LifecycleState         string    `json:"lifecycle_state"`
+	ConnectionState        string    `json:"connection_state"`
+	ConnectionStateReason  string    `json:"connection_state_reason,omitempty"`
+	Description            string    `json:"description"`
+	Cwd                    string    `json:"cwd"`
+	Executable             bool      `json:"executable"`
+	ProjectGrantMissing    bool      `json:"project_grant_missing,omitempty"`
+	LifecycleReasonCode    string    `json:"lifecycle_reason_code"`
+	LifecycleReasonMessage string    `json:"lifecycle_reason_message"`
+	CreatedAt              time.Time `json:"created_at"`
+	UpdatedAt              time.Time `json:"updated_at"`
+}
+
+type machineListResult struct {
+	Machines     []machineObservationPayload `json:"machines"`
+	MachinePools []machinePoolPayload        `json:"machine_pools"`
+	listing.OffsetPage
+}
+
+type machinePoolPayload struct {
+	MachinePoolID      string   `json:"machine_pool_id"`
+	MachinePoolName    string   `json:"machine_pool_name"`
+	Description        string   `json:"description,omitempty"`
+	SupportedOverrides []string `json:"supported_overrides"`
+	DefaultCPU         *int     `json:"default_cpu,omitempty"`
+	DefaultMemoryMB    *int     `json:"default_memory_mb,omitempty"`
+	MinCPU             *int     `json:"min_cpu,omitempty"`
+	MaxCPU             *int     `json:"max_cpu,omitempty"`
+	MinMemoryMB        *int     `json:"min_memory_mb,omitempty"`
+	MaxMemoryMB        *int     `json:"max_memory_mb,omitempty"`
+}
+
+type machineInspectionPayload struct {
+	machineObservationPayload
+	FailureReport json.RawMessage `json:"failure_report,omitempty"`
+}
+
+type machineProvisioningAcceptedPayload struct {
+	machineObservationPayload
+	Created bool `json:"created"`
+	Ready   bool `json:"ready"`
+}
+
+type machineDeletionAcceptedPayload struct {
+	machineObservationPayload
+	Deleted            bool `json:"deleted"`
+	DeletionInProgress bool `json:"deletion_in_progress"`
+}
+
+func machineProvisioningAcceptedResult(
+	record executionstore.PoolMachineRecord,
+) (toolResultContent, error) {
+	payload, err := machineObservation(record)
+	if err != nil {
+		return toolResultContent{}, err
+	}
+	payload.CPU = record.Machine.CPU
+	payload.MemoryMB = record.Machine.MemoryMB
+	return structuredToolResultContent(machineProvisioningAcceptedPayload{
+		machineObservationPayload: payload,
+		Created:                   true,
+		Ready:                     false,
+	})
+}
+
+func machineDeletionAcceptedResult(
+	record executionstore.PoolMachineRecord,
+) (toolResultContent, error) {
+	payload, err := machineObservation(record)
+	if err != nil {
+		return toolResultContent{}, err
+	}
+	return structuredToolResultContent(machineDeletionAcceptedPayload{
+		machineObservationPayload: payload,
+		Deleted:                   false,
+		DeletionInProgress:        true,
+	})
+}
+
+func machineObservation(record executionstore.PoolMachineRecord) (machineObservationPayload, error) {
+	machineID, err := publicid.Encode(publicid.KindMachine, record.Machine.ID)
+	if err != nil {
+		return machineObservationPayload{}, err
+	}
+	var poolID string
+	if record.Machine.MachinePoolID != uuid.Nil {
+		poolID, err = publicid.Encode(publicid.KindMachinePool, record.Machine.MachinePoolID)
+		if err != nil {
+			return machineObservationPayload{}, err
+		}
+	}
+	cwd := record.Binding.Cwd
+	if cwd == "" {
+		cwd = record.Machine.Cwd
+	}
+	return machineObservationPayload{
+		MachineID:              machineID,
+		SourceKind:             string(record.Machine.SourceKind),
+		BindingKind:            string(record.Binding.BindingKind),
+		BindingState:           string(record.Binding.State),
+		DisplayName:            record.Machine.DisplayName,
+		MachinePoolID:          poolID,
+		MachinePoolName:        record.MachinePoolName,
+		LifecycleState:         string(record.Machine.LifecycleState),
+		ConnectionState:        string(record.Machine.ConnectionState),
+		ConnectionStateReason:  record.Machine.ConnectionStateReason,
+		Description:            record.Binding.Description,
+		Cwd:                    cwd,
+		Executable:             machineExecutable(record),
+		LifecycleReasonCode:    record.Machine.LifecycleReasonCode,
+		LifecycleReasonMessage: record.Machine.LifecycleReasonMessage,
+		CreatedAt:              record.Binding.CreatedAt,
+		UpdatedAt:              record.Binding.UpdatedAt,
+	}, nil
+}
+
+func agentMachineObservation(
+	record executionstore.AgentMachineObservationRecord,
+) (machineObservationPayload, error) {
+	machineID, err := publicid.Encode(publicid.KindMachine, record.MachineID)
+	if err != nil {
+		return machineObservationPayload{}, err
+	}
+	payload := machineObservationPayload{
+		MachineID:           machineID,
+		BindingKind:         string(record.BindingKind),
+		BindingState:        string(record.BindingState),
+		Description:         record.Description,
+		Executable:          record.Executable,
+		ProjectGrantMissing: record.ProjectGrantMissing,
+		CreatedAt:           record.BindingCreatedAt,
+		UpdatedAt:           record.BindingUpdatedAt,
+	}
+	if record.ProjectGrantMissing {
+		return payload, nil
+	}
+	if record.MachinePoolID != uuid.Nil {
+		payload.MachinePoolID, err = publicid.Encode(publicid.KindMachinePool, record.MachinePoolID)
+		if err != nil {
+			return machineObservationPayload{}, err
+		}
+	}
+	payload.CPU = record.CPU
+	payload.MemoryMB = record.MemoryMB
+	payload.SourceKind = string(record.SourceKind)
+	payload.DisplayName = record.DisplayName
+	payload.MachinePoolName = record.MachinePoolName
+	payload.LifecycleState = string(record.LifecycleState)
+	payload.ConnectionState = string(record.ConnectionState)
+	payload.ConnectionStateReason = record.ConnectionStateReason
+	payload.Cwd = record.Cwd
+	payload.LifecycleReasonCode = record.LifecycleReasonCode
+	payload.LifecycleReasonMessage = record.LifecycleReasonMessage
+	return payload, nil
+}
+
+func agentMachineInspection(
+	record executionstore.AgentMachineObservationRecord,
+) (machineInspectionPayload, error) {
+	observation, err := agentMachineObservation(record)
+	if err != nil {
+		return machineInspectionPayload{}, err
+	}
+	payload := machineInspectionPayload{
+		machineObservationPayload: observation,
+	}
+	if !record.ProjectGrantMissing {
+		payload.FailureReport = record.FailureReport
+	}
+	return payload, nil
+}
+
+func machineExecutable(record executionstore.PoolMachineRecord) bool {
+	return record.Binding.State == executionstore.AgentMachineBindingStateAttached &&
+		record.Machine.LifecycleState == executionstore.MachineLifecycleStateActive &&
+		(record.Machine.ConnectionState == executionstore.MachineConnectionStateOnline ||
+			record.Machine.ConnectionState == executionstore.MachineConnectionStateAsleep)
+}
+
+func failMachineTransaction(
+	code string,
+	cause error,
+	retryable bool,
+) (transactionalPhaseResult, error) {
+	return failMachineTransactionWithMessage(code, cause.Error(), cause, retryable)
+}
+
+func failMachineTransactionWithMessage(
+	code, message string,
+	cause error,
+	retryable bool,
+) (transactionalPhaseResult, error) {
+	content, err := toolFailureContent(code, message, retryable)
+	if err != nil {
+		return nil, fmt.Errorf("marshal machine tool failure: %w", err)
+	}
+	return failInTransaction(content, cause), nil
+}
+
+func failMachineTransactionForStorageError(
+	code string,
+	cause error,
+	retryable bool,
+) (transactionalPhaseResult, error) {
+	if errors.Is(cause, storeerr.ErrManagedWorkAdmissionDenied) {
+		return failMachineTransactionWithMessage(
+			storeerr.ManagedWorkAdmissionDeniedCode,
+			storeerr.InsufficientOmnaraCreditsMessage,
+			cause,
+			false,
+		)
+	}
+	if !errors.Is(cause, storeerr.ErrInvalidRequest) &&
+		!errors.Is(cause, storeerr.ErrNotFound) &&
+		!errors.Is(cause, storeerr.ErrStateTransitionConflict) {
+		return nil, cause
+	}
+	return failMachineTransaction(code, cause, retryable)
+}
+
+func toolFailureContent(
+	code, message string,
+	retryable bool,
+) (toolResultContent, error) {
+	return structuredToolResultContent(
+		map[string]any{"error_code": code, "error": message, "retryable": retryable},
+	)
+}

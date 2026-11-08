@@ -1,0 +1,417 @@
+package executionstore
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/omnara-ai/omnara/internal/dbsafe"
+	"github.com/omnara-ai/omnara/internal/resourcemeta"
+	"github.com/omnara-ai/omnara/internal/storage/internal/dbsqlc"
+	"github.com/omnara-ai/omnara/internal/storage/internal/lifecyclelock"
+	"github.com/omnara-ai/omnara/internal/storage/internal/storeutil"
+	"github.com/omnara-ai/omnara/internal/storage/listing"
+	"github.com/omnara-ai/omnara/internal/storage/storeerr"
+)
+
+type ActorProvider string
+
+const (
+	ActorProviderOmnara      ActorProvider = "omnara"
+	ActorProviderIntegration ActorProvider = "integration"
+	ActorProviderExternal    ActorProvider = "external"
+)
+
+type ActorRecord struct {
+	ID               uuid.UUID       `json:"id"`
+	ProjectID        uuid.UUID       `json:"project_id"`
+	Provider         ActorProvider   `json:"provider"`
+	ProviderTenantID string          `json:"provider_tenant_id,omitempty"`
+	ProviderUserID   string          `json:"provider_user_id"`
+	DisplayName      string          `json:"display_name"`
+	Metadata         json.RawMessage `json:"metadata"`
+	CreatedAt        time.Time       `json:"created_at"`
+	UpdatedAt        time.Time       `json:"updated_at"`
+}
+
+type UpsertActorIdentityInput struct {
+	ProjectID        uuid.UUID
+	Provider         ActorProvider
+	ProviderTenantID string
+	ProviderUserID   string
+	DisplayName      string
+	Metadata         resourcemeta.Metadata
+}
+
+func upsertActorIdentityTx(
+	ctx context.Context,
+	qtx *dbsqlc.Queries,
+	input UpsertActorIdentityInput,
+) (ActorRecord, error) {
+	provider := ActorProvider(strings.TrimSpace(string(input.Provider)))
+	providerTenantID := strings.TrimSpace(input.ProviderTenantID)
+	providerUserID := strings.TrimSpace(input.ProviderUserID)
+	if input.ProjectID == uuid.Nil || provider == "" || providerUserID == "" {
+		return ActorRecord{}, errors.New("project, provider, and provider user id are required")
+	}
+	if provider != ActorProviderExternal && providerTenantID == "" {
+		return ActorRecord{}, errors.New("provider tenant id is required for non-external actors")
+	}
+	if err := validateActorText(providerTenantID, providerUserID, input.DisplayName); err != nil {
+		return ActorRecord{}, err
+	}
+	metadata, err := input.Metadata.JSON()
+	if err != nil {
+		return ActorRecord{}, err
+	}
+	displayName := strings.TrimSpace(input.DisplayName)
+	identity := dbsqlc.GetActorByIdentityParams{
+		ProjectID:        input.ProjectID,
+		Provider:         string(provider),
+		ProviderTenantID: storeutil.TextFromEmpty(providerTenantID),
+		ProviderUserID:   providerUserID,
+	}
+	row, err := qtx.GetActorByIdentity(ctx, identity)
+	if err == nil && (displayName == "" || stringFromSQLCText(row.DisplayName) == displayName) {
+		unchanged := true
+		if len(input.Metadata) > 0 {
+			var stored resourcemeta.Metadata
+			if err := json.Unmarshal(row.Metadata, &stored); err != nil {
+				return ActorRecord{}, fmt.Errorf("decode actor metadata: %w", err)
+			}
+			for key, value := range input.Metadata {
+				if previous, exists := stored[key]; !exists || previous != value {
+					unchanged = false
+					break
+				}
+			}
+		}
+		if unchanged {
+			return actorRecordFromSQLC(row), nil
+		}
+	}
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return ActorRecord{}, fmt.Errorf("upsert actor: %w", err)
+	}
+	row, err = qtx.UpsertActorIdentity(ctx, dbsqlc.UpsertActorIdentityParams{
+		ProjectID:        input.ProjectID,
+		Provider:         string(provider),
+		ProviderTenantID: storeutil.TextFromEmpty(providerTenantID),
+		ProviderUserID:   providerUserID,
+		DisplayName:      displayName,
+		Metadata:         metadata,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		row, err = qtx.GetActorByIdentity(ctx, identity)
+	}
+	if err != nil {
+		return ActorRecord{}, fmt.Errorf("upsert actor: %w", err)
+	}
+	return actorRecordFromSQLC(row), nil
+}
+
+type PutActorInput struct {
+	ProjectID        uuid.UUID
+	ProviderTenantID string
+	ProviderUserID   string
+	// DisplayName and Metadata overwrite the stored attributes only when
+	// set, including when set to an empty value; when unset the stored
+	// values are kept.
+	DisplayName *string
+	Metadata    resourcemeta.Metadata
+}
+
+const (
+	// MaxActorProviderTenantIDLength bounds actor provider tenant ids, in characters.
+	MaxActorProviderTenantIDLength = 128
+	// MaxActorProviderUserIDLength bounds actor provider user ids, in characters.
+	MaxActorProviderUserIDLength = 128
+	// MaxActorDisplayNameLength bounds actor display names, in characters.
+	MaxActorDisplayNameLength = 256
+)
+
+// PutActor upserts an external actor by (provider_tenant_id,
+// provider_user_id). Unset attributes keep their stored values, set
+// attributes are overwritten, and an unchanged actor is not rewritten.
+func (s *Store) PutActor(ctx context.Context, input PutActorInput) (ActorRecord, error) {
+	if err := validatePutActorInput(input); err != nil {
+		return ActorRecord{}, err
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return ActorRecord{}, fmt.Errorf("begin put actor: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := dbsqlc.New(tx)
+	if err := enterActiveActorProjectTx(ctx, tx, qtx, input.ProjectID); err != nil {
+		return ActorRecord{}, err
+	}
+	record, err := putActorTx(ctx, qtx, input)
+	if err != nil {
+		return ActorRecord{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ActorRecord{}, fmt.Errorf("commit put actor: %w", err)
+	}
+	return record, nil
+}
+
+func enterActiveActorProjectTx(
+	ctx context.Context,
+	tx dbsqlc.DBTX,
+	qtx *dbsqlc.Queries,
+	projectID uuid.UUID,
+) error {
+	project, err := loadProjectTx(ctx, qtx, projectID)
+	if err != nil {
+		return err
+	}
+	return lifecyclelock.EnterActiveProject(ctx, tx, project.OrgID, projectID)
+}
+
+func putActorTx(ctx context.Context, q *dbsqlc.Queries, input PutActorInput) (ActorRecord, error) {
+	if err := validatePutActorInput(input); err != nil {
+		return ActorRecord{}, err
+	}
+	providerTenantID := strings.TrimSpace(input.ProviderTenantID)
+	providerUserID := strings.TrimSpace(input.ProviderUserID)
+	displayName := ""
+	if input.DisplayName != nil {
+		displayName = strings.TrimSpace(*input.DisplayName)
+	}
+	metadataSet := input.Metadata != nil
+	metadata, err := input.Metadata.JSON()
+	if err != nil {
+		return ActorRecord{}, err
+	}
+	row, err := q.PutActor(ctx, dbsqlc.PutActorParams{
+		ProjectID:        input.ProjectID,
+		ProviderTenantID: storeutil.TextFromEmpty(providerTenantID),
+		ProviderUserID:   providerUserID,
+		DisplayName:      displayName,
+		DisplayNameSet:   input.DisplayName != nil,
+		Metadata:         metadata,
+		MetadataSet:      metadataSet,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The actor exists and nothing changed, so the upsert skipped the
+		// write; read the current row instead.
+		row, err = q.GetActorByIdentity(ctx, dbsqlc.GetActorByIdentityParams{
+			ProjectID:        input.ProjectID,
+			Provider:         string(ActorProviderExternal),
+			ProviderTenantID: storeutil.TextFromEmpty(providerTenantID),
+			ProviderUserID:   providerUserID,
+		})
+	}
+	if err != nil {
+		return ActorRecord{}, fmt.Errorf("put actor: %w", err)
+	}
+	return actorRecordFromSQLC(row), nil
+}
+
+func validatePutActorInput(input PutActorInput) error {
+	providerTenantID := strings.TrimSpace(input.ProviderTenantID)
+	providerUserID := strings.TrimSpace(input.ProviderUserID)
+	if input.ProjectID == uuid.Nil {
+		return errors.New("project is required")
+	}
+	if providerUserID == "" {
+		return fmt.Errorf("%w: provider user id is required", storeerr.ErrInvalidActorRequest)
+	}
+	if utf8.RuneCountInString(providerTenantID) > MaxActorProviderTenantIDLength {
+		return fmt.Errorf(
+			"%w: provider tenant id must be at most %d characters",
+			storeerr.ErrInvalidActorRequest, MaxActorProviderTenantIDLength,
+		)
+	}
+	if utf8.RuneCountInString(providerUserID) > MaxActorProviderUserIDLength {
+		return fmt.Errorf(
+			"%w: provider user id must be at most %d characters",
+			storeerr.ErrInvalidActorRequest, MaxActorProviderUserIDLength,
+		)
+	}
+	displayName := ""
+	if input.DisplayName != nil {
+		displayName = strings.TrimSpace(*input.DisplayName)
+	}
+	if err := validateActorText(providerTenantID, providerUserID, displayName); err != nil {
+		return err
+	}
+	if utf8.RuneCountInString(displayName) > MaxActorDisplayNameLength {
+		return fmt.Errorf(
+			"%w: display name must be at most %d characters",
+			storeerr.ErrInvalidActorRequest, MaxActorDisplayNameLength,
+		)
+	}
+	if input.Metadata != nil {
+		if err := input.Metadata.Validate(); err != nil {
+			return fmt.Errorf("%w: %w", storeerr.ErrInvalidActorRequest, err)
+		}
+	}
+	return nil
+}
+
+func validateActorText(tenantID, userID, displayName string) error {
+	for _, field := range []struct{ name, value string }{
+		{"provider tenant id", tenantID},
+		{"provider user id", userID},
+		{"display name", displayName},
+	} {
+		if err := dbsafe.Text(field.value); err != nil {
+			return fmt.Errorf("%w: %s %w", storeerr.ErrInvalidActorRequest, field.name, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) GetActor(ctx context.Context, projectID, actorID uuid.UUID) (ActorRecord, error) {
+	if projectID == uuid.Nil || actorID == uuid.Nil {
+		return ActorRecord{}, errors.New("project and actor are required")
+	}
+	row, err := s.q.GetActor(ctx, dbsqlc.GetActorParams{ProjectID: projectID, ID: actorID})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ActorRecord{}, storeerr.ErrNotFound
+		}
+		return ActorRecord{}, fmt.Errorf("get actor: %w", err)
+	}
+	return actorRecordFromSQLC(row), nil
+}
+
+type ListActorsInput struct {
+	ProjectID        uuid.UUID
+	Provider         ActorProvider
+	ProviderTenantID string
+	ProviderUserID   string
+	After            listing.KeysetCursor
+	Limit            int
+}
+
+func (s *Store) ListActors(ctx context.Context, input ListActorsInput) ([]ActorRecord, error) {
+	if input.ProjectID == uuid.Nil {
+		return nil, errors.New("project is required")
+	}
+	limit := input.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	var cursorCreatedAt *time.Time
+	var cursorID *uuid.UUID
+	if input.After.Set {
+		cursorCreatedAt = &input.After.CreatedAt
+		cursorID = &input.After.ID
+	}
+	rows, err := s.q.ListActors(ctx, dbsqlc.ListActorsParams{
+		ProjectID:        input.ProjectID,
+		Provider:         strings.TrimSpace(string(input.Provider)),
+		ProviderTenantID: strings.TrimSpace(input.ProviderTenantID),
+		ProviderUserID:   strings.TrimSpace(input.ProviderUserID),
+		CursorCreatedAt:  cursorCreatedAt,
+		CursorID:         cursorID,
+		RowLimit:         int64(limit),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list actors: %w", err)
+	}
+	records := make([]ActorRecord, 0, len(rows))
+	for _, row := range rows {
+		records = append(records, actorRecordFromSQLC(row))
+	}
+	return records, nil
+}
+
+func (s *Store) ListActorDisplayNames(
+	ctx context.Context,
+	projectID uuid.UUID,
+	provider ActorProvider,
+	providerTenantID string,
+	providerUserIDs []string,
+) (map[string]string, error) {
+	if projectID == uuid.Nil || provider == "" {
+		return nil, errors.New("project and provider are required")
+	}
+	if len(providerUserIDs) == 0 {
+		return map[string]string{}, nil
+	}
+	rows, err := s.q.ListActorDisplayNames(
+		ctx,
+		dbsqlc.ListActorDisplayNamesParams{
+			ProjectID:        projectID,
+			Provider:         string(provider),
+			ProviderTenantID: storeutil.TextFromEmpty(providerTenantID),
+			ProviderUserIds:  providerUserIDs,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list actor display names: %w", err)
+	}
+	names := make(map[string]string, len(rows))
+	for _, row := range rows {
+		names[row.ProviderUserID] = row.DisplayName
+	}
+	return names, nil
+}
+
+type UpdateActorDisplayNameInput struct {
+	ProjectID        uuid.UUID
+	Provider         ActorProvider
+	ProviderTenantID string
+	ProviderUserID   string
+	DisplayName      string
+}
+
+func (s *Store) UpdateActorDisplayName(
+	ctx context.Context,
+	input UpdateActorDisplayNameInput,
+) error {
+	if input.ProjectID == uuid.Nil || input.Provider == "" || input.ProviderUserID == "" ||
+		strings.TrimSpace(input.DisplayName) == "" {
+		return errors.New("project, provider, provider user id, and display name are required")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin update actor display name: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := dbsqlc.New(tx)
+	if err := enterActiveActorProjectTx(ctx, tx, qtx, input.ProjectID); err != nil {
+		return err
+	}
+	_, err = qtx.UpdateActorDisplayName(
+		ctx,
+		dbsqlc.UpdateActorDisplayNameParams{
+			ProjectID:        input.ProjectID,
+			Provider:         string(input.Provider),
+			ProviderTenantID: storeutil.TextFromEmpty(input.ProviderTenantID),
+			ProviderUserID:   input.ProviderUserID,
+			DisplayName:      strings.TrimSpace(input.DisplayName),
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("update actor display name: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit update actor display name: %w", err)
+	}
+	return nil
+}
+
+func actorRecordFromSQLC(row dbsqlc.Actor) ActorRecord {
+	return ActorRecord{
+		ID:               row.ID,
+		ProjectID:        row.ProjectID,
+		Provider:         ActorProvider(row.Provider),
+		ProviderTenantID: stringFromSQLCText(row.ProviderTenantID),
+		ProviderUserID:   row.ProviderUserID,
+		DisplayName:      stringFromSQLCText(row.DisplayName),
+		Metadata:         row.Metadata,
+		CreatedAt:        row.CreatedAt,
+		UpdatedAt:        row.UpdatedAt,
+	}
+}

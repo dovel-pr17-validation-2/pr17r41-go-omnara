@@ -1,0 +1,343 @@
+//go:build integration
+
+package executionstore_test
+
+import (
+	"context"
+	"encoding/json"
+	"maps"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/omnara-ai/omnara/internal/jsoncanonical"
+	"github.com/omnara-ai/omnara/internal/machinepool/provideroptions"
+	"github.com/omnara-ai/omnara/internal/publicid"
+	"github.com/omnara-ai/omnara/internal/secrets"
+	"github.com/omnara-ai/omnara/internal/storage"
+	"github.com/omnara-ai/omnara/internal/storage/executionstore"
+	"github.com/omnara-ai/omnara/internal/storage/identitystore"
+	"github.com/omnara-ai/omnara/internal/storage/internal/dbsqlc"
+	"github.com/omnara-ai/omnara/internal/testutil/integrationdb"
+	"github.com/omnara-ai/omnara/internal/testutil/storagetest"
+	"github.com/omnara-ai/omnara/internal/toolpermission"
+)
+
+type Store struct {
+	*storage.Store
+	pool *pgxpool.Pool
+	q    *dbsqlc.Queries
+}
+
+type IdentityStore struct {
+	*identitystore.Store
+	pool *pgxpool.Pool
+}
+
+func TestMain(m *testing.M) {
+	integrationdb.RunTestMain(m)
+}
+
+func newIntegrationKeyWrapper() secrets.KeyWrapper {
+	keyWrapper, err := secrets.NewLocalKeyWrapper(
+		"storage-integration-key",
+		map[string][]byte{
+			"storage-integration-key": []byte("0123456789abcdef0123456789abcdef"),
+		},
+	)
+	if err != nil {
+		panic(err)
+	}
+	return keyWrapper
+}
+
+func newIntegrationStore(pool *pgxpool.Pool, opts ...storage.Option) *Store {
+	allOpts := make([]storage.Option, 0, len(opts)+1)
+	allOpts = append(allOpts, storage.WithSecretKeyWrapper(newIntegrationKeyWrapper()))
+	allOpts = append(allOpts, opts...)
+	return NewStore(pool, allOpts...)
+}
+
+func NewStore(pool *pgxpool.Pool, opts ...storage.Option) *Store {
+	return &Store{
+		Store: storage.NewStore(pool, opts...),
+		pool:  pool,
+		q:     dbsqlc.New(pool),
+	}
+}
+
+func (s *Store) Identity() *IdentityStore {
+	return &IdentityStore{Store: s.Store.Identity(), pool: s.pool}
+}
+
+func (s *IdentityStore) CreateVerifiedUser(
+	ctx context.Context,
+	input storagetest.CreateVerifiedUserInput,
+) (identitystore.UserRecord, error) {
+	return storagetest.CreateVerifiedUser(ctx, s.pool, input)
+}
+
+func newSecretIntegrationKeyWrapper() secrets.KeyWrapper {
+	keyWrapper, err := secrets.NewLocalKeyWrapper(
+		"test-key",
+		map[string][]byte{"test-key": []byte("0123456789abcdef0123456789abcdef")},
+	)
+	if err != nil {
+		panic(err)
+	}
+	return keyWrapper
+}
+
+func newSecretIntegrationStore(pool *pgxpool.Pool, opts ...storage.Option) *Store {
+	allOpts := []storage.Option{
+		storage.WithSecretKeyWrapper(newSecretIntegrationKeyWrapper()),
+		storage.WithMachinePoolProviders(mergingMachinePoolProviders{}),
+	}
+	allOpts = append(allOpts, opts...)
+	return newIntegrationStore(pool, allOpts...)
+}
+
+func createSecretTestUser(
+	t *testing.T,
+	ctx context.Context,
+	store *Store,
+	name, orgRole string,
+) identitystore.UserRecord {
+	t.Helper()
+	user, err := store.Identity().CreateUser(
+		ctx,
+		identitystore.CreateUserInput{DisplayName: name},
+	)
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if _, err := store.Identity().AddOrgMembership(
+		ctx,
+		identitystore.AddOrgMembershipInput{
+			OrgID:  testOrgID,
+			UserID: user.ID,
+			Role:   orgRole,
+		},
+	); err != nil {
+		t.Fatalf("add org membership: %v", err)
+	}
+	return user
+}
+
+func waitForDatabaseTime(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	target time.Time,
+) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `SELECT pg_sleep_until($1)`, target); err != nil {
+		t.Fatalf("wait for database time: %v", err)
+	}
+}
+
+func userPrincipal(id uuid.UUID) identitystore.PrincipalRecord {
+	return identitystore.PrincipalRecord{Type: identitystore.PrincipalTypeUser, ID: id}
+}
+
+func normalizedJSON(value json.RawMessage) json.RawMessage {
+	if len(value) == 0 {
+		return json.RawMessage(`{}`)
+	}
+	return value
+}
+
+func sameJSON(a, b json.RawMessage) bool {
+	return jsoncanonical.Equal(a, b)
+}
+
+func assertJSONRawEqual(t *testing.T, got json.RawMessage, want string) {
+	t.Helper()
+	if !sameJSON(got, json.RawMessage(want)) {
+		t.Fatalf("json = %s, want %s", got, want)
+	}
+}
+
+type mergingMachinePoolProviders struct{}
+
+func (mergingMachinePoolProviders) ResolveMachineProviderOptions(
+	_ string,
+	defaultOptions map[string]json.RawMessage,
+	projectOptions map[string]json.RawMessage,
+	agentOptions map[string]json.RawMessage,
+) (map[string]json.RawMessage, error) {
+	return provideroptions.Merge(defaultOptions, projectOptions, agentOptions), nil
+}
+
+func (mergingMachinePoolProviders) ValidatePool(
+	_ string,
+	_ executionstore.MachinePoolProviderPolicy,
+) error {
+	return nil
+}
+
+func (providers mergingMachinePoolProviders) BuildMachineProvisioningIntent(
+	provider string,
+	policy executionstore.MachinePoolProviderPolicy,
+	machineProvisioning executionstore.MachineProvisioningConfig,
+) (executionstore.MachineProvisioningConfig, error) {
+	if err := providers.ValidatePool(provider, policy); err != nil {
+		return executionstore.MachineProvisioningConfig{}, err
+	}
+	return machineProvisioning, nil
+}
+
+func testMachineProvisioning(
+	t *testing.T,
+	cpu int,
+	memoryMB int,
+	providerOptions map[string]any,
+) executionstore.MachineProvisioningConfig {
+	t.Helper()
+	rawProviderOptions := make(map[string]json.RawMessage, len(providerOptions))
+	for key, value := range providerOptions {
+		rawProviderOptions[key] = mustTestRawJSON(t, value)
+	}
+	return executionstore.MachineProvisioningConfig{
+		CPU:             &cpu,
+		MemoryMB:        &memoryMB,
+		ProviderOptions: rawProviderOptions,
+	}
+}
+
+func requireMachineProvisioningForTest(
+	t *testing.T,
+	got executionstore.MachineProvisioningConfig,
+	want executionstore.MachineProvisioningConfig,
+) {
+	t.Helper()
+	if diff := cmp.Diff(want.CPU, got.CPU); diff != "" {
+		t.Fatalf("machine provisioning cpu (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff(want.MemoryMB, got.MemoryMB); diff != "" {
+		t.Fatalf("machine provisioning memory_mb (-want +got):\n%s", diff)
+	}
+	if len(got.ProviderOptions) != len(want.ProviderOptions) {
+		t.Fatalf(
+			"machine provisioning provider_options keys = %v, want %v",
+			slices.Sorted(maps.Keys(got.ProviderOptions)), slices.Sorted(maps.Keys(want.ProviderOptions)),
+		)
+	}
+	for key, wantValue := range want.ProviderOptions {
+		if !sameJSON(got.ProviderOptions[key], wantValue) {
+			t.Fatalf(
+				"machine provisioning provider_options[%s] = %s, want %s",
+				key,
+				got.ProviderOptions[key],
+				wantValue,
+			)
+		}
+	}
+}
+
+func requireMachineEnvironmentForTest(
+	t *testing.T,
+	got, want executionstore.MachineEnvironment,
+) {
+	t.Helper()
+	if diff := cmp.Diff(want, got, cmpopts.EquateEmpty()); diff != "" {
+		t.Fatalf("machine environment (-want +got):\n%s", diff)
+	}
+}
+
+func mustTestRawJSON(t *testing.T, value any) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal json: %v", err)
+	}
+	return raw
+}
+
+func provisionDefaultMachinePoolGrantsForProject(
+	ctx context.Context,
+	store *Store,
+	orgID, projectID uuid.UUID,
+) error {
+	tx, err := store.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := store.Execution().ProvisionOrganizationDefaultsTx(ctx, tx, orgID, projectID, nil); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func setManagedWorkAdmissionForTest(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	orgID uuid.UUID,
+	allowed bool,
+) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `
+INSERT INTO org_managed_work_admission(org_id, new_managed_work_allowed)
+VALUES ($1, $2)
+ON CONFLICT (org_id) DO UPDATE
+SET new_managed_work_allowed = EXCLUDED.new_managed_work_allowed
+`, orgID, allowed); err != nil {
+		t.Fatalf("set managed work admission: %v", err)
+	}
+}
+
+func permissionRequestForStorageTest(t *testing.T, toolName string) json.RawMessage {
+	t.Helper()
+	authorization, err := toolpermission.NewAuthorization(
+		toolName,
+		json.RawMessage(`{}`),
+	)
+	if err != nil {
+		t.Fatalf("authorization: %v", err)
+	}
+	mode, ok := toolpermission.FindMode(
+		toolpermission.CommonModeDescriptors(),
+		toolpermission.ModeAlwaysAsk,
+	)
+	if !ok {
+		t.Fatal("always_ask mode missing")
+	}
+	value, err := toolpermission.NewAllowDenyForm("Permission requested", nil)
+	if err != nil {
+		t.Fatalf("interaction form: %v", err)
+	}
+	request, err := toolpermission.NewRequest(
+		mode,
+		toolpermission.DefaultSelection(toolpermission.ModeAlwaysAsk),
+		authorization,
+		value,
+	)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	raw, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	return raw
+}
+
+func publicResourceID(kind publicid.Kind, id uuid.UUID) string {
+	encoded, err := publicid.Encode(kind, id)
+	if err != nil {
+		return ""
+	}
+	return encoded
+}
+
+func (mergingMachinePoolProviders) ConfigurableMachineResources(
+	string,
+) (executionstore.ConfigurableMachineResources, error) {
+	return executionstore.ConfigurableMachineResources{CPU: true, MemoryMB: true}, nil
+}

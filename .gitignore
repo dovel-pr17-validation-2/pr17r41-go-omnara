@@ -1,0 +1,30 @@
+.env
+node_modules/
+examples/**/pnpm-lock.yaml
+examples/**/package-lock.json
+examples/**/deno.lock
+.DS_Store
+.local/
+.tools/
+.cache/
+.claude/
+.idea/
+.unikraft/
+coverage.out
+coverage.html
+tmp/
+mcp-registry-snapshot/
+/bin/
+research/
+plans/
+dist/
+
+# Frontend (frontend/): commit source, ignore deps and build output.
+# frontend/apps/web/dist/.gitkeep is kept so //go:embed all:dist always compiles.
+frontend/apps/web/dist/*
+!frontend/apps/web/dist/.gitkeep
+frontend/apps/web/playwright-report/
+frontend/apps/web/test-results/
+frontend/**/*.tsbuildinfo
+internal/blackbox/*.log
+blackbox-run.log

@@ -1,0 +1,148 @@
+import { useGrantMachineToProject, useMachines, useProjectMachineGrants } from '@omnara/react'
+import { type VisibleMachine } from '@omnara/sdk'
+import { useId } from 'react'
+
+import { machinePoolProviderLabel } from '@/components/org/MachinePoolDialogState'
+import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field'
+import { createResourceMultiCombobox } from '@/components/ui/resource-multi-combobox'
+import { useBatchGrantSubmit } from '@/hooks/use-batch-grant-submit'
+import { useCompleteInfiniteQueryItems } from '@/hooks/use-complete-infinite-query-items'
+import { useInfiniteQueryItems } from '@/hooks/use-infinite-query-items'
+import { useTypeaheadSearch } from '@/hooks/use-resource-list'
+
+const MachineMultiCombobox = createResourceMultiCombobox<VisibleMachine>({
+  itemKey: (machine) => machine.id,
+  itemLabel: (machine) => machine.display_name,
+  renderItem: (machine) => (
+    <span className="flex min-w-0 flex-col">
+      <span className="truncate">{machine.display_name}</span>
+      <span className="text-muted-foreground text-xs">
+        {machinePoolProviderLabel(machine.provider)}
+      </span>
+    </span>
+  ),
+  placeholder: 'Search machines…',
+  emptyMessage: 'No machines to share.',
+})
+
+export function GrantProjectMachineDialog({
+  open,
+  onOpenChange,
+  orgId,
+  projectId,
+  onGranted,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  orgId: string
+  projectId: string
+  onGranted?: (machines: VisibleMachine[]) => void
+}) {
+  const mutation = useGrantMachineToProject(orgId)
+  const batch = useBatchGrantSubmit<VisibleMachine>({
+    label: 'machine',
+    fallbackError: 'Could not share machines',
+    itemKey: (machine) => machine.id,
+    grant: async (machine) => {
+      await mutation.mutateAsync({ projectID: projectId, machineID: machine.id })
+    },
+    onGranted,
+    onSuccess: () => {
+      onOpenChange(false)
+    },
+  })
+  const inputId = useId()
+  const search = useTypeaheadSearch()
+  const machinesQuery = useMachines(orgId, {
+    filters: { source_kind: 'byo', ...search.filters },
+    sort: 'name',
+    pageSize: 25,
+    enabled: open,
+  })
+  const grantsQuery = useProjectMachineGrants(orgId, projectId, {
+    filters: search.filters,
+    sort: 'name',
+    pageSize: 25,
+    enabled: open,
+  })
+  const completeGrants = useCompleteInfiniteQueryItems(grantsQuery, open)
+  const grantedIds = new Set(completeGrants.items.map((item) => item.grant.machine_id))
+  const machines = useInfiniteQueryItems(machinesQuery).filter(
+    (machine) =>
+      machine.source_kind === 'byo' && machine.access.can_manage && !grantedIds.has(machine.id),
+  )
+  const queryError = machinesQuery.isError || grantsQuery.isError
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Share machines</DialogTitle>
+          <DialogDescription>
+            Let this project run agents on an organization BYO machine.
+          </DialogDescription>
+        </DialogHeader>
+        <form onSubmit={(event) => void batch.submit(event)}>
+          <FieldGroup>
+            <Field>
+              <FieldLabel htmlFor={inputId}>Machines</FieldLabel>
+              <MachineMultiCombobox
+                id={inputId}
+                items={machines}
+                value={batch.items}
+                onValueChange={batch.setItems}
+                search={search}
+                query={machinesQuery}
+                pending={machinesQuery.isPending || completeGrants.isPending}
+                disabled={batch.isSubmitting || queryError || !completeGrants.isComplete}
+              />
+              {!queryError && !machinesQuery.isPending && machines.length === 0 && (
+                <FieldDescription>
+                  Every organization BYO machine is already shared, or none exist yet.
+                </FieldDescription>
+              )}
+            </Field>
+            {queryError && (
+              <p className="text-destructive text-sm">
+                Could not load machines.{' '}
+                <button
+                  type="button"
+                  className="underline"
+                  onClick={() => {
+                    void Promise.all([machinesQuery.refetch(), grantsQuery.refetch()])
+                  }}
+                >
+                  Retry
+                </button>
+              </p>
+            )}
+            {batch.errorMessage && <p className="text-destructive text-sm">{batch.errorMessage}</p>}
+            <DialogFooter>
+              <Button
+                type="submit"
+                disabled={
+                  batch.isSubmitting ||
+                  batch.items.length === 0 ||
+                  queryError ||
+                  !completeGrants.isComplete
+                }
+                loading={batch.isSubmitting}
+              >
+                Share machines
+              </Button>
+            </DialogFooter>
+          </FieldGroup>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}

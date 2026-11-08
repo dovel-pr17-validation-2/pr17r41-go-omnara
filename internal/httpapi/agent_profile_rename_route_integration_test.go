@@ -1,0 +1,92 @@
+//go:build integration
+
+package httpapi
+
+import (
+	"context"
+	"net/http"
+	"testing"
+
+	"github.com/omnara-ai/omnara/internal/testutil"
+)
+
+func TestRenameAgentProfileRoute(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+
+	handler := newIntegrationServer(pool)
+
+	project := bootstrapPublicHTTPProject(t, handler, "rename-profile")
+
+	config := createPublicHTTPAgentConfig(
+		t,
+		handler,
+		project,
+		"rename-profile",
+		"yaml",
+		"instruction: Help out.\nmodel:\n  provider_config: openai-prod\n  name: gpt-test\n",
+		project.AdminToken,
+		http.StatusCreated,
+	)
+	profile := createPublicHTTPAgentProfile(
+		t,
+		handler,
+		project,
+		"rename-profile",
+		"Original",
+		testutil.RequireType[string](t, config["id"]),
+		project.AdminToken,
+		http.StatusCreated,
+	)
+	profilePath := project.ProjectPath + "/agent-profiles/" + testutil.RequireType[string](t, profile["id"])
+
+	renamed := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPatch,
+		profilePath,
+		`{"name":"Renamed  研究 🚀"}`,
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	if renamed["name"] != "Renamed  研究 🚀" || renamed["id"] != profile["id"] ||
+		renamed["current_config_id"] != profile["current_config_id"] {
+		t.Fatalf("renamed profile = %+v, want exact name with unchanged config", renamed)
+	}
+
+	for _, body := range []string{`{"name":"   "}`, `{"name":" Renamed"}`} {
+		requestJSONWithHeaders(
+			t,
+			handler,
+			http.MethodPatch,
+			profilePath,
+			body,
+			"",
+			http.StatusBadRequest,
+			authHeaders(project.AdminToken),
+		)
+	}
+
+	fetched := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		profilePath,
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	if fetched["name"] != "Renamed  研究 🚀" {
+		t.Fatalf("fetched profile name = %v, want exact renamed value", fetched["name"])
+	}
+	for _, response := range []map[string]any{profile, renamed, fetched} {
+		currentConfig := testutil.RequireType[map[string]any](t, response["current_config"])
+		compiled := testutil.RequireType[map[string]any](t, currentConfig["compiled_definition"])
+		if compiled["instruction"] != "Help out." {
+			t.Fatalf("profile detail/mutation lost compiled instruction: %+v", compiled)
+		}
+	}
+}

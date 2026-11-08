@@ -1,0 +1,450 @@
+package compaction
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/omnara-ai/omnara/internal/agentconfig"
+	agentevents "github.com/omnara-ai/omnara/internal/events"
+	"github.com/omnara-ai/omnara/internal/model"
+	"github.com/omnara-ai/omnara/internal/modelcontext"
+	"github.com/omnara-ai/omnara/internal/modelprotocol"
+	"github.com/omnara-ai/omnara/internal/storage/executionstore"
+	"github.com/omnara-ai/omnara/internal/storage/storeerr"
+	modelresolvertest "github.com/omnara-ai/omnara/internal/testutil/modelresolver"
+)
+
+type fakeStore struct {
+	events               []executionstore.CompactionSourceEventRecord
+	atomicGroups         []executionstore.CompactionAtomicGroupRecord
+	priorCheckpoint      *executionstore.ContextCheckpointRecord
+	agentConfig          executionstore.AgentConfigRecord
+	compactionRetryCount int
+
+	claims           []executionstore.ModelCallClaim
+	retryFailures    []executionstore.RecordRecoverableModelCallFailureInput
+	terminalFailures []executionstore.RecordTerminalCompactionFailureInput
+	replacements     []executionstore.ReplaceCompactionSourceInput
+	publishInputs    []executionstore.PublishContextCheckpointInput
+	publishErrs      []error
+	published        *executionstore.ContextCheckpointRecord
+	clock            func() time.Time
+}
+
+func (s *fakeStore) ListCompactionSourceEvents(
+	_ context.Context,
+	_, _ uuid.UUID,
+	afterSequence int64,
+	limit int32,
+) ([]executionstore.CompactionSourceEventRecord, error) {
+	out := make([]executionstore.CompactionSourceEventRecord, 0)
+	for _, event := range s.events {
+		if event.Sequence <= afterSequence {
+			continue
+		}
+		out = append(out, event)
+		if int32(len(out)) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) ListCompactionAtomicGroups(
+	_ context.Context,
+	_, _ uuid.UUID,
+	_, _ int64,
+) ([]executionstore.CompactionAtomicGroupRecord, error) {
+	return append([]executionstore.CompactionAtomicGroupRecord(nil), s.atomicGroups...), nil
+}
+
+func (s *fakeStore) CaptureAgentConfigForEventWatermark(
+	_ context.Context,
+	projectID, _ uuid.UUID,
+	watermark int64,
+) (executionstore.AgentConfigSnapshotRecord, error) {
+	config := s.agentConfig
+	if config.ID == uuid.Nil {
+		config = defaultCompactionAgentConfig()
+	}
+	config.ProjectID = projectID
+	return executionstore.AgentConfigSnapshotRecord{
+		AgentConfig:        config,
+		InputEventSequence: watermark,
+	}, nil
+}
+
+func (s *fakeStore) GetLatestApplicableContextCheckpoint(
+	_ context.Context,
+	_, _ uuid.UUID,
+	maxEventSequence int64,
+) (executionstore.ContextCheckpointRecord, bool, error) {
+	if s.priorCheckpoint == nil || s.priorCheckpoint.CheckpointEventSequence > maxEventSequence {
+		return executionstore.ContextCheckpointRecord{}, false, nil
+	}
+	return *s.priorCheckpoint, true, nil
+}
+
+func (s *fakeStore) CountModelCallRetries(
+	_ context.Context,
+	_, _ uuid.UUID,
+	_ uuid.UUID,
+) (int, error) {
+	return max(s.compactionRetryCount, len(s.retryFailures)), nil
+}
+
+func (s *fakeStore) addStartedClaim(input RunInput) executionstore.ModelCallClaim {
+	claim := newCompactionClaim(input, len(s.claims)+1, s.now())
+	s.claims = append(s.claims, claim)
+	return claim
+}
+
+func newCompactionClaim(
+	input RunInput,
+	index int,
+	now time.Time,
+) executionstore.ModelCallClaim {
+	end := input.Plan.EventSequenceEnd
+	return executionstore.ModelCallClaim{
+		Created: true,
+		Claimed: true,
+		Context: executionstore.ModelCallContextRecord{
+			ID:                        testIDN(100 + index),
+			OrgID:                     testIDN(500),
+			ProjectID:                 input.Plan.ProjectID,
+			AgentID:                   input.Plan.AgentID,
+			OperationKind:             executionstore.ModelCallOperationCompaction,
+			AttemptNumber:             1,
+			AgentConfigID:             testIDN(501),
+			ConfiguredModelRevisionID: testIDN(601),
+			InputEventSequence:        input.Plan.InputEventSequence,
+			SourceEventSequenceEnd:    &end,
+			RuntimeLockID:             input.RuntimeLockID,
+			State:                     executionstore.ModelCallContextStarted,
+			CreatedAt:                 now,
+		},
+	}
+}
+
+func (s *fakeStore) RecordRetryableModelCallFailure(
+	_ context.Context,
+	input executionstore.RecordRecoverableModelCallFailureInput,
+) (executionstore.ModelCallContextRecord, error) {
+	s.retryFailures = append(s.retryFailures, input)
+	contextRecord, found := s.contextByID(input.ModelCallContextID)
+	if !found {
+		return executionstore.ModelCallContextRecord{}, storeerr.ErrStateTransitionConflict
+	}
+	retryAt := s.now().Add(input.RetryDelay)
+	contextRecord.State = executionstore.ModelCallContextFailed
+	contextRecord.RecoveryKind = executionstore.ModelCallRecoveryRetry
+	contextRecord.ErrorKind = input.ErrorKind
+	contextRecord.ErrorCode = input.ErrorCode
+	contextRecord.ErrorMessage = input.ErrorMessage
+	contextRecord.RetryAt = &retryAt
+	for i := range s.claims {
+		if s.claims[i].Context.ID == contextRecord.ID {
+			s.claims[i].Context = contextRecord
+		}
+	}
+	return contextRecord, nil
+}
+
+func (s *fakeStore) RecordTerminalCompactionFailure(
+	_ context.Context,
+	input executionstore.RecordTerminalCompactionFailureInput,
+) error {
+	s.terminalFailures = append(s.terminalFailures, input)
+	return nil
+}
+
+func (s *fakeStore) ReplaceCompactionSource(
+	_ context.Context,
+	input executionstore.ReplaceCompactionSourceInput,
+) (executionstore.ReplaceCompactionSourceResult, error) {
+	s.replacements = append(s.replacements, input)
+	end := input.NextSourceEventSequenceEnd
+	previous, _ := s.contextByID(input.ModelCallContextID)
+	reductions := 0
+	attempt := 1
+	if previous.SourceEventSequenceEnd != nil && end == *previous.SourceEventSequenceEnd {
+		reductions = previous.SourceExcerptReductionCount + 1
+		attempt = previous.AttemptNumber + 1
+	}
+	claim := executionstore.ModelCallClaim{
+		Context: executionstore.ModelCallContextRecord{
+			ID:                          testIDN(700 + len(s.replacements)),
+			OrgID:                       testIDN(500),
+			ProjectID:                   input.ProjectID,
+			AgentID:                     input.AgentID,
+			OperationKind:               executionstore.ModelCallOperationCompaction,
+			AttemptNumber:               attempt,
+			AgentConfigID:               testIDN(501),
+			ConfiguredModelRevisionID:   testIDN(601),
+			InputEventSequence:          s.claims[0].Context.InputEventSequence,
+			SourceEventSequenceEnd:      &end,
+			SourceExcerptReductionCount: reductions,
+			RuntimeLockID:               input.RuntimeLockID,
+			State:                       executionstore.ModelCallContextStarted,
+			CreatedAt:                   s.now(),
+		},
+		Created: true,
+		Claimed: true,
+	}
+	s.claims = append(s.claims, claim)
+	return executionstore.ReplaceCompactionSourceResult{CompactionCall: claim}, nil
+}
+
+type errorResolver struct {
+	err error
+}
+
+func (r errorResolver) Resolve(context.Context, model.Selection) (model.ResolvedClient, error) {
+	return model.ResolvedClient{}, r.err
+}
+
+func (s *fakeStore) PublishContextCheckpoint(
+	_ context.Context,
+	input executionstore.PublishContextCheckpointInput,
+) (executionstore.ContextCheckpointRecord, error) {
+	s.publishInputs = append(s.publishInputs, input)
+	if len(s.publishErrs) > 0 {
+		err := s.publishErrs[0]
+		s.publishErrs = s.publishErrs[1:]
+		if err != nil {
+			return executionstore.ContextCheckpointRecord{}, err
+		}
+	}
+	claim, _ := s.contextByID(input.ModelCallContextID)
+	record := executionstore.ContextCheckpointRecord{
+		ID:                             testIDN(900 + len(s.publishInputs)),
+		ProjectID:                      input.ProjectID,
+		AgentID:                        input.AgentID,
+		SummarizedThroughEventSequence: *claim.SourceEventSequenceEnd,
+		ProducerModelCallContextID:     input.ModelCallContextID,
+		CheckpointEventID:              testIDN(950 + len(s.publishInputs)),
+		CheckpointEventSequence:        claim.InputEventSequence + 1,
+		Summary:                        input.Summary,
+		CreatedAt:                      s.now(),
+	}
+	s.published = &record
+	return record, nil
+}
+
+func (s *fakeStore) contextByID(id uuid.UUID) (executionstore.ModelCallContextRecord, bool) {
+	for index := len(s.claims) - 1; index >= 0; index-- {
+		if s.claims[index].Context.ID == id {
+			return s.claims[index].Context, true
+		}
+	}
+	return executionstore.ModelCallContextRecord{}, false
+}
+
+func (s *fakeStore) now() time.Time {
+	if s.clock != nil {
+		return s.clock().UTC()
+	}
+	return time.Now().UTC()
+}
+
+type summaryResult struct {
+	response model.Response
+	err      error
+}
+
+type summaryModel struct {
+	caps              model.Capabilities
+	preparedBundles   []modelcontext.Bundle
+	preparedPolicies  []model.RequestPolicy
+	preparedEstimate  func(model.PrepareInput, []byte) int
+	sourceInputTokens int
+	prepareErrs       []error
+	requests          []model.Request
+	results           []summaryResult
+	respond           func(model.Request) (model.Response, error)
+}
+
+func (m *summaryModel) RequestedProviderModelSlug() string {
+	return "summary"
+}
+
+func (m *summaryModel) APIFormat() modelprotocol.APIFormat {
+	return modelprotocol.APIFormatOpenAIResponses
+}
+
+func (m *summaryModel) ModelAPIVariant() modelprotocol.APIVariant {
+	return modelprotocol.APIVariantDefault
+}
+
+func (m *summaryModel) Capabilities() model.Capabilities {
+	caps := m.caps
+	if caps.ContextWindowTokens == 0 {
+		caps.ContextWindowTokens = 200_000
+	}
+	if caps.MaxOutputTokens == nil {
+		caps.MaxOutputTokens = new(4_096)
+	}
+	if caps.DefaultMaxOutputTokens == 0 {
+		caps.DefaultMaxOutputTokens = 2_048
+	}
+	return caps
+}
+
+func (m *summaryModel) Prepare(
+	_ context.Context,
+	input model.PrepareInput,
+) (model.PreparedRequest, error) {
+	if len(m.prepareErrs) > 0 {
+		err := m.prepareErrs[0]
+		m.prepareErrs = m.prepareErrs[1:]
+		if err != nil {
+			return model.PreparedRequest{}, err
+		}
+	}
+	m.preparedBundles = append(m.preparedBundles, input.Context)
+	m.preparedPolicies = append(m.preparedPolicies, input.Policy)
+	body, err := json.Marshal(map[string]any{
+		"max_output_tokens": input.Policy.MaxOutputTokens,
+		"messages":          input.Context.Messages,
+	})
+	if err != nil {
+		return model.PreparedRequest{}, err
+	}
+	estimate := modelcontext.EstimatePreparedRequest(body, nil)
+	if m.preparedEstimate != nil {
+		estimate = m.preparedEstimate(input, body)
+	} else if m.sourceInputTokens > 0 {
+		estimate = m.sourceInputTokens
+	}
+	return model.PreparedRequest{Body: body, InputTokenEstimate: estimate}, nil
+}
+
+func (m *summaryModel) Respond(_ context.Context, input model.Request) (model.Response, error) {
+	m.requests = append(m.requests, input)
+	if m.respond != nil {
+		return m.respond(input)
+	}
+	if len(m.results) > 0 {
+		result := m.results[0]
+		m.results = m.results[1:]
+		return result.response, result.err
+	}
+	return completeSummaryResponse(
+		"## Goal\nContinue the current task.\n\n" +
+			"## Next Steps\nProceed with the next verified action.",
+	), nil
+}
+
+func defaultCompactionAgentConfig() executionstore.AgentConfigRecord {
+	return compactionAgentConfigWithReasoning("")
+}
+
+func compactionAgentConfigWithReasoning(reasoningEffort string) executionstore.AgentConfigRecord {
+	source := `
+instruction: Continue the task.
+model:
+  provider_config: openai-prod
+  name: summary
+`
+	if reasoningEffort != "" {
+		source += "  reasoning:\n    effort: " + reasoningEffort + "\n"
+	}
+	compiled, err := agentconfig.Compile(
+		agentconfig.SourceFormatYAML,
+		[]byte(source),
+		agentconfig.CompileOptions{
+			ResolveModelSelection: func(_, _ string) (agentconfig.ResolvedModelSelection, error) {
+				return agentconfig.ResolvedModelSelection{ConfiguredModelID: testIDN(600)}, nil
+			},
+		},
+	)
+	if err != nil {
+		panic(err)
+	}
+	return executionstore.AgentConfigRecord{
+		ID:                      testIDN(501),
+		OrgID:                   testIDN(500),
+		ConfiguredModelID:       testIDN(600),
+		CompiledDefinition:      json.RawMessage(compiled.CanonicalJSON),
+		EffectiveDefinitionHash: compiled.Hash,
+	}
+}
+
+func compactionResolver(client model.Client) model.Resolver {
+	return modelresolvertest.Static{Clients: []model.ResolvedClient{{
+		Client:                    client,
+		ConfiguredModelRevisionID: testIDN(601).String(),
+	}}}
+}
+
+func testRunner(store *fakeStore, client model.Client, now ...func() time.Time) Runner {
+	runner := Runner{
+		Store:    store,
+		Resolver: compactionResolver(client),
+	}
+	if len(now) > 0 {
+		runner.Now = now[0]
+	}
+	store.clock = runner.now
+	return runner
+}
+
+func runInput(plan Plan) RunInput {
+	return RunInput{
+		Plan:                 plan,
+		TurnID:               testTurnID,
+		OpeningInputIDs:      []uuid.UUID{testOpeningInputID},
+		OpeningEventSequence: plan.InputEventSequence,
+		RuntimeLockID:        testRuntimeLockID,
+	}
+}
+
+func testPlan(start, end, frontier int64) Plan {
+	if frontier <= end {
+		frontier = end + 1
+	}
+	return Plan{
+		ProjectID:          testProjectID,
+		AgentID:            testAgentID,
+		InputEventSequence: frontier,
+		EventSequenceStart: start,
+		EventSequenceEnd:   end,
+	}
+}
+
+func completeSummaryResponse(summary string) model.Response {
+	return model.Response{
+		ID:                "resp_complete",
+		ProviderRequestID: "req_complete",
+		StopReason:        model.StopReasonEndTurn,
+		Content:           []model.ResponsePart{{Type: model.ResponsePartTypeText, Text: summary}},
+	}
+}
+
+func mustCompactionEvent(
+	sequence int64,
+	kind, inputKind string,
+	contentParts json.RawMessage,
+) executionstore.CompactionSourceEventRecord {
+	if len(contentParts) == 0 {
+		contentParts = json.RawMessage(`[]`)
+	}
+	return executionstore.CompactionSourceEventRecord{
+		ID:           testIDN(300 + int(sequence)),
+		Sequence:     sequence,
+		Kind:         kind,
+		InputKind:    inputKind,
+		ContentParts: contentParts,
+		CreatedAt:    time.Unix(sequence, 0).UTC(),
+	}
+}
+
+func textCompactionEvent(sequence int64, text string) executionstore.CompactionSourceEventRecord {
+	content, err := json.Marshal([]map[string]string{{"type": "text", "text": text}})
+	if err != nil {
+		panic(err)
+	}
+	return mustCompactionEvent(sequence, string(agentevents.KindModelOutput), "content", content)
+}

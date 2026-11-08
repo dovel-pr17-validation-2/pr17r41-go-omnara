@@ -1,0 +1,194 @@
+import { type SecretListSort, type SecretOwnerScope, useSecrets } from '@omnara/react'
+import type { Secret } from '@omnara/sdk'
+import { type ReactNode, useState } from 'react'
+
+import { DataTable } from '@/components/data-table/DataTable'
+import { DetailList } from '@/components/data-table/DetailList'
+import { ResourceListToolbar } from '@/components/data-table/ResourceListToolbar'
+import { SearchHeader } from '@/components/layout/SearchHeader'
+import { CreateSecretDialog } from '@/components/org/CreateSecretDialog'
+import { EditSecretDialog } from '@/components/org/EditSecretDialog'
+import { McpOAuthOutcomeDialog } from '@/components/secrets/McpOAuthOutcomeDialog'
+import { SecretRowActions } from '@/components/secrets/SecretRowActions'
+import { Button } from '@/components/ui/button'
+import { usePagedQuery } from '@/hooks/use-paged-query'
+import {
+  resourceSortOptions,
+  useListToolbarVisibility,
+  useResourceList,
+} from '@/hooks/use-resource-list'
+import { guides } from '@/lib/docs'
+import { formatDateTime } from '@/lib/format'
+import { canManageOrg } from '@/lib/permissions'
+import { secretSubtitle } from '@/lib/secrets'
+import { useActiveOrg } from '@/lib/use-active-org'
+
+export function SecretsSection({
+  owner = { kind: 'org' },
+  canRead: canReadOverride,
+  canManage: canManageOverride,
+  actions,
+}: {
+  owner?: SecretOwnerScope
+  canRead?: boolean
+  canManage?: boolean
+  /** Extra header controls shown before the create button, e.g. tabs. */
+  actions?: ReactNode
+}) {
+  const { activeOrg } = useActiveOrg()
+  const canManage =
+    canManageOverride ??
+    (owner.kind === 'user' || (owner.kind === 'org' && canManageOrg(activeOrg.role)))
+  // Secret metadata has a dedicated list permission. The current API exposes
+  // it through org management and project secret management, respectively.
+  const canRead = canReadOverride ?? canManage
+
+  if (!canRead) {
+    return (
+      <div className="flex flex-col gap-3">
+        {actions && <div className="flex justify-end">{actions}</div>}
+        <p className="text-muted-foreground text-sm">
+          You don’t have permission to view secrets here.
+        </p>
+      </div>
+    )
+  }
+
+  return <SecretsList owner={owner} canManage={canManage} actions={actions} />
+}
+
+function SecretsList({
+  owner,
+  canManage,
+  actions,
+}: {
+  owner: SecretOwnerScope
+  canManage: boolean
+  actions?: ReactNode
+}) {
+  const { activeOrg } = useActiveOrg()
+  const list = useResourceList<SecretListSort>('-updated_at')
+  const query = useSecrets(activeOrg.id, owner, {
+    filters: list.apiFilters,
+    sort: list.sort,
+  })
+  const paged = usePagedQuery(query, list.queryKey)
+  const showToolbar = useListToolbarVisibility(list, paged.pagination, query.isSuccess)
+  const [open, setOpen] = useState(false)
+  const [editingSecret, setEditingSecret] = useState<Secret | null>(null)
+
+  const newSecretButton = () =>
+    canManage ? (
+      <Button
+        size="sm"
+        onClick={() => {
+          setOpen(true)
+        }}
+      >
+        New secret
+      </Button>
+    ) : undefined
+
+  return (
+    <>
+      <div className="flex flex-col gap-3">
+        <SearchHeader
+          title="Secrets"
+          description="Configure secret values to be used with LLM providers, sandbox providers, MCPs, and more."
+          guide={guides.secrets}
+          toolbar={
+            <ResourceListToolbar
+              search={list.search}
+              onSearchChange={list.setSearch}
+              sort={{ value: list.sort, options: resourceSortOptions, onChange: list.setSort }}
+              placeholder="Search secrets by name…"
+              showSearch={showToolbar}
+            />
+          }
+        >
+          {actions}
+          {newSecretButton()}
+        </SearchHeader>
+        <DataTable
+          columns={[
+            {
+              id: 'name',
+              header: 'Name',
+              cell: (secret) => (
+                <span className="inline-flex max-w-full items-center gap-2">
+                  <span className="truncate font-medium">{secret.name}</span>
+                  {secret.management_kind === 'cluster' && (
+                    <span className="text-muted-foreground">cluster</span>
+                  )}
+                </span>
+              ),
+            },
+            {
+              id: 'type',
+              header: 'Type',
+              cell: (secret) => (
+                <span className="text-muted-foreground">{secretSubtitle(secret)}</span>
+              ),
+            },
+            {
+              id: 'actions',
+              header: '',
+              className: 'w-14',
+              isActions: true,
+              cell: (secret) => (
+                <SecretRowActions
+                  orgId={activeOrg.id}
+                  secret={secret}
+                  canDelete={canManage}
+                  onEdit={canManage ? setEditingSecret : undefined}
+                  canGrant={canManage}
+                />
+              ),
+            },
+          ]}
+          data={paged.rows}
+          isFiltered={list.isFiltering}
+          pagination={paged.pagination}
+          getRowId={(secret) => secret.id}
+          rowExpanded={(secret) => (
+            <DetailList
+              items={[
+                { label: 'ID', value: secret.id, mono: true },
+                {
+                  label: 'Managed by',
+                  value: secret.management_kind === 'cluster' ? 'Cluster' : 'Organization',
+                },
+                { label: 'MCP URL', value: secret.metadata.mcp_url, mono: true },
+                { label: 'Payload keys', value: secret.payload_keys.join(', '), mono: true },
+                { label: 'Version', value: secret.current_version_number },
+                { label: 'Created', value: formatDateTime(secret.created_at) },
+                { label: 'Updated', value: formatDateTime(secret.updated_at) },
+              ]}
+            />
+          )}
+          isPending={query.isPending}
+          isError={query.isError}
+          onRetry={() => {
+            void query.refetch()
+          }}
+          emptyMessage="No secrets yet. Add the API keys and credentials your providers and pools use."
+          emptyAction={newSecretButton()}
+        />
+      </div>
+      {canManage && (
+        <CreateSecretDialog open={open} onOpenChange={setOpen} orgId={activeOrg.id} owner={owner} />
+      )}
+      {editingSecret && (
+        <EditSecretDialog
+          open
+          orgId={activeOrg.id}
+          secret={editingSecret}
+          onOpenChange={(nextOpen) => {
+            if (!nextOpen) setEditingSecret(null)
+          }}
+        />
+      )}
+      <McpOAuthOutcomeDialog />
+    </>
+  )
+}

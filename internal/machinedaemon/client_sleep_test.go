@@ -1,0 +1,277 @@
+package machinedaemon
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/omnara-ai/omnara/internal/daemonprotocol"
+)
+
+func TestSleepPlatformSelection(t *testing.T) {
+	if _, err := newSleepPlatform("unsupported"); err == nil {
+		t.Fatal("unsupported sleep platform must fail closed")
+	}
+	platform, err := newSleepPlatform("")
+	if err != nil {
+		t.Fatalf("empty sleep platform: %v", err)
+	}
+	if err := platform.allowSleep(); err != nil {
+		t.Fatalf("noop allow sleep: %v", err)
+	}
+	if err := platform.preventSleep(); err != nil {
+		t.Fatalf("noop prevent sleep: %v", err)
+	}
+	arker, err := newSleepPlatform(daemonprotocol.SleepPlatformArker)
+	if err != nil || arker != (controlFileSleepPlatform{controlPath: daemonprotocol.ArkerAwakeControlFilePath}) {
+		t.Fatalf("arker sleep platform = %#v, %v", arker, err)
+	}
+	createOS, err := newSleepPlatform(daemonprotocol.SleepPlatformCreateOS)
+	if selfPause, ok := createOS.(createOSSleepPlatform); err != nil || !ok ||
+		selfPause.pauseURL != daemonprotocol.CreateOSSelfPauseURL {
+		t.Fatalf("createos sleep platform = %#v, %v", createOS, err)
+	}
+}
+
+func TestCreateOSSleepPlatformPausesTheSandbox(t *testing.T) {
+	status := http.StatusAccepted
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodPost || r.URL.Path != "/self/pause" {
+			t.Errorf("self-pause request = %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(status)
+	}))
+	defer server.Close()
+	platform := createOSSleepPlatform{pauseURL: server.URL + "/self/pause", httpClient: server.Client()}
+	if err := platform.preventSleep(); err != nil || requests != 0 {
+		t.Fatalf("prevent sleep error = %v requests = %d, want a no-op", err, requests)
+	}
+	if err := platform.allowSleep(); err != nil || requests != 1 {
+		t.Fatalf("allow sleep error = %v requests = %d", err, requests)
+	}
+	status = http.StatusServiceUnavailable
+	if err := platform.allowSleep(); err == nil || !strings.Contains(err.Error(), "HTTP 503") {
+		t.Fatalf("allow sleep error = %v, want the rejected pause reported", err)
+	}
+}
+
+func TestControlFileSleepPlatformWritesCounter(t *testing.T) {
+	controlPath := filepath.Join(t.TempDir(), "scale_to_zero_disable")
+	if err := os.WriteFile(controlPath, []byte("=1"), 0o600); err != nil {
+		t.Fatalf("seed control file: %v", err)
+	}
+	platform := controlFileSleepPlatform{controlPath: controlPath}
+	if err := platform.allowSleep(); err != nil {
+		t.Fatalf("allow sleep: %v", err)
+	}
+	if data, _ := os.ReadFile(controlPath); string(data) != "=0" {
+		t.Fatalf("allow sleep wrote %q, want =0", data)
+	}
+	if err := platform.preventSleep(); err != nil {
+		t.Fatalf("prevent sleep: %v", err)
+	}
+	if data, _ := os.ReadFile(controlPath); string(data) != "=1" {
+		t.Fatalf("prevent sleep wrote %q, want =1", data)
+	}
+
+	missing := controlFileSleepPlatform{controlPath: filepath.Join(t.TempDir(), "missing", "control")}
+	if err := missing.preventSleep(); err == nil {
+		t.Fatal("missing control file must fail closed")
+	}
+}
+
+func TestWakeListenerSignalsSleepingDaemon(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := New(Config{
+		APIURL:         "https://api.test",
+		MachineToken:   "token",
+		SleepAfter:     daemonprotocol.MinimumSleepAfter,
+		WakeListenAddr: "127.0.0.1:0",
+	}, nil, nil)
+	client.sleepPlatform = noopSleepPlatform{}
+
+	address, err := client.startWakeListener(ctx)
+	if err != nil {
+		t.Fatalf("start wake listener: %v", err)
+	}
+
+	woke := make(chan error, 1)
+	go func() { woke <- client.sleepUntilWake(ctx) }()
+
+	conn, err := net.Dial("tcp", address)
+	if err != nil {
+		t.Fatalf("dial wake listener: %v", err)
+	}
+	_ = conn.Close()
+
+	select {
+	case err := <-woke:
+		if err != nil {
+			t.Fatalf("sleep until wake: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("wake listener poke did not wake the daemon")
+	}
+}
+
+func TestSleepUntilWakeConsumesBufferedTransitionSignal(t *testing.T) {
+	ctx := context.Background()
+	client := New(Config{
+		APIURL:       "https://api.test",
+		MachineToken: "token",
+		SleepAfter:   daemonprotocol.MinimumSleepAfter,
+	}, nil, nil)
+	client.sleepPlatform = noopSleepPlatform{}
+
+	client.signalWake()
+	if err := client.sleepUntilWake(ctx); err != nil {
+		t.Fatalf("sleep until wake with buffered signal: %v", err)
+	}
+}
+
+type asleepProbeSleepPlatform struct {
+	client *Client
+	asleep *bool
+}
+
+func (p asleepProbeSleepPlatform) allowSleep() error {
+	*p.asleep = p.client.Asleep()
+	return nil
+}
+
+func (asleepProbeSleepPlatform) preventSleep() error { return nil }
+
+func TestSleepUntilWakeReportsAsleepOnlyWhileWaiting(t *testing.T) {
+	client := New(Config{
+		APIURL:       "https://api.test",
+		MachineToken: "token",
+		SleepAfter:   daemonprotocol.MinimumSleepAfter,
+	}, nil, nil)
+	asleepWhileWaiting := false
+	client.sleepPlatform = asleepProbeSleepPlatform{client: &client, asleep: &asleepWhileWaiting}
+
+	client.signalWake()
+	if err := client.sleepUntilWake(context.Background()); err != nil {
+		t.Fatalf("sleep until wake: %v", err)
+	}
+	if !asleepWhileWaiting || client.Asleep() {
+		t.Fatalf("asleep while waiting = %t, after wake = %t", asleepWhileWaiting, client.Asleep())
+	}
+}
+
+func TestSleepUntilWakeStopsOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	client := New(Config{
+		APIURL:       "https://api.test",
+		MachineToken: "token",
+		SleepAfter:   daemonprotocol.MinimumSleepAfter,
+	}, nil, nil)
+	client.sleepPlatform = noopSleepPlatform{}
+
+	done := make(chan error, 1)
+	go func() { done <- client.sleepUntilWake(ctx) }()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("sleep until wake = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("sleep until wake did not stop on cancel")
+	}
+}
+
+func TestSleepNotWakeCapableDisablesSleepForSession(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/sleep") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"code":"not_wake_capable","error":"machine is not wake capable"}`))
+	}))
+	defer server.Close()
+
+	client := New(Config{
+		APIURL:       server.URL,
+		MachineToken: "token",
+		SleepAfter:   daemonprotocol.MinimumSleepAfter,
+	}, server.Client(), nil)
+
+	if !client.sleepEnabled() {
+		t.Fatal("sleep must start enabled")
+	}
+	err := client.Sleep(context.Background(), DaemonRuntime{ID: "rt_1"})
+	if !errors.Is(err, errDaemonSleepNotWakeCapable) {
+		t.Fatalf("sleep = %v, want errDaemonSleepNotWakeCapable", err)
+	}
+	client.sleepDisabled.Store(true)
+	if client.sleepEnabled() {
+		t.Fatal("sleep must be disabled for the session after not_wake_capable")
+	}
+}
+
+func TestSleepRequestHasNoBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/sleep") {
+			http.NotFound(w, r)
+			return
+		}
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(data) != 0 {
+			http.Error(w, "request body is not allowed", http.StatusBadRequest)
+			return
+		}
+		if contentType := r.Header.Get("Content-Type"); contentType != "" {
+			http.Error(w, "content type is not allowed", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"rt_1","state":"ended"}`))
+	}))
+	defer server.Close()
+
+	client := New(Config{
+		APIURL:       server.URL,
+		MachineToken: "token",
+		SleepAfter:   daemonprotocol.MinimumSleepAfter,
+	}, server.Client(), nil)
+
+	if err := client.Sleep(context.Background(), DaemonRuntime{ID: "rt_1"}); err != nil {
+		t.Fatalf("sleep = %v, want no body accepted", err)
+	}
+}
+
+func TestSleepPendingWorkConflictIsVeto(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"code":"pending_work","error":"machine has pending daemon work"}`))
+	}))
+	defer server.Close()
+
+	client := New(Config{
+		APIURL:       server.URL,
+		MachineToken: "token",
+		SleepAfter:   daemonprotocol.MinimumSleepAfter,
+	}, server.Client(), nil)
+
+	if err := client.Sleep(context.Background(), DaemonRuntime{ID: "rt_1"}); !errors.Is(err, errDaemonSleepVetoed) {
+		t.Fatalf("sleep = %v, want errDaemonSleepVetoed", err)
+	}
+}

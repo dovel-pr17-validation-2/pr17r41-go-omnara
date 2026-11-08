@@ -1,0 +1,294 @@
+package modelstore
+
+import (
+	"encoding/json"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/omnara-ai/omnara/internal/modelprotocol"
+	"github.com/omnara-ai/omnara/internal/storage/listing"
+	"github.com/omnara-ai/omnara/internal/storage/management"
+	"github.com/omnara-ai/omnara/internal/storage/patch"
+)
+
+const (
+	ModelProviderAuthKindBearerToken  = "bearer_token"
+	ModelProviderAuthKindAPIKeyHeader = "api_key_header"
+	ModelProviderAuthKindSigV4        = "sigv4"
+
+	ModelCacheRetentionNone  = "none"
+	ModelCacheRetentionShort = "short"
+	ModelCacheRetentionLong  = "long"
+
+	DefaultModelProviderRequestTimeoutMS = int64(time.Hour / time.Millisecond)
+	DefaultModelProviderIdleTimeoutMS    = int64((5 * time.Minute) / time.Millisecond)
+
+	maxModelProviderHeaders = 64
+)
+
+type CreateModelProviderConfigInput struct {
+	OrgID              uuid.UUID
+	Name               string
+	APIFormat          modelprotocol.APIFormat
+	APIVariant         modelprotocol.APIVariant
+	BaseURL            string
+	EndpointPath       string
+	RequestTimeoutMS   int
+	IdleTimeoutMS      int
+	AuthKind           string
+	AuthOptions        json.RawMessage
+	CredentialSecretID uuid.UUID
+	Headers            json.RawMessage
+	SecretHeaders      json.RawMessage
+	managementKind     management.Kind
+}
+
+type modelProviderConfigUpdate struct {
+	OrgID              uuid.UUID
+	ID                 uuid.UUID
+	BaseURL            string
+	EndpointPath       string
+	RequestTimeoutMS   int
+	IdleTimeoutMS      int
+	AuthKind           string
+	AuthOptions        json.RawMessage
+	CredentialSecretID uuid.UUID
+	Headers            json.RawMessage
+	SecretHeaders      json.RawMessage
+	APIFormat          modelprotocol.APIFormat
+	APIVariant         modelprotocol.APIVariant
+}
+
+type PatchModelProviderConfigInput struct {
+	OrgID              uuid.UUID
+	ID                 uuid.UUID
+	BaseURL            *string
+	EndpointPath       *string
+	RequestTimeoutMS   *int
+	IdleTimeoutMS      *int
+	AuthKind           *string
+	AuthOptions        *json.RawMessage
+	CredentialSecretID *uuid.UUID
+	Headers            *json.RawMessage
+	SecretHeaders      *json.RawMessage
+}
+
+type ModelProviderHeaders struct {
+	Headers       map[string]string
+	SecretHeaders map[string]uuid.UUID
+}
+
+type ModelProviderConfigRecord struct {
+	ID                 uuid.UUID                `json:"id"`
+	OrgID              uuid.UUID                `json:"org_id"`
+	ManagementKind     management.Kind          `json:"management_kind"`
+	Name               string                   `json:"name"`
+	APIFormat          modelprotocol.APIFormat  `json:"api_format"`
+	APIVariant         modelprotocol.APIVariant `json:"api_variant"`
+	BaseURL            string                   `json:"base_url"`
+	EndpointPath       string                   `json:"endpoint_path"`
+	RequestTimeoutMS   int                      `json:"request_timeout_ms"`
+	IdleTimeoutMS      int                      `json:"idle_timeout_ms"`
+	AuthKind           string                   `json:"auth_kind"`
+	AuthOptions        json.RawMessage          `json:"auth_options"`
+	CredentialSecretID uuid.UUID                `json:"credential_secret_id"`
+	Headers            json.RawMessage          `json:"headers"`
+	SecretHeaders      json.RawMessage          `json:"secret_headers"`
+	DeletedAt          *time.Time               `json:"deleted_at,omitempty"`
+	CreatedAt          time.Time                `json:"created_at"`
+	UpdatedAt          time.Time                `json:"updated_at"`
+}
+
+type CreateConfiguredModelInput struct {
+	OrgID                     uuid.UUID
+	ModelProviderConfigID     uuid.UUID
+	Name                      string
+	ProviderModelSlug         string
+	ContextWindowTokens       int
+	MaxOutputTokens           *int
+	DefaultMaxOutputTokens    *int
+	DefaultCacheRetention     string
+	SupportsTools             *bool
+	SupportsReasoning         bool
+	DefaultReasoningEffort    string
+	SupportedReasoningEfforts []string
+	InputModalities           []string
+	OutputModalities          []string
+	APIVariantOptions         json.RawMessage
+}
+
+type configuredModelUpdate struct {
+	OrgID                     uuid.UUID
+	ModelProviderConfigID     uuid.UUID
+	ID                        uuid.UUID
+	Name                      string
+	ProviderModelSlug         string
+	ContextWindowTokens       int
+	MaxOutputTokens           *int
+	DefaultMaxOutputTokens    *int
+	DefaultCacheRetention     string
+	SupportsTools             *bool
+	SupportsReasoning         bool
+	DefaultReasoningEffort    string
+	SupportedReasoningEfforts []string
+	InputModalities           []string
+	OutputModalities          []string
+	APIVariantOptions         json.RawMessage
+}
+
+type PatchConfiguredModelInput struct {
+	OrgID                     uuid.UUID
+	ModelProviderConfigID     uuid.UUID
+	ID                        uuid.UUID
+	Name                      *string
+	ProviderModelSlug         *string
+	ContextWindowTokens       *int
+	MaxOutputTokens           patch.NullableInt
+	DefaultMaxOutputTokens    patch.NullableInt
+	DefaultCacheRetention     *string
+	SupportsTools             *bool
+	SupportsReasoning         *bool
+	DefaultReasoningEffort    *string
+	SupportedReasoningEfforts *[]string
+	InputModalities           *[]string
+	OutputModalities          *[]string
+	APIVariantOptions         *json.RawMessage
+}
+
+type ConfiguredModelRecord struct {
+	ID                        uuid.UUID       `json:"id"`
+	OrgID                     uuid.UUID       `json:"org_id"`
+	ModelProviderConfigID     uuid.UUID       `json:"model_provider_config_id"`
+	ManagementKind            management.Kind `json:"management_kind"`
+	Name                      string          `json:"name"`
+	CurrentRevisionID         uuid.UUID       `json:"current_revision_id"`
+	ProviderModelSlug         string          `json:"provider_model_slug"`
+	ContextWindowTokens       int             `json:"context_window_tokens"`
+	MaxOutputTokens           *int            `json:"max_output_tokens"`
+	DefaultMaxOutputTokens    *int            `json:"default_max_output_tokens,omitempty"`
+	DefaultCacheRetention     string          `json:"default_cache_retention,omitempty"`
+	SupportsTools             bool            `json:"supports_tools"`
+	SupportsReasoning         bool            `json:"supports_reasoning"`
+	DefaultReasoningEffort    string          `json:"default_reasoning_effort"`
+	SupportedReasoningEfforts []string        `json:"supported_reasoning_efforts"`
+	InputModalities           []string        `json:"input_modalities"`
+	OutputModalities          []string        `json:"output_modalities"`
+	APIVariantOptions         json.RawMessage `json:"api_variant_options"`
+	DeletedAt                 *time.Time      `json:"deleted_at,omitempty"`
+	CreatedAt                 time.Time       `json:"created_at"`
+	UpdatedAt                 time.Time       `json:"updated_at"`
+	RevisionCreatedAt         time.Time       `json:"revision_created_at"`
+}
+
+type ConfiguredModelRevisionRecord struct {
+	ID                        uuid.UUID       `json:"id"`
+	OrgID                     uuid.UUID       `json:"org_id"`
+	ConfiguredModelID         uuid.UUID       `json:"configured_model_id"`
+	ModelProviderConfigID     uuid.UUID       `json:"model_provider_config_id"`
+	ProviderModelSlug         string          `json:"provider_model_slug"`
+	ContextWindowTokens       int             `json:"context_window_tokens"`
+	MaxOutputTokens           *int            `json:"max_output_tokens"`
+	DefaultMaxOutputTokens    *int            `json:"default_max_output_tokens,omitempty"`
+	DefaultCacheRetention     string          `json:"default_cache_retention,omitempty"`
+	SupportsTools             bool            `json:"supports_tools"`
+	SupportsReasoning         bool            `json:"supports_reasoning"`
+	DefaultReasoningEffort    string          `json:"default_reasoning_effort"`
+	SupportedReasoningEfforts []string        `json:"supported_reasoning_efforts"`
+	InputModalities           []string        `json:"input_modalities"`
+	OutputModalities          []string        `json:"output_modalities"`
+	APIVariantOptions         json.RawMessage `json:"api_variant_options"`
+	CreatedAt                 time.Time       `json:"created_at"`
+}
+
+type ConfiguredModelRevisionDisplayRecord struct {
+	ConfiguredModelRevisionRecord
+	ConfiguredModelName string
+	ProviderConfigName  string
+	APIFormat           modelprotocol.APIFormat
+	APIVariant          modelprotocol.APIVariant
+}
+
+type CreateProjectModelGrantInput struct {
+	OrgID                     uuid.UUID
+	ProjectID                 uuid.UUID
+	ConfiguredModelID         uuid.UUID
+	ContextWindowTokens       *int
+	MaxOutputTokens           *int
+	DefaultMaxOutputTokens    *int
+	DefaultCacheRetention     string
+	SupportsTools             *bool
+	SupportsReasoning         *bool
+	DefaultReasoningEffort    string
+	SupportedReasoningEfforts []string
+	InputModalities           []string
+	OutputModalities          []string
+}
+
+type UpdateProjectModelGrantInput struct {
+	OrgID                     uuid.UUID
+	ProjectID                 uuid.UUID
+	ID                        uuid.UUID
+	ContextWindowTokens       patch.NullableInt
+	MaxOutputTokens           patch.NullableInt
+	DefaultMaxOutputTokens    patch.NullableInt
+	DefaultCacheRetention     *string
+	SupportsTools             patch.NullableBool
+	SupportsReasoning         patch.NullableBool
+	DefaultReasoningEffort    *string
+	SupportedReasoningEfforts *[]string
+	InputModalities           *[]string
+	OutputModalities          *[]string
+}
+
+type ProjectModelGrantRecord struct {
+	ID                        uuid.UUID `json:"id"`
+	OrgID                     uuid.UUID `json:"org_id"`
+	ProjectID                 uuid.UUID `json:"project_id"`
+	ConfiguredModelID         uuid.UUID `json:"configured_model_id"`
+	ContextWindowTokens       *int      `json:"context_window_tokens,omitempty"`
+	MaxOutputTokens           *int      `json:"max_output_tokens,omitempty"`
+	DefaultMaxOutputTokens    *int      `json:"default_max_output_tokens,omitempty"`
+	DefaultCacheRetention     string    `json:"default_cache_retention,omitempty"`
+	SupportsTools             *bool     `json:"supports_tools,omitempty"`
+	SupportsReasoning         *bool     `json:"supports_reasoning,omitempty"`
+	DefaultReasoningEffort    string    `json:"default_reasoning_effort,omitempty"`
+	SupportedReasoningEfforts []string  `json:"supported_reasoning_efforts"`
+	InputModalities           []string  `json:"input_modalities"`
+	OutputModalities          []string  `json:"output_modalities"`
+	CreatedAt                 time.Time `json:"created_at"`
+	UpdatedAt                 time.Time `json:"updated_at"`
+}
+
+type ListProjectModelGrantsInput struct {
+	OrgID     uuid.UUID
+	ProjectID uuid.UUID
+	Limit     int
+	List      listing.Options
+}
+
+type ConfiguredModelSummaryRecord struct {
+	ID                    uuid.UUID `json:"id"`
+	OrgID                 uuid.UUID `json:"org_id"`
+	ModelProviderConfigID uuid.UUID `json:"model_provider_config_id"`
+	Name                  string    `json:"name"`
+	ProviderConfigName    string    `json:"provider_config"`
+	ProviderModelSlug     string    `json:"provider_model_slug"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
+}
+
+type ProjectModelGrantListRecord struct {
+	Grant ProjectModelGrantRecord
+	Model ConfiguredModelSummaryRecord
+	// Effective is the model's current revision with the grant applied, or nil
+	// when the grant no longer fits that revision. When reasoning is supported,
+	// SupportedReasoningEfforts lists the efforts an agent config may set, or is
+	// empty when any value is accepted.
+	Effective *ConfiguredModelRevisionRecord
+}
+
+type ListProjectModelGrantsResult struct {
+	Grants  []ProjectModelGrantListRecord
+	HasMore bool
+	Next    listing.Cursor
+}

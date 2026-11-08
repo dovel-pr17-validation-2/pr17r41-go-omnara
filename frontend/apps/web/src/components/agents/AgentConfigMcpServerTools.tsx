@@ -1,0 +1,330 @@
+import { Combobox as ComboboxPrimitive } from '@base-ui/react/combobox'
+import { useMcpServerTools } from '@omnara/react'
+import {
+  ApiError,
+  type McpServerTool,
+  type McpServerToolsRequest,
+  schemas,
+  type ToolPermissionProfile,
+} from '@omnara/sdk'
+import { type ReactNode, useState } from 'react'
+
+import {
+  mcpToolNameAddable,
+  type UnexposableMcpTool,
+  unexposableMcpTools,
+} from '@/components/agents/agentConfigMcp'
+import { AgentConfigMcpToolOverrideList } from '@/components/agents/AgentConfigMcpToolOverrideList'
+import { mcpServerAvailability } from '@/components/agents/mcpAvailability'
+import { mcpServerToolsRequest } from '@/components/agents/mcpServerToolsRequest'
+import {
+  type BasicMcpServer,
+  type BasicMcpTool,
+  type McpAuthType,
+} from '@/components/agents/useAgentBuilderForm'
+import { SearchIcon, TriangleAlert } from '@/components/icons'
+import { Button } from '@/components/ui/button'
+import {
+  Combobox,
+  ComboboxContent,
+  ComboboxEmpty,
+  ComboboxItem,
+  ComboboxList,
+  ComboboxLoading,
+} from '@/components/ui/combobox'
+import { Field, FieldLabel } from '@/components/ui/field'
+import { useDebouncedValue } from '@/hooks/use-resource-list'
+
+export function AgentConfigMcpServerTools({
+  orgId,
+  projectId,
+  server,
+  permissionProfile,
+  defaults,
+  onToolsChange,
+  onAuthTypeChange,
+}: {
+  orgId: string
+  projectId: string
+  server: BasicMcpServer
+  permissionProfile?: ToolPermissionProfile
+  defaults: ReactNode
+  onToolsChange: (tools: BasicMcpTool[]) => void
+  onAuthTypeChange: (authType: McpAuthType) => void
+}) {
+  const request = parseRequestKey(useDebouncedValue(JSON.stringify(mcpServerToolsRequest(server))))
+  const discovery = useMcpServerTools(orgId, projectId, request, {
+    onError: (error) => {
+      const detected = detectedAuthType(error)
+      if (server.authType === 'none' && detected != null) onAuthTypeChange(detected)
+    },
+  })
+  const discovered = discovery.data?.tools ?? []
+  const overriddenNames = new Set(server.tools.map((tool) => tool.name))
+  const unexposableTools = unexposableMcpTools(
+    server,
+    discovered.map((tool) => tool.name),
+  )
+  const discoveryFailure = visibleDiscoveryFailure(discovery, server.authType)
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-x-6 gap-y-3 sm:flex-nowrap">
+        <Field className="min-w-0 flex-1 basis-full sm:basis-auto">
+          <FieldLabel htmlFor={`${server.id}-tool-override`}>Tool overrides</FieldLabel>
+          <ToolOverridePicker
+            inputId={`${server.id}-tool-override`}
+            discovered={discovered}
+            overriddenNames={overriddenNames}
+            discovering={discovery.isPending && request != null}
+            onAdd={(name) => {
+              onToolsChange([...server.tools, { name, enabled: null, permission: null }])
+            }}
+          />
+        </Field>
+        {defaults}
+      </div>
+      <AgentConfigMcpToolOverrideList
+        tools={server.tools}
+        discovered={discovered}
+        permissionProfile={permissionProfile}
+        serverAvailability={mcpServerAvailability(server)}
+        onToolsChange={onToolsChange}
+      />
+      {unexposableTools.length > 0 && <UnexposableTools tools={unexposableTools} />}
+      {discoveryFailure && (
+        <DiscoveryFailure
+          error={discoveryFailure}
+          server={server}
+          onRetry={() => {
+            void discovery.refetch()
+          }}
+          onAuthTypeChange={onAuthTypeChange}
+        />
+      )}
+    </div>
+  )
+}
+
+function ToolOverridePicker({
+  inputId,
+  discovered,
+  overriddenNames,
+  discovering,
+  onAdd,
+}: {
+  inputId: string
+  discovered: McpServerTool[]
+  overriddenNames: Set<string>
+  discovering: boolean
+  onAdd: (name: string) => void
+}) {
+  const [query, setQuery] = useState('')
+  const candidates = discovered.filter((tool) => !overriddenNames.has(tool.name))
+  const typedName = query.trim()
+  const typedNameAddable =
+    mcpToolNameAddable(typedName) &&
+    !overriddenNames.has(typedName) &&
+    !discovered.some((tool) => tool.name === typedName)
+
+  function addOverride(name: string) {
+    if (overriddenNames.has(name)) return
+    onAdd(name)
+    setQuery('')
+  }
+
+  return (
+    <Combobox
+      items={candidates}
+      inputValue={query}
+      onInputValueChange={(value, details) => {
+        if (details.reason === 'input-change' || details.reason === 'input-clear') {
+          setQuery(value)
+        }
+      }}
+      value={null}
+      onValueChange={(tool: McpServerTool | null) => {
+        if (tool) addOverride(tool.name)
+      }}
+      itemToStringLabel={(tool: McpServerTool) => tool.name}
+      itemToStringValue={(tool: McpServerTool) => tool.name}
+      isItemEqualToValue={(tool: McpServerTool, other: McpServerTool) => tool.name === other.name}
+      filter={matchesToolSearch}
+    >
+      <div className="relative">
+        <SearchIcon className="text-muted-foreground pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2" />
+        <ComboboxPrimitive.Input
+          id={inputId}
+          className="placeholder:text-muted-foreground control-focus bg-background h-9 w-full rounded-md border pr-3 pl-9 text-base md:text-sm pointer-coarse:text-base"
+          placeholder="Add a tool override"
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && typedNameAddable) {
+              event.preventDefault()
+              addOverride(typedName)
+            }
+          }}
+        />
+      </div>
+      <ComboboxContent>
+        <ComboboxEmpty>
+          {discovering
+            ? null
+            : emptyMessage({
+                typedName: typedNameAddable ? typedName : null,
+                candidates,
+                discovered,
+              })}
+        </ComboboxEmpty>
+        <ComboboxList>
+          {(tool: McpServerTool) => (
+            <ComboboxItem key={tool.name} value={tool}>
+              <div className="min-w-0 flex-1">
+                <div className="truncate font-mono text-xs">{tool.name}</div>
+                {tool.description && (
+                  <div className="text-muted-foreground line-clamp-2 text-xs">
+                    {tool.description}
+                  </div>
+                )}
+              </div>
+            </ComboboxItem>
+          )}
+        </ComboboxList>
+        {discovering && <ComboboxLoading label="Discovering tools…" />}
+      </ComboboxContent>
+    </Combobox>
+  )
+}
+
+function matchesToolSearch(tool: McpServerTool, search: string) {
+  const needle = search.trim().toLowerCase()
+  return (
+    needle === '' ||
+    tool.name.toLowerCase().includes(needle) ||
+    (tool.title?.toLowerCase().includes(needle) ?? false) ||
+    (tool.description?.toLowerCase().includes(needle) ?? false)
+  )
+}
+
+function emptyMessage({
+  typedName,
+  candidates,
+  discovered,
+}: {
+  typedName: string | null
+  candidates: McpServerTool[]
+  discovered: McpServerTool[]
+}) {
+  if (typedName != null) return `Press Enter to add "${typedName}"`
+  if (candidates.length === 0 && discovered.length > 0) {
+    return 'Every discovered tool already has an override.'
+  }
+  return 'No tools match.'
+}
+
+function visibleDiscoveryFailure(
+  discovery: ReturnType<typeof useMcpServerTools>,
+  authType: McpAuthType,
+) {
+  if (!discovery.isError) return null
+  if (authType !== 'none') return discovery.error
+  return detectedAuthType(discovery.error) == null ? discovery.error : null
+}
+
+function parseRequestKey(key: string): McpServerToolsRequest | null {
+  if (key === '' || key === 'null') return null
+  const parsed = schemas.zMcpServerToolsRequest.safeParse(JSON.parse(key))
+  return parsed.success ? parsed.data : null
+}
+
+function DiscoveryFailure({
+  error,
+  server,
+  onRetry,
+  onAuthTypeChange,
+}: {
+  error: unknown
+  server: BasicMcpServer
+  onRetry: () => void
+  onAuthTypeChange: (authType: McpAuthType) => void
+}) {
+  const detected = detectedAuthType(error)
+  const switchable = detected != null && detected !== server.authType
+  return (
+    <div role="alert" className="text-warning flex items-start gap-2 text-sm">
+      <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+      <div className="min-w-0 flex-1 space-y-1">
+        <p className="font-medium">{discoveryFailureTitle(error, server, detected)}</p>
+        <p className="text-muted-foreground break-words">
+          {error instanceof ApiError ? error.message : 'Unexpected error.'}
+        </p>
+      </div>
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        className="shrink-0"
+        onClick={() => {
+          if (switchable) onAuthTypeChange(detected)
+          else onRetry()
+        }}
+      >
+        {switchable ? (detected === 'oauth' ? 'Use OAuth' : 'Use bearer secret') : 'Retry'}
+      </Button>
+    </div>
+  )
+}
+
+function UnexposableTools({ tools }: { tools: UnexposableMcpTool[] }) {
+  return (
+    <div role="alert" className="text-destructive flex items-start gap-2 text-sm">
+      <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+      <div className="min-w-0 flex-1 space-y-1">
+        <p className="font-medium">
+          {tools.length === 1
+            ? 'One tool cannot be exposed to the model, so the agent will fail to connect to this server. Fix the name or disable the tool.'
+            : `${tools.length} tools cannot be exposed to the model, so the agent will fail to connect to this server. Fix the names or disable the tools.`}
+        </p>
+        <ul className="text-muted-foreground list-disc space-y-0.5 pl-5">
+          {tools.map((tool) => (
+            <li key={tool.name} className="break-words">
+              {tool.error}
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  )
+}
+
+function detectedAuthType(cause: unknown): McpAuthType | null {
+  if (!(cause instanceof ApiError) || cause.status !== 422) return null
+  const parsed = schemas.zMcpServerAuthRequiredError.safeParse(cause.body)
+  return parsed.success ? (parsed.data.auth?.type ?? null) : null
+}
+
+function discoveryFailureTitle(
+  cause: unknown,
+  server: BasicMcpServer,
+  detected: McpAuthType | null,
+) {
+  if (detected === 'oauth') {
+    return server.authType === 'oauth'
+      ? 'The server rejected the selected OAuth secret. Log in again to refresh it.'
+      : 'This server uses OAuth. Switch authentication to an OAuth secret and log in.'
+  }
+  if (detected === 'bearer') {
+    return server.authType === 'bearer' || server.authType === 'sigv4'
+      ? 'The server rejected the selected secret.'
+      : 'This server expects a bearer token. Switch authentication to a bearer secret.'
+  }
+  if (cause instanceof ApiError && cause.status === 424) {
+    return 'The MCP server failed or did not respond. Try again.'
+  }
+  if (cause instanceof ApiError && cause.status === 422) {
+    return 'The MCP server did not accept the request.'
+  }
+  if (cause instanceof ApiError && cause.status === 404) {
+    return 'The selected secret is not available to this project.'
+  }
+  return 'Could not discover tools.'
+}

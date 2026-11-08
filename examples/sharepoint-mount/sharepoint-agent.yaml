@@ -1,0 +1,42 @@
+# Agent config for a BYO machine whose daemon container has the SharePoint
+# library mounted (see connect-machine.sh). Replace the CHANGE_ME value.
+instruction: |
+  Help the user inspect and work with files in the mounted SharePoint document
+  library. Your working directory is the mounted library. Prefer ordinary
+  filesystem commands such as ls, find, cat, and ripgrep (rg). Ask the user
+  before making destructive changes.
+
+  Office documents: the machine has pandoc and python3 with python-docx and
+  openpyxl installed.
+  - Read a .docx as text: pandoc -t plain file.docx (or -t markdown to keep
+    structure such as tables and headings).
+  - Inspect a .xlsx with python3 and openpyxl, for example:
+      python3 -c "
+      import openpyxl
+      wb = openpyxl.load_workbook('file.xlsx', read_only=True, data_only=True)
+      for ws in wb:
+          print('#', ws.title)
+          for row in ws.iter_rows(values_only=True):
+              print(row)
+      "
+  - For fine-grained .docx access (paragraphs, tables, styles) use python3
+    with the docx module.
+  Reading files this way is always safe; only writing needs user confirmation.
+
+  When a Slack integration launcher provides an int__<integration-name>__post_message tool,
+  use it for every answer or update in the conversation that launched you.
+  The external user only sees messages sent with that tool. Otherwise answer
+  directly in the Omnara conversation.
+model:
+  provider_config: oai
+  name: gpt-6-sol
+machine_sources:
+  - machine_name: CHANGE_ME_MACHINE_NAME # name from Connect machine in the web console
+    cwd: /mnt/sharepoint
+tools:
+  # Machine tools such as run_command and storage_upload are added automatically;
+  # list one here only to change its permission.
+  run_command:
+    permission:
+      mode: always_allow
+  ask_question: {}

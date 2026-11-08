@@ -1,0 +1,282 @@
+package skillstore
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/omnara-ai/omnara/internal/skills"
+	"github.com/omnara-ai/omnara/internal/storage/identitystore"
+	"github.com/omnara-ai/omnara/internal/storage/internal/dbsqlc"
+	"github.com/omnara-ai/omnara/internal/storage/storeerr"
+)
+
+func lockActiveUserSkillOwnerTx(
+	ctx context.Context,
+	qtx *dbsqlc.Queries,
+	orgID, userID uuid.UUID,
+) error {
+	if _, err := qtx.LockUserForUpdate(
+		ctx,
+		dbsqlc.LockUserForUpdateParams{ID: userID},
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return storeerr.ErrUnauthorized
+		}
+		return fmt.Errorf("lock skill owner: %w", err)
+	}
+	if _, err := qtx.GetOrgAuthorizationRole(
+		ctx,
+		dbsqlc.GetOrgAuthorizationRoleParams{OrgID: orgID, UserID: userID},
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return storeerr.ErrUnauthorized
+		}
+		return fmt.Errorf("load skill owner organization membership: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) validateCreateSkillInput(ctx context.Context, input CreateSkillInput) error {
+	if input.OrgID == uuid.Nil || input.Actor.ID == uuid.Nil {
+		return invalidSkillRequest("org and actor are required")
+	}
+	if err := s.AuthorizeSkillOwnerManage(ctx, input.OrgID, SkillOwner{
+		Kind: input.OwnerKind, ProjectID: input.OwnerProjectID, UserID: input.OwnerUserID,
+	}, input.Actor); err != nil {
+		return err
+	}
+	if input.Name == "" {
+		return invalidSkillName("skill name is required")
+	}
+	if err := skills.ValidateName(input.Name); err != nil {
+		return invalidSkillName("skill name %v", err)
+	}
+	if input.Description == "" {
+		return invalidSkillRequest("skill description is required")
+	}
+	if input.SkillMd == "" {
+		return invalidSkillRequest("skill body is required")
+	}
+	if len(input.ArchiveBytes) == 0 {
+		return invalidSkillRequest("skill archive bytes are required")
+	}
+	return nil
+}
+
+type SkillOwner struct {
+	Kind      string
+	ProjectID uuid.UUID
+	UserID    uuid.UUID
+}
+
+func (s *Store) AuthorizeSkillOwnerManage(
+	ctx context.Context,
+	orgID uuid.UUID,
+	owner SkillOwner,
+	actor identitystore.PrincipalRecord,
+) error {
+	switch owner.Kind {
+	case SkillOwnerOrg:
+		if owner.ProjectID != uuid.Nil || owner.UserID != uuid.Nil {
+			return invalidSkillRequest("org-owned skill cannot set project or user owner")
+		}
+		return s.authorizeOrgSkillManage(ctx, orgID, actor)
+	case SkillOwnerProject:
+		if owner.ProjectID == uuid.Nil || owner.UserID != uuid.Nil {
+			return invalidSkillRequest("project-owned skill requires only project owner")
+		}
+		return s.authorizeProjectSkillManage(ctx, orgID, owner.ProjectID, actor)
+	case SkillOwnerUser:
+		if owner.ProjectID != uuid.Nil || owner.UserID == uuid.Nil {
+			return invalidSkillRequest("user-owned skill requires only user owner")
+		}
+		if actor.Type != identitystore.PrincipalTypeUser || owner.UserID != actor.ID {
+			return storeerr.ErrUnauthorized
+		}
+		return s.requireOrgMember(ctx, orgID, actor)
+	default:
+		return invalidSkillRequest("unsupported owner kind %q", owner.Kind)
+	}
+}
+
+func (s *Store) authorizeSkillManage(
+	ctx context.Context,
+	skill SkillRecord,
+	actor identitystore.PrincipalRecord,
+) error {
+	return s.AuthorizeSkillOwnerManage(ctx, skill.OrgID, SkillOwner{
+		Kind: skill.OwnerKind, ProjectID: skill.OwnerProjectID, UserID: skill.OwnerUserID,
+	}, actor)
+}
+
+func (s *Store) authorizeSkillRead(
+	ctx context.Context,
+	skill SkillRecord,
+	actor identitystore.PrincipalRecord,
+) error {
+	if actor.ID == uuid.Nil {
+		return storeerr.ErrUnauthorized
+	}
+	switch skill.OwnerKind {
+	case SkillOwnerOrg:
+		allowed, err := s.access.AuthorizeOrg(ctx, identitystore.AuthorizeOrgInput{
+			Principal: actor,
+			OrgID:     skill.OrgID,
+			Action:    identitystore.OrgActionRead,
+		})
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return storeerr.ErrUnauthorized
+		}
+		return nil
+	case SkillOwnerProject:
+		allowed, err := s.access.AuthorizeProject(ctx, identitystore.AuthorizeProjectInput{
+			Principal: actor,
+			OrgID:     skill.OrgID,
+			ProjectID: skill.OwnerProjectID,
+			Action:    identitystore.ProjectActionRead,
+		})
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			return storeerr.ErrUnauthorized
+		}
+		return nil
+	case SkillOwnerUser:
+		if actor.Type != identitystore.PrincipalTypeUser || skill.OwnerUserID != actor.ID {
+			return storeerr.ErrUnauthorized
+		}
+		return s.requireOrgMember(ctx, skill.OrgID, actor)
+	default:
+		return fmt.Errorf("unsupported skill owner kind %q", skill.OwnerKind)
+	}
+}
+
+// authorizeSharedSkillRead lets a skill be read by anyone who can read a project it's shared
+// with, since that project's agents can already use it.
+func (s *Store) authorizeSharedSkillRead(
+	ctx context.Context,
+	skill SkillRecord,
+	actor identitystore.PrincipalRecord,
+) error {
+	projectIDs, err := s.q.ListSkillGrantTargetProjectIDs(ctx, dbsqlc.ListSkillGrantTargetProjectIDsParams{
+		OrgID: skill.OrgID, SkillID: skill.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("list skill grant projects: %w", err)
+	}
+	for _, projectID := range projectIDs {
+		allowed, err := s.access.AuthorizeProject(ctx, identitystore.AuthorizeProjectInput{
+			Principal: actor,
+			OrgID:     skill.OrgID,
+			ProjectID: projectID,
+			Action:    identitystore.ProjectActionRead,
+		})
+		if err != nil {
+			return err
+		}
+		if allowed {
+			return nil
+		}
+	}
+	return storeerr.ErrUnauthorized
+}
+
+func (s *Store) authorizeOrgSkillManage(
+	ctx context.Context,
+	orgID uuid.UUID,
+	actor identitystore.PrincipalRecord,
+) error {
+	allowed, err := s.access.AuthorizeOrg(ctx, identitystore.AuthorizeOrgInput{
+		Principal: actor,
+		OrgID:     orgID,
+		Action:    identitystore.OrgActionManage,
+	})
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return storeerr.ErrUnauthorized
+	}
+	return nil
+}
+
+func (s *Store) authorizeProjectSkillManage(
+	ctx context.Context,
+	orgID, projectID uuid.UUID,
+	actor identitystore.PrincipalRecord,
+) error {
+	allowed, err := s.access.AuthorizeProject(ctx, identitystore.AuthorizeProjectInput{
+		Principal: actor,
+		OrgID:     orgID,
+		ProjectID: projectID,
+		Action:    identitystore.ProjectActionManage,
+	})
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return storeerr.ErrUnauthorized
+	}
+	return nil
+}
+
+func (s *Store) requireOrgMember(
+	ctx context.Context,
+	orgID uuid.UUID,
+	actor identitystore.PrincipalRecord,
+) error {
+	allowed, err := s.access.HasOrgMembership(ctx, actor, orgID)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return storeerr.ErrUnauthorized
+	}
+	return nil
+}
+
+func (s *Store) skillVisibleForCompile(
+	ctx context.Context,
+	rec SkillRecord,
+	input GetSkillsByIDsInput,
+) (bool, error) {
+	if rec.OrgID != input.OrgID || input.ProjectID == uuid.Nil {
+		return false, nil
+	}
+	if rec.OwnerKind == SkillOwnerProject && rec.OwnerProjectID == input.ProjectID {
+		return true, nil
+	}
+	available, err := s.q.SkillAvailableToProject(ctx, dbsqlc.SkillAvailableToProjectParams{
+		OrgID: input.OrgID, SkillID: rec.ID, ProjectID: input.ProjectID,
+	})
+	if err != nil {
+		return false, fmt.Errorf("check skill project grant: %w", err)
+	}
+	return available, nil
+}
+
+func (s *Store) authorizeSkillGrantDelete(
+	ctx context.Context,
+	skill SkillRecord,
+	targetProjectID uuid.UUID,
+	actor identitystore.PrincipalRecord,
+) error {
+	if err := s.authorizeSkillManage(ctx, skill, actor); err == nil {
+		return nil
+	} else if !errors.Is(err, storeerr.ErrUnauthorized) {
+		return err
+	}
+	if err := s.authorizeProjectSkillManage(ctx, skill.OrgID, targetProjectID, actor); err == nil {
+		return nil
+	} else if !errors.Is(err, storeerr.ErrUnauthorized) {
+		return err
+	}
+	return storeerr.ErrNotFound
+}

@@ -1,0 +1,114 @@
+---
+title: Artifacts
+description: View metadata and download files referenced in an agent's event log
+icon: "box-archive"
+---
+
+The event log stays lightweight because it never embeds file bytes. When inline media enters the conversation, the bytes are stored as an **artifact** (`art_…`) and the persisted event carries a `media_ref` block pointing at it:
+
+```json
+{ "type": "media_ref", "artifact_id": "art_z3jehcyd5n6a2bfgik7mv4qtrw" }
+```
+
+In the dashboard, artifacts appear as downloadable cards or attachment chips on the conversation timeline; rendering your own timeline means resolving each `media_ref` with the two endpoints on this page.
+
+Model context identifies conversation attachments by their public `artifact_id`, allowing an agent with [`storage_download`](/tools/built-in#storage_download) to copy one to an attached machine using `path: "/artifacts/<artifact_id>"` and a machine `destination`.
+
+## Artifacts uploaded by an agent
+
+A successful [`storage_upload`](/tools/built-in#storage_upload) result contains the `path` as structured data and a `media_ref` for presentation. Use the artifact ID from the final component of the path with the metadata and content endpoints below.
+
+The relevant fields in the resulting event look like this:
+
+```json
+{
+  "event_kind": "tool_result",
+  "tool_call_id": "tcl_wz3jehcyd5n6a2bfgik7mv4qtr",
+  "outcome": "succeeded",
+  "content_blocks": [
+    {
+      "type": "structured_data",
+      "value": {
+        "path": "/artifacts/art_z3jehcyd5n6a2bfgik7mv4qtrw"
+      }
+    },
+    {
+      "type": "media_ref",
+      "artifact_id": "art_z3jehcyd5n6a2bfgik7mv4qtrw",
+      "exclude_from_model_context": true
+    }
+  ]
+}
+```
+
+```bash
+export BASE="$OMNARA_API/orgs/$ORG/projects/$PROJ"
+export AGENT="agt_v4qtrwz3jehcyd5n6a2bfgik7m"
+```
+
+## Get artifact metadata
+
+Fetch the descriptor first when you need to decide how to render or whether to download:
+
+```bash
+curl "$BASE/agents/$AGENT/artifacts/art_z3jehcyd5n6a2bfgik7mv4qtrw" \
+  -H "Authorization: Bearer $OMNARA_TOKEN"
+```
+
+```json
+{
+  "id": "art_z3jehcyd5n6a2bfgik7mv4qtrw",
+  "org_id": "org_k7mv4qtrwz3jehcyd5n6a2bfgi",
+  "project_id": "proj_7mv4qtrwz3jehcyd5n6a2bfgik",
+  "agent_id": "agt_v4qtrwz3jehcyd5n6a2bfgik7m",
+  "content_type": "application/pdf",
+  "filename": "eu-ai-act-summary.pdf",
+  "digest": "sha256:9f2ab8…",
+  "size_bytes": 482133,
+  "created_at": "2026-08-03T19:15:40Z"
+}
+```
+
+`digest` is a content hash — useful for caching and deduplication on your side: if you've already stored that digest, skip the download.
+
+<Info>
+Full schema and playground: [Get artifact](/api-reference/endpoints/events/get-artifact).
+</Info>
+
+## Download the content
+
+The content endpoint returns the raw bytes with the artifact's content type:
+
+```bash
+curl -o eu-ai-act-summary.pdf \
+  "$BASE/agents/$AGENT/artifacts/art_z3jehcyd5n6a2bfgik7mv4qtrw/content" \
+  -H "Authorization: Bearer $OMNARA_TOKEN"
+```
+
+Content is immutable — the same artifact ID always yields the same bytes, so responses are safe to cache indefinitely.
+
+<Info>
+Full schema and playground: [Get artifact content](/api-reference/endpoints/events/get-artifact-content).
+</Info>
+
+## Where artifacts come from
+
+| Source | What happens |
+| --- | --- |
+| Inline `media` block on an [input](/events/sending-input#attach-files-and-images) | Persisted as an artifact; the stored event shows a `media_ref`. |
+| Inline `media` block on a [custom tool result](/api-reference/endpoints/agents/submit-a-result-for-a-ready-custom-tool-call) | Same conversion — submission accepts bytes, the timeline stores a reference. |
+| `storage_upload` | The durable tool result stores the path and a `media_ref`. |
+| Model output with media | The `model_output` event references it. |
+
+There's no general-purpose public endpoint for creating artifacts; they're created during agent interactions.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Streaming events" icon="tower-broadcast" href="/events/streaming">
+    Where media_ref blocks appear in each event kind
+  </Card>
+  <Card title="Sending input" icon="paper-plane" href="/events/sending-input">
+    Attach files to your messages
+  </Card>
+</CardGroup>

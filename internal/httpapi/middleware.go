@@ -1,0 +1,346 @@
+package httpapi
+
+import (
+	"context"
+	"crypto/subtle"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/omnara-ai/omnara/internal/bearertoken"
+	"github.com/omnara-ai/omnara/internal/daemonprotocol"
+	"github.com/omnara-ai/omnara/internal/errutil"
+	"github.com/omnara-ai/omnara/internal/httpapi/apierror"
+	"github.com/omnara-ai/omnara/internal/httpapi/apimcp"
+	httpauth "github.com/omnara-ai/omnara/internal/httpapi/auth"
+	"github.com/omnara-ai/omnara/internal/httpapi/openapi"
+	"github.com/omnara-ai/omnara/internal/integration/discord"
+	"github.com/omnara-ai/omnara/internal/integration/slack"
+	"github.com/omnara-ai/omnara/internal/log/logent"
+	"github.com/omnara-ai/omnara/internal/modelcontext"
+	"github.com/omnara-ai/omnara/internal/skills"
+	"github.com/omnara-ai/omnara/internal/storage/identitystore"
+	"github.com/omnara-ai/omnara/internal/storage/integrationstore"
+	"github.com/omnara-ai/omnara/internal/storage/storeerr"
+	"github.com/omnara-ai/omnara/observability/httprequest"
+	"github.com/omnara-ai/omnara/observability/metrics"
+	logpkg "github.com/omnara-ai/omnara/observability/wideevent"
+)
+
+type principalContextKey struct{}
+type browserCSRFHashContextKey struct{}
+
+const maxRequestBodyBytes int64 = 1024 * 1024
+
+// maxAttachmentRequestBodyBytes covers the per-input attachment budget as
+// base64 (4/3 expansion) plus headroom for the surrounding JSON.
+const maxAttachmentRequestBodyBytes int64 = 2 * modelcontext.MaxResolvedMediaBytes
+
+const maxSkillUploadRequestBodyBytes int64 = int64(skills.MaxArchiveBytes) + 1024*1024
+
+const (
+	uploadBaseTime          = 30 * time.Second
+	uploadMinBytesPerSecond = 64 * 1024
+)
+
+func uploadBudget(limitBytes int64) time.Duration {
+	return uploadBaseTime + time.Duration(limitBytes/uploadMinBytesPerSecond)*time.Second
+}
+
+func requestBodyLimit(r *http.Request) int64 {
+	if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/memory-stores/") &&
+		strings.HasSuffix(r.URL.Path, "/file") {
+		return daemonprotocol.MaxFileTransferBytes
+	}
+	if r.Method != http.MethodPost {
+		return maxRequestBodyBytes
+	}
+	switch {
+	case r.URL.Path == httpauth.OAuthDeviceAuthorizationPath, r.URL.Path == httpauth.OAuthTokenPath:
+		return httpauth.MaxOAuthFormBytes
+	case r.URL.Path == slackEventsPath:
+		return slack.EventBodyMaxBytes
+	case r.URL.Path == slackActionsPath:
+		return slack.ActionBodyMaxBytes
+	case r.URL.Path == GitHubEventsPath:
+		return integrationstore.IntegrationInboxMaxPayloadBytes
+	case strings.HasPrefix(r.URL.Path, "/api/integrations/discord/") && strings.HasSuffix(r.URL.Path, "/interactions"):
+		return discord.InteractionMaxBytes
+	case strings.HasSuffix(r.URL.Path, "/slack-setup"):
+		return maxSlackSetupRequestBodyBytes
+	case strings.HasSuffix(r.URL.Path, "/inputs"),
+		strings.Contains(r.URL.Path, "/tool-calls/") &&
+			strings.HasSuffix(r.URL.Path, "/result"):
+		return maxAttachmentRequestBodyBytes
+	case strings.HasSuffix(r.URL.Path, "/skills"), isSkillUpdatePath(r.URL.Path):
+		return maxSkillUploadRequestBodyBytes
+	case strings.HasPrefix(r.URL.Path, openAPIBasePath+"/daemon/processes/") &&
+		strings.HasSuffix(r.URL.Path, "/file"):
+		return daemonprotocol.MaxFileTransferBytes
+	}
+	return maxRequestBodyBytes
+}
+
+func isSkillUpdatePath(path string) bool {
+	idx := strings.LastIndexByte(path, '/')
+	if idx < 0 {
+		return false
+	}
+	return path[idx+1:] != "" && strings.HasSuffix(path[:idx], "/skills")
+}
+
+type middleware func(http.Handler) http.Handler
+
+func chain(handler http.Handler, middlewares ...middleware) http.Handler {
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		handler = middlewares[i](handler)
+	}
+	return handler
+}
+
+func requestEvents(log *slog.Logger, recorder *metrics.HTTPRecorder, mux *http.ServeMux) middleware {
+	config := httprequest.Config{
+		Logger:  log,
+		Metrics: recorder,
+		Mux:     mux,
+		WriteInternalError: func(w http.ResponseWriter) {
+			apierror.Write(w, openapi.ErrorCodeInternalError)
+		},
+	}
+	return func(next http.Handler) http.Handler {
+		return httprequest.Handler(config, next)
+	}
+}
+
+func rejectCanceledRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.Context().Err(); err != nil {
+			logpkg.Error(r.Context(), err)
+			closeHTTP1Connection(w, r)
+			apierror.Write(w, openapi.ErrorCodeServiceUnavailable)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func closeHTTP1Connection(w http.ResponseWriter, r *http.Request) {
+	if r.ProtoMajor == 1 {
+		w.Header().Set("Connection", "close")
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now())
+	}
+}
+
+func maxBody(limit func(*http.Request) int64, budget func(int64) time.Duration) middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Body != nil {
+				limitBytes := limit(r)
+				if r.Body != http.NoBody {
+					_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(budget(limitBytes)))
+				}
+				r.Body = limitedBody{ReadCloser: http.MaxBytesReader(w, r.Body, limitBytes), w: w, r: r}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+type limitedBody struct {
+	io.ReadCloser
+	w http.ResponseWriter
+	r *http.Request
+}
+
+func (b limitedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		closeHTTP1Connection(b.w, b.r)
+	}
+	return n, err
+}
+
+func (s *Server) auth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !requiresAuth(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		const prefix = "Bearer "
+		header := r.Header.Get("Authorization")
+		authAttempted := false
+		if s.store != nil {
+			if strings.HasPrefix(header, prefix) {
+				token := strings.TrimPrefix(header, prefix)
+				principal, kind, err := s.authenticateBearerToken(r.Context(), r, token)
+				if err == nil {
+					logent.Authenticated(r.Context(), principal)
+					next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalContextKey{}, principal)))
+					return
+				}
+				if !errors.Is(err, storeerr.ErrUnauthorized) {
+					logent.AuthFailedError(
+						r.Context(),
+						logent.AuthSchemeBearer,
+						kind,
+						logent.AuthResultUnavailable,
+						err,
+					)
+					apierror.Write(w, openapi.ErrorCodeAuthenticationUnavailable)
+					return
+				}
+				logent.AuthFailed(
+					r.Context(),
+					logent.AuthSchemeBearer,
+					kind,
+					logent.AuthResultUnauthorized,
+				)
+				s.writeUnauthorized(w, r)
+				return
+			}
+			sessionCookie, cookieErr := httpauth.BrowserSessionCookie(r, s.publicURL)
+			if cookieErr == nil {
+				authAttempted = true
+				principal, csrfHash, err := s.store.Identity().AuthenticateBrowserSession(
+					r.Context(),
+					sessionCookie.Value,
+				)
+				if err == nil {
+					if mutatesState(r.Method) && !s.validBrowserCSRF(r, csrfHash) {
+						logent.AuthFailed(
+							r.Context(),
+							logent.AuthSchemeCookie,
+							logent.TokenKindBrowserSession,
+							logent.AuthResultCSRFFailed,
+						)
+						apierror.Write(w, openapi.ErrorCodeCsrfCheckFailed)
+						return
+					}
+					logent.Authenticated(r.Context(), principal)
+					ctx := context.WithValue(r.Context(), principalContextKey{}, principal)
+					ctx = context.WithValue(ctx, browserCSRFHashContextKey{}, csrfHash)
+					next.ServeHTTP(w, r.WithContext(ctx))
+					return
+				}
+				if !errors.Is(err, storeerr.ErrUnauthorized) {
+					logent.AuthFailedError(
+						r.Context(),
+						logent.AuthSchemeCookie,
+						logent.TokenKindBrowserSession,
+						logent.AuthResultUnavailable,
+						err,
+					)
+					if errors.Is(r.Context().Err(), context.Canceled) && errutil.OnlyMatches(err, context.Canceled) {
+						return
+					}
+					apierror.Write(w, openapi.ErrorCodeAuthenticationUnavailable)
+					return
+				}
+				logent.AuthFailed(
+					r.Context(),
+					logent.AuthSchemeCookie,
+					logent.TokenKindBrowserSession,
+					logent.AuthResultUnauthorized,
+				)
+			}
+		}
+		if !authAttempted {
+			logent.AuthFailed(
+				r.Context(),
+				logent.AuthSchemeNone,
+				logent.TokenKindUnknown,
+				logent.AuthResultUnauthorized,
+			)
+		}
+		s.writeUnauthorized(w, r)
+	})
+}
+
+func (s *Server) writeUnauthorized(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == apimcp.Path {
+		w.Header().Set("WWW-Authenticate", `Bearer resource_metadata="`+s.mcpProtectedResourceMetadataURL(r)+`"`)
+	}
+	apierror.Write(w, openapi.ErrorCodeUnauthorized)
+}
+
+func (s *Server) authenticateBearerToken(
+	ctx context.Context,
+	r *http.Request,
+	token string,
+) (identitystore.PrincipalRecord, logent.TokenKind, error) {
+	kind, err := bearertoken.Parse(token)
+	if err != nil {
+		return identitystore.PrincipalRecord{}, logent.TokenKindUnknown, storeerr.ErrUnauthorized
+	}
+	switch kind {
+	case bearertoken.KindOAuthAccess:
+		authenticated, err := s.store.Identity().AuthenticateOAuthAccessToken(ctx, token)
+		if err != nil {
+			return identitystore.PrincipalRecord{}, logent.TokenKindOAuthAccess, err
+		}
+		if r.URL.Path != apimcp.Path || authenticated.Resource != s.mcpResourceURL(r) {
+			return identitystore.PrincipalRecord{}, logent.TokenKindOAuthAccess, storeerr.ErrUnauthorized
+		}
+		return authenticated.Principal, logent.TokenKindOAuthAccess, nil
+	case bearertoken.KindPersonalAccess:
+		principal, err := s.store.Identity().AuthenticatePersonalAccessToken(ctx, token)
+		return principal, logent.TokenKindPersonalAccess, err
+	case bearertoken.KindOrganization:
+		principal, err := s.store.Identity().AuthenticateOrgAPIKey(ctx, token)
+		return principal, logent.TokenKindOrgAPIKey, err
+	case bearertoken.KindDaemon:
+		principal, err := s.store.Execution().AuthenticateMachineDaemonToken(ctx, token)
+		return principal, logent.TokenKindMachineDaemon, err
+	default:
+		return identitystore.PrincipalRecord{}, logent.TokenKindUnknown, storeerr.ErrUnauthorized
+	}
+}
+
+func requiresAuth(path string) bool {
+	if strings.HasPrefix(path, openAPIBasePath+"/") {
+		return true
+	}
+	for _, route := range serverManualRouteContracts {
+		if route.Pattern == path {
+			return route.Access == manualRouteAccessAuthRequired
+		}
+	}
+	for _, route := range httpauth.RouteContracts() {
+		if route.Pattern == path {
+			return route.RequiresAuth()
+		}
+	}
+	return false
+}
+
+func mutatesState(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
+	}
+}
+
+func (s *Server) validBrowserCSRF(r *http.Request, csrfHash string) bool {
+	if csrfHash == "" {
+		return false
+	}
+	if !s.sameOrigin(r) {
+		return false
+	}
+	presented := r.Header.Get(httpauth.CSRFHeaderName)
+	if presented == "" {
+		return false
+	}
+	hashed := identitystore.HashBearerToken(presented)
+	return subtle.ConstantTimeCompare([]byte(hashed), []byte(csrfHash)) == 1
+}
+
+func (s *Server) sameOrigin(r *http.Request) bool {
+	return httpauth.SameOrigin(s.publicURL, r)
+}

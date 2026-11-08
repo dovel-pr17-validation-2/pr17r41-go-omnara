@@ -1,0 +1,388 @@
+import { useAgentInteractions, useResolveAgentInteraction } from '@omnara/react'
+import type {
+  AgentInteraction,
+  InteractionAnswer,
+  InteractionFormOption,
+  ResolveAgentInteractionRequest,
+} from '@omnara/sdk'
+import { useState } from 'react'
+
+import { KeyRound, MessageCircleQuestion } from '@/components/icons'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { isImeComposing } from '@/lib/ime-composition'
+import { errorMessage } from '@/lib/submit-status'
+import { cn } from '@/lib/utils'
+
+type Resolve = (
+  interaction: AgentInteraction,
+  body: ResolveAgentInteractionRequest,
+) => Promise<void>
+
+function selectedOptions(
+  options: InteractionFormOption[],
+  optionIndices: number[],
+): InteractionFormOption[] {
+  return optionIndices.flatMap((index) => options[index] ?? [])
+}
+
+function keyedContextItems(interaction: AgentInteraction) {
+  const occurrences = new Map<string, number>()
+  return (interaction.request.context ?? []).map((item) => {
+    const contentKey = JSON.stringify([item.label, item.value])
+    const occurrence = (occurrences.get(contentKey) ?? 0) + 1
+    occurrences.set(contentKey, occurrence)
+    return {
+      item,
+      key: `${interaction.id}:context:${contentKey}:${String(occurrence)}`,
+    }
+  })
+}
+
+function subagentSourceLabel(interaction: AgentInteraction): string | null {
+  if (interaction.agent_name == null) return null
+  return `From subagent ${interaction.agent_name}`
+}
+
+/**
+ * A permission request answered in one click. Options render as buttons, the first
+ * (Allow) as the primary action; an option that accepts text (Deny) can carry a reason.
+ */
+function PermissionActions({
+  interaction,
+  resolve,
+  pending,
+  canOperate,
+}: {
+  interaction: AgentInteraction
+  resolve: Resolve
+  pending: boolean
+  canOperate: boolean
+}) {
+  const [reason, setReason] = useState('')
+  const [reasonOpen, setReasonOpen] = useState(false)
+  const [chosen, setChosen] = useState<number | null>(null)
+  const options = interaction.request.questions[0]?.options ?? []
+  const reasonIndex = options.findIndex((option) => option.allows_text === true)
+  const reasonId = `${interaction.id}-reason`
+  const disabled = !canOperate || pending
+
+  function answer(optionIndex: number) {
+    const text = reason.trim()
+    const selection: InteractionAnswer = { option_indices: [optionIndex] }
+    if (optionIndex === reasonIndex && text !== '') selection.text = text
+    setChosen(optionIndex)
+    void resolve(interaction, { answers: [selection] }).catch(() => undefined)
+  }
+
+  return (
+    <div className="grid min-w-0 gap-2">
+      {reasonOpen && reasonIndex !== -1 && (
+        <>
+          <Label htmlFor={reasonId} className="sr-only">
+            Reason for denying (optional)
+          </Label>
+          <Input
+            id={reasonId}
+            className="h-8 sm:h-8"
+            value={reason}
+            placeholder="Reason for denying (optional)"
+            disabled={disabled}
+            autoComplete="off"
+            onChange={(event) => {
+              setReason(event.target.value)
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && !isImeComposing(event.nativeEvent) && !disabled) {
+                event.preventDefault()
+                answer(reasonIndex)
+              }
+            }}
+          />
+        </>
+      )}
+      <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
+        {reasonIndex !== -1 && !reasonOpen && (
+          <button
+            type="button"
+            className="text-muted-foreground hover:text-foreground mr-auto text-xs underline-offset-2 hover:underline disabled:opacity-50"
+            disabled={disabled}
+            onClick={() => {
+              setReasonOpen(true)
+            }}
+          >
+            Add a reason
+          </button>
+        )}
+        {options
+          .map((option, optionIndex) => ({ option, optionIndex }))
+          .reverse()
+          .map(({ option, optionIndex }) => (
+            <Button
+              key={optionIndex}
+              type="button"
+              size="sm"
+              variant={optionIndex === 0 ? 'default' : 'outline'}
+              className="min-w-20"
+              disabled={disabled}
+              loading={pending && chosen === optionIndex}
+              onClick={() => {
+                answer(optionIndex)
+              }}
+            >
+              {option.label}
+            </Button>
+          ))}
+      </div>
+    </div>
+  )
+}
+
+function InteractionFormCard({
+  interaction,
+  resolve,
+  pending,
+  canOperate,
+}: {
+  interaction: AgentInteraction
+  resolve: Resolve
+  pending: boolean
+  canOperate: boolean
+}) {
+  const [selections, setSelections] = useState<Record<number, number[]>>({})
+  const [responses, setResponses] = useState<Record<number, string>>({})
+  const isPermission = interaction.interaction_kind === 'permission'
+  const questions = interaction.request.questions
+  let complete = true
+  for (let questionIndex = 0; questionIndex < questions.length; questionIndex += 1) {
+    if ((selections[questionIndex]?.length ?? 0) === 0) {
+      complete = false
+      break
+    }
+  }
+  const directPermission = isPermission && questions.length === 1 && questions[0]?.multiple !== true
+  const contextItems = keyedContextItems(interaction)
+  const toolName = interaction.tool_name ?? null
+  const subagentLabel = subagentSourceLabel(interaction)
+
+  function submit() {
+    const answers: InteractionAnswer[] = []
+    for (const [questionIndex, question] of interaction.request.questions.entries()) {
+      const optionIndices = selections[questionIndex]
+      if (optionIndices == null || optionIndices.length === 0) return
+      const options = selectedOptions(question.options, optionIndices)
+      const answer: InteractionAnswer = {
+        option_indices: optionIndices,
+      }
+      const text = responses[questionIndex]?.trim()
+      if (options.some((option) => option.allows_text === true) && text != null && text !== '') {
+        answer.text = text
+      }
+      answers.push(answer)
+    }
+    void resolve(interaction, {
+      answers,
+    }).catch(() => undefined)
+  }
+
+  return (
+    <Card className="border-primary/35 bg-primary/[0.04] min-w-0 gap-3 shadow-none">
+      <CardHeader className="min-w-0 gap-1">
+        {isPermission ? (
+          <CardTitle className="text-link flex flex-wrap items-center gap-2 text-sm wrap-anywhere">
+            <KeyRound className="size-4 shrink-0" />
+            {toolName == null ? (
+              interaction.request.title
+            ) : (
+              <>
+                Permission requested for
+                <span className="bg-muted text-foreground rounded-md px-2 py-1 font-mono text-xs">
+                  {toolName}
+                </span>
+              </>
+            )}
+          </CardTitle>
+        ) : (
+          <CardTitle className="text-primary flex items-center gap-2 text-sm wrap-anywhere">
+            <MessageCircleQuestion className="size-4 shrink-0" />
+            {interaction.request.title}
+          </CardTitle>
+        )}
+      </CardHeader>
+      <CardContent className="grid min-w-0 gap-4">
+        {subagentLabel != null && (
+          <p className="text-muted-foreground text-xs wrap-anywhere">{subagentLabel}</p>
+        )}
+        {contextItems.length > 0 && (
+          <dl className="bg-background grid min-w-0 gap-2 rounded-md border p-3 text-xs">
+            {contextItems.map(({ item, key }) => (
+              <div key={key} className="grid min-w-0 gap-1">
+                <dt className="text-muted-foreground font-medium wrap-anywhere">{item.label}</dt>
+                <dd className="font-mono wrap-anywhere whitespace-pre-wrap">{item.value}</dd>
+              </div>
+            ))}
+          </dl>
+        )}
+        {directPermission && (
+          <PermissionActions
+            interaction={interaction}
+            resolve={resolve}
+            pending={pending}
+            canOperate={canOperate}
+          />
+        )}
+        {!directPermission &&
+          questions.map((question, questionIndex) => {
+            const optionIndices = selections[questionIndex] ?? []
+            const optionIndexSet = new Set(optionIndices)
+            const allowsText = selectedOptions(question.options, optionIndices).some(
+              (option) => option.allows_text === true,
+            )
+            const isLast = questionIndex === questions.length - 1
+            const responseId = `${interaction.id}-${questionIndex}-response`
+            const responseLabel = isPermission ? 'Reason (optional)' : 'Details (optional)'
+            return (
+              <fieldset key={questionIndex} className="grid min-w-0 gap-3">
+                <legend
+                  className={cn(
+                    'mb-3 text-sm font-medium wrap-anywhere',
+                    isPermission && 'sr-only',
+                  )}
+                >
+                  {question.prompt}
+                </legend>
+                <div className="flex min-w-0 flex-wrap items-center gap-2">
+                  {question.options.map((candidate, optionIndex) => (
+                    <Button
+                      key={optionIndex}
+                      type="button"
+                      size="sm"
+                      variant={optionIndexSet.has(optionIndex) ? 'default' : 'outline'}
+                      className="h-auto min-h-8 max-w-full text-left wrap-anywhere whitespace-normal"
+                      disabled={!canOperate || pending}
+                      onClick={() => {
+                        const nextOptionIndices =
+                          question.multiple === true
+                            ? optionIndexSet.has(optionIndex)
+                              ? optionIndices.filter((index) => index !== optionIndex)
+                              : [...optionIndices, optionIndex]
+                            : [optionIndex]
+                        const nextOptionIndexSet = new Set(nextOptionIndices)
+                        setSelections((current) => ({
+                          ...current,
+                          [questionIndex]: nextOptionIndices,
+                        }))
+                        const nextAllowsText = question.options.some(
+                          (option, index) =>
+                            option.allows_text === true && nextOptionIndexSet.has(index),
+                        )
+                        if (!nextAllowsText) {
+                          setResponses((current) => ({
+                            ...current,
+                            [questionIndex]: '',
+                          }))
+                        }
+                      }}
+                    >
+                      {candidate.label}
+                    </Button>
+                  ))}
+                  {allowsText && (
+                    <>
+                      <Label htmlFor={responseId} className="sr-only">
+                        {responseLabel}
+                      </Label>
+                      <Input
+                        id={responseId}
+                        className="h-8 min-w-40 flex-1 sm:h-8"
+                        value={responses[questionIndex] ?? ''}
+                        placeholder={responseLabel}
+                        disabled={!canOperate || pending}
+                        onChange={(event) => {
+                          setResponses((current) => ({
+                            ...current,
+                            [questionIndex]: event.target.value,
+                          }))
+                        }}
+                        onKeyDown={(event) => {
+                          if (
+                            event.key === 'Enter' &&
+                            !isImeComposing(event.nativeEvent) &&
+                            complete &&
+                            !pending
+                          ) {
+                            event.preventDefault()
+                            submit()
+                          }
+                        }}
+                      />
+                    </>
+                  )}
+                  {isLast && (
+                    <Button
+                      size="sm"
+                      className="ml-auto"
+                      disabled={!canOperate || pending || !complete}
+                      onClick={submit}
+                    >
+                      Submit
+                    </Button>
+                  )}
+                </div>
+              </fieldset>
+            )
+          })}
+      </CardContent>
+    </Card>
+  )
+}
+
+export function AgentInteractions({
+  orgID,
+  projectID,
+  agentID,
+  canOperate,
+}: {
+  orgID: string
+  projectID: string
+  agentID: string
+  canOperate: boolean
+}) {
+  const interactionsQuery = useAgentInteractions(orgID, projectID, agentID)
+  const resolveInteraction = useResolveAgentInteraction(orgID, projectID, agentID)
+  const interactions = interactionsQuery.data?.data ?? []
+  const loadError =
+    interactionsQuery.error != null ? errorMessage(interactionsQuery.error, 'Unknown error') : null
+  const error = resolveInteraction.error
+  const pending = resolveInteraction.isPending
+  const onResolve: Resolve = async (interaction, body) => {
+    await resolveInteraction.mutateAsync({
+      interactionID: interaction.id,
+      body,
+      targetAgentID: interaction.agent_id,
+    })
+  }
+  if (interactions.length === 0 && loadError == null) return null
+  return (
+    <section
+      className="grid max-h-[40svh] min-w-0 gap-3 overflow-x-hidden overflow-y-auto pr-1"
+      aria-label="Agent requests"
+    >
+      {loadError != null && (
+        <p className="text-destructive text-xs">Could not load pending requests: {loadError}</p>
+      )}
+      {error && <p className="text-destructive text-xs">{error.message}</p>}
+      {interactions.map((interaction) => (
+        <InteractionFormCard
+          key={interaction.id}
+          interaction={interaction}
+          resolve={onResolve}
+          pending={pending}
+          canOperate={canOperate}
+        />
+      ))}
+    </section>
+  )
+}

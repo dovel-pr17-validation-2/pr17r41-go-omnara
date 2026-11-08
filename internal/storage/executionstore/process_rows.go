@@ -1,0 +1,132 @@
+package executionstore
+
+import (
+	"github.com/omnara-ai/omnara/internal/storage/internal/dbsqlc"
+	"github.com/omnara-ai/omnara/internal/storage/internal/storeutil"
+)
+
+func processRecordFromSQLC(row dbsqlc.Process) ProcessRecord {
+	return ProcessRecord{
+		ExecutionSpec:         row.ExecutionSpec,
+		ID:                    row.ID,
+		OrgID:                 row.OrgID,
+		ProjectID:             row.ProjectID,
+		AgentID:               row.AgentID,
+		ToolCallID:            row.ToolCallID,
+		RuntimeLockID:         row.RuntimeLockID,
+		AgentMachineBindingID: row.AgentMachineBindingID,
+		MachineID:             row.MachineID,
+		ExecutionGrantedAt:    row.ExecutionGrantedAt,
+		Cwd:                   row.Cwd,
+		TimeoutSeconds:        int(row.TimeoutSeconds),
+		InitialWaitMS:         int(row.InitialWaitMs),
+		DefaultOutputCursor:   row.DefaultOutputCursor,
+		State:                 ProcessState(row.State),
+		StateReasonCode:       stringFromSQLCText(row.StateReasonCode),
+		StateReasonMessage:    row.StateReasonMessage,
+		SourceStartedAt:       row.SourceStartedAt,
+		SourceEndedAt:         row.SourceEndedAt,
+		StateChangedAt:        row.StateChangedAt,
+		ExitCode:              storeutil.IntPtr(row.ExitCode),
+		ExitSignal:            row.ExitSignal,
+		CreatedAt:             row.CreatedAt,
+		UpdatedAt:             row.UpdatedAt,
+	}
+}
+
+func processRecordFromInsertSQLC(row dbsqlc.Process) ProcessRecord {
+	return processRecordFromSQLC(row)
+}
+
+func processRecordFromStartedSQLC(row dbsqlc.Process) ProcessRecord {
+	return processRecordFromSQLC(row)
+}
+
+func processRecordFromCompleteSQLC(row dbsqlc.Process) ProcessRecord {
+	return processRecordFromSQLC(row)
+}
+
+func processRecordFromAcceptSQLC(row dbsqlc.AcceptDaemonProcessRow) ProcessRecord {
+	return ProcessRecord{
+		ExecutionSpec:         row.ExecutionSpec,
+		ID:                    row.ID,
+		OrgID:                 row.OrgID,
+		ProjectID:             row.ProjectID,
+		AgentID:               row.AgentID,
+		ToolCallID:            row.ToolCallID,
+		RuntimeLockID:         row.RuntimeLockID,
+		AgentMachineBindingID: row.AgentMachineBindingID,
+		MachineID:             row.MachineID,
+		ExecutionGrantedAt:    row.ExecutionGrantedAt,
+		Cwd:                   row.Cwd,
+		TimeoutSeconds:        int(row.TimeoutSeconds),
+		InitialWaitMS:         int(row.InitialWaitMs),
+		DefaultOutputCursor:   row.DefaultOutputCursor,
+		State:                 ProcessState(row.State),
+		StateReasonCode:       stringFromSQLCText(row.StateReasonCode),
+		StateReasonMessage:    row.StateReasonMessage,
+		SourceStartedAt:       row.SourceStartedAt,
+		SourceEndedAt:         row.SourceEndedAt,
+		StateChangedAt:        row.StateChangedAt,
+		ExitCode:              storeutil.IntPtr(row.ExitCode),
+		ExitSignal:            row.ExitSignal,
+		CreatedAt:             row.CreatedAt,
+		UpdatedAt:             row.UpdatedAt,
+	}
+}
+
+func activeProcessRecordFromSQLC(row dbsqlc.ListActiveProcessesRow) ActiveProcessRecord {
+	return ActiveProcessRecord{
+		ExecutionSpec:   row.ExecutionSpec,
+		ID:              row.ID,
+		State:           ProcessState(row.State),
+		MachineID:       row.MachineID,
+		Cwd:             row.Cwd,
+		SourceStartedAt: row.SourceStartedAt,
+		CreatedAt:       row.CreatedAt,
+		UpdatedAt:       row.UpdatedAt,
+		ToolCallID:      row.ToolCallID,
+	}
+}
+
+func processActionRecordFromSQLC(row dbsqlc.ProcessAction) ProcessActionRecord {
+	return ProcessActionRecord{
+		ID:                 row.ID,
+		OrgID:              row.OrgID,
+		ProjectID:          row.ProjectID,
+		AgentID:            row.AgentID,
+		ProcessID:          row.ProcessID,
+		ToolCallID:         row.ToolCallID,
+		RuntimeLockID:      row.RuntimeLockID,
+		ActionKind:         ProcessActionKind(row.ActionKind),
+		Seq:                row.Seq,
+		Payload:            row.Payload,
+		State:              ProcessActionState(row.State),
+		CreatedAt:          row.CreatedAt,
+		UpdatedAt:          row.UpdatedAt,
+		StateReasonCode:    stringFromSQLCText(row.StateReasonCode),
+		StateReasonMessage: row.StateReasonMessage,
+	}
+}
+
+func processActionRecordFromAcceptSQLC(
+	row dbsqlc.AcceptDaemonProcessActionRow,
+) ProcessActionRecord {
+	return ProcessActionRecord{
+		ID:                 row.ID,
+		OrgID:              row.OrgID,
+		ProjectID:          row.ProjectID,
+		AgentID:            row.AgentID,
+		ProcessID:          row.ProcessID,
+		ToolCallID:         row.ToolCallID,
+		RuntimeLockID:      row.RuntimeLockID,
+		ActionKind:         ProcessActionKind(row.ActionKind),
+		Seq:                row.Seq,
+		Payload:            row.Payload,
+		State:              ProcessActionState(row.State),
+		CreatedAt:          row.CreatedAt,
+		UpdatedAt:          row.UpdatedAt,
+		StateReasonCode:    stringFromSQLCText(row.StateReasonCode),
+		StateReasonMessage: row.StateReasonMessage,
+	}
+}

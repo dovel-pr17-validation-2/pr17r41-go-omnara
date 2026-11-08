@@ -1,0 +1,135 @@
+---
+title: Members & access
+description: Manage organizations, projects, members, roles, and invitations
+icon: "users"
+---
+
+import MembersOrgCreate from '/snippets/members-org-create.mdx'
+import MembersProjectCreate from '/snippets/members-project-create.mdx'
+import MembersInvite from '/snippets/members-invite.mdx'
+import MembersInviteAccept from '/snippets/members-invite-accept.mdx'
+import MembersList from '/snippets/members-list.mdx'
+import MembersUpdate from '/snippets/members-update.mdx'
+import MembersProjectRoles from '/snippets/members-project-roles.mdx'
+
+An **organization** is the top-level account. **Projects** contain agents and configs, and control which shared resources they can use through grants. Each person has one organization role and, optionally, a role in individual projects.
+
+## Roles
+
+**Org roles** — held by every member:
+
+| Role | Can |
+| --- | --- |
+| `owner` | Everything, including deleting the org and managing owners |
+| `admin` | Manage the org: members, projects, secrets, machines, models — everything but deleting the org or managing owners |
+| `member` | See the org; project access comes only from explicit project roles |
+
+**Project roles** — granted per member, per project:
+
+| Role | Read | Operate agents | Manage project | Manage access |
+| --- | --- | --- | --- | --- |
+| `admin` | ✓ | ✓ | ✓ | ✓ |
+| `developer` | ✓ | ✓ | ✓ | — |
+| `operator` | ✓ | ✓ | — | — |
+| `viewer` | ✓ | — | — | — |
+
+**Operate agents** means launching agents, sending [inputs](/events/sending-input), resolving [interactions](/events/interactions), and stopping work. **Manage project** means creating and changing project resources, such as configs, profiles, and project-owned secrets. **Manage access** means assigning project roles and managing grants for shared resources such as models, machines, and pools.
+
+Organization owners and admins automatically have full access to every project, so they do not need separate project roles.
+
+## Organizations
+
+Your first org is created during onboarding. Creation atomically sets up the org, a default project, and your `owner` membership.
+
+<Tabs>
+<Tab title="API">
+  The examples assume the client, `$ORG`/`orgID`, and `$PROJ`/`projectID` setup from the [quickstart](/quickstart).
+
+  <MembersOrgCreate />
+
+  `omnara whoami` and [`GET /me`](/api/authentication) (`getCurrentUser` in the SDK) list the organizations you belong to, and `omnara config select` switches the CLI's default organization and project. Deleting an organization (`omnara orgs delete {org-id}`, `DELETE /orgs/{orgID}`, `deleteOrganization`) is owner-only and removes everything in it.
+</Tab>
+<Tab title="Dashboard">
+  Click the organization name at the top of the sidebar and choose **New organization**. Use the same menu to switch organizations.
+</Tab>
+</Tabs>
+
+## Projects
+
+<Tabs>
+<Tab title="API">
+  <MembersProjectCreate />
+</Tab>
+<Tab title="Dashboard">
+  Open the project switcher in the page header, click **New project**, and give it a name.
+</Tab>
+</Tabs>
+
+Project lists include only projects you can access. Each project includes `access.can_read`, `can_operate`, `can_manage`, and `can_manage_access`, so clients do not need to recreate the role matrix.
+
+## Invite people
+
+Invitations are org-scoped and email-addressed. Invite as `owner`, `admin`, or `member`; only owners can invite owners.
+
+<Tabs>
+<Tab title="API">
+  <MembersInvite />
+
+  Organization admins can list pending invitations with `omnara members invites list` or `GET /orgs/$ORG/invitations` (`listOrgInvitations`), and revoke one with `omnara members invites delete {invitation-id}` or `DELETE /orgs/$ORG/invitations/{invitationID}` (`deleteOrgInvitation`).
+
+  The invitee can list and accept invitations through their own account:
+
+  <MembersInviteAccept />
+
+  Accepting creates the organization membership. The invitation is then removed from the pending list.
+</Tab>
+<Tab title="Dashboard">
+  With **All projects** selected in the project switcher, open **Members** and click **Invite user**: email plus role. Pending invitees appear in the list until accepted; **Revoke invitation** withdraws one. The invitee accepts from their own account when they sign in.
+</Tab>
+</Tabs>
+
+## Manage members
+
+<Tabs>
+<Tab title="API">
+  <MembersList />
+
+  The response includes each member's user ID, email, display name, and organization role. Use the user ID to change their role or remove them:
+
+  <MembersUpdate />
+</Tab>
+<Tab title="Dashboard">
+  The **Members** page (with **All projects** selected in the project switcher) lists everyone with their org role. Expand a member to change their **Org role** or **Remove from organization**.
+</Tab>
+</Tabs>
+
+<Warning>
+  Only owners can grant the owner role or change or remove an owner, and the last owner cannot be demoted or removed. Demoting an owner cancels the owner invitations they sent. Removing another member permanently deletes the secrets and skills they own in this organization and cancels invitations they sent. Removal fails if one of their secrets is still used by another resource.
+</Warning>
+
+## Give members project access
+
+Organization members need a project role to access a project. Owners and admins already have access to every project.
+
+Use `operator` for teammates who should run agents and handle approvals without changing configs, profiles, or project-owned secrets.
+
+<Tabs>
+<Tab title="API">
+  There is no CLI command for project roles yet. `PUT` creates or changes the member's role:
+
+  <MembersProjectRoles />
+
+  `GET …/projects` (`listMemberProjectAccess`) lists the member's explicit project roles. `DELETE` on the same project path (`removeMemberProjectAccess`) removes one.
+</Tab>
+<Tab title="Dashboard">
+  1. With **All projects** selected in the project switcher, open **Members** and expand the member.
+  2. Under **Project access**, choose a project and role.
+  3. Click **Add**.
+
+  Use the role menu to change access or **Remove** to revoke it.
+</Tab>
+</Tabs>
+
+<Info>
+Full schema and playground: [Organizations and Projects](/api-reference/endpoints/organizations-and-projects/create-organization) · [Members](/api-reference/endpoints/organizations-and-projects/list-organization-members) · [Invitations](/api-reference/endpoints/organizations-and-projects/create-org-invitation).
+</Info>

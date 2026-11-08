@@ -1,0 +1,33 @@
+package storagefixture
+
+import (
+	"context"
+	"encoding/json"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/omnara-ai/omnara/internal/storage/executionstore"
+	"github.com/omnara-ai/omnara/internal/storage/modelstore"
+	"github.com/stretchr/testify/require"
+)
+
+func SeedAgentConfig(
+	t testing.TB,
+	ctx context.Context,
+	models *modelstore.Store,
+	execution *executionstore.Store,
+	orgID, projectID uuid.UUID,
+	sourceYAML string,
+) executionstore.AgentConfigRecord {
+	t.Helper()
+	compiled := SeedModelAndCompileAgentYAML(t, ctx, models, execution, orgID, projectID, sourceYAML)
+	config, err := execution.CreateAgentConfig(ctx, executionstore.CreateAgentConfigInput{
+		ProjectID:               projectID,
+		Source:                  sourceYAML,
+		ConfiguredModelID:       compiled.Compiled.Model.ConfiguredModelID,
+		CompiledDefinition:      json.RawMessage(compiled.CanonicalJSON),
+		EffectiveDefinitionHash: compiled.Hash,
+	})
+	require.NoError(t, err, "create agent config for project %s", projectID)
+	return config
+}

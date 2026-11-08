@@ -1,0 +1,693 @@
+package machinepool
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/omnara-ai/omnara/internal/machinepool/providers"
+	"github.com/omnara-ai/omnara/internal/ssrf"
+	"github.com/omnara-ai/omnara/internal/storage/executionstore"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+func TestManagerValidatesDefaultMachinePool(t *testing.T) {
+	cpu := 1
+	memoryMB := 1024
+	manager := Manager{
+		Catalog:      DefaultCatalog(),
+		PublicAPIURL: "https://api.omnara.test/v1",
+	}
+	err := manager.ValidateDefaultMachinePool(executionstore.DefaultMachinePoolTemplate{
+		Name:                          "provider-default-pool",
+		Provider:                      "unikraft",
+		ProviderAuthEnvVar:            "TEST_DEFAULT_POOL_TOKEN",
+		DefaultMachineCPU:             &cpu,
+		DefaultMachineMemoryMB:        &memoryMB,
+		DefaultMachineEnv:             json.RawMessage(`{}`),
+		DefaultMachineProviderOptions: json.RawMessage(`{"image":"registry.example/daemon:latest","metro":"sfo"}`),
+		ProviderConfig:                json.RawMessage(`{}`),
+		MaxTotalMachines:              1,
+		MaxTotalCPU:                   &cpu,
+		MaxTotalMemoryMB:              &memoryMB,
+		MaxMachineCPU:                 &cpu,
+		MaxMachineMemoryMB:            &memoryMB,
+	})
+	if err != nil {
+		t.Fatalf("validate default machine pool: %v", err)
+	}
+}
+
+func TestManagerRejectsDefaultMachineConfigExceedingCaps(t *testing.T) {
+	defaultCPU := 8
+	maxMachineCPU := 4
+	memoryMB := 1024
+	manager := Manager{
+		Catalog:      DefaultCatalog(),
+		PublicAPIURL: "https://api.omnara.test/v1",
+	}
+	err := manager.ValidateDefaultMachinePool(executionstore.DefaultMachinePoolTemplate{
+		Name:                          "provider-default-pool",
+		Provider:                      "unikraft",
+		ProviderAuthEnvVar:            "TEST_DEFAULT_POOL_TOKEN",
+		DefaultMachineCPU:             &defaultCPU,
+		DefaultMachineMemoryMB:        &memoryMB,
+		DefaultMachineEnv:             json.RawMessage(`{}`),
+		DefaultMachineProviderOptions: json.RawMessage(`{"image":"registry.example/daemon:latest","metro":"sfo"}`),
+		ProviderConfig:                json.RawMessage(`{}`),
+		MaxTotalMachines:              1,
+		MaxTotalCPU:                   &defaultCPU,
+		MaxTotalMemoryMB:              &memoryMB,
+		MaxMachineCPU:                 &maxMachineCPU,
+		MaxMachineMemoryMB:            &memoryMB,
+	})
+	if err == nil {
+		t.Fatal("expected default machine pool config exceeding caps to fail")
+	}
+	if !strings.Contains(err.Error(), "max_machine_cpu") {
+		t.Fatalf("expected max_machine_cpu error, got %v", err)
+	}
+}
+
+func TestManagerRejectsInvalidDefaultMachineConfig(t *testing.T) {
+	cpu := 1
+	memoryMB := 1024
+	manager := Manager{
+		Catalog:      DefaultCatalog(),
+		PublicAPIURL: "https://api.omnara.test/v1",
+	}
+	err := manager.ValidateDefaultMachinePool(executionstore.DefaultMachinePoolTemplate{
+		Name:                   "provider-default-pool",
+		Provider:               "unikraft",
+		ProviderAuthEnvVar:     "TEST_DEFAULT_POOL_TOKEN",
+		DefaultMachineCPU:      &cpu,
+		DefaultMachineMemoryMB: &memoryMB,
+		DefaultMachineEnv:      json.RawMessage(`{}`),
+		ProviderConfig:         json.RawMessage(`{}`),
+		MaxTotalMachines:       1,
+		MaxTotalCPU:            &cpu,
+		MaxTotalMemoryMB:       &memoryMB,
+		MaxMachineCPU:          &cpu,
+		MaxMachineMemoryMB:     &memoryMB,
+	})
+	if err == nil {
+		t.Fatal("expected invalid default machine pool config to fail")
+	}
+}
+
+func TestDeleteBackoff(t *testing.T) {
+	tests := []struct {
+		attempts int32
+		want     time.Duration
+	}{
+		{attempts: 0, want: time.Minute},
+		{attempts: 1, want: time.Minute},
+		{attempts: 2, want: 5 * time.Minute},
+		{attempts: 3, want: 30 * time.Minute},
+		{attempts: 4, want: 24 * time.Hour},
+		{attempts: 10, want: 24 * time.Hour},
+	}
+	for _, tc := range tests {
+		if got := deleteBackoff(tc.attempts); got != tc.want {
+			t.Fatalf("deleteBackoff(%d) = %s, want %s", tc.attempts, got, tc.want)
+		}
+	}
+}
+
+func TestRunBoundedReconcileContinuesAfterError(t *testing.T) {
+	expectedErr := errors.New("boom")
+	var ran atomic.Int32
+	count, _, err := runBoundedReconcile(context.Background(), 5, 2, func(_ context.Context, i int) error {
+		ran.Add(1)
+		if i == 2 {
+			return expectedErr
+		}
+		return nil
+	})
+	if count != 5 {
+		t.Fatalf("count = %d, want 5", count)
+	}
+	if !errors.Is(err, expectedErr) {
+		t.Fatalf("err = %v, want %v", err, expectedErr)
+	}
+	if ran.Load() != 5 {
+		t.Fatalf("ran = %d, want 5", ran.Load())
+	}
+}
+
+func TestRunBoundedReconcileRetainsConcurrentFailures(t *testing.T) {
+	failures := []error{errors.New("provider failed"), errors.New("storage failed")}
+	count, _, err := runBoundedReconcile(context.Background(), len(failures), len(failures), func(
+		_ context.Context,
+		i int,
+	) error {
+		return failures[i]
+	})
+	if count != len(failures) {
+		t.Fatalf("count = %d, want %d", count, len(failures))
+	}
+	for _, failure := range failures {
+		if !errors.Is(err, failure) {
+			t.Fatalf("err = %v, want retained failure %v", err, failure)
+		}
+	}
+}
+
+func TestRunBoundedReconcileRetainsFailureDuringCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{}, 2)
+	releaseFailure := make(chan struct{})
+	failure := errors.New("provider failed")
+	type result struct {
+		count int
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		count, _, err := runBoundedReconcile(ctx, 2, 2, func(ctx context.Context, i int) error {
+			started <- struct{}{}
+			if i == 0 {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			<-releaseFailure
+			return failure
+		})
+		done <- result{count: count, err: err}
+	}()
+	<-started
+	<-started
+	cancel()
+	close(releaseFailure)
+	got := <-done
+	if got.count != 2 {
+		t.Fatalf("count = %d, want 2", got.count)
+	}
+	if !errors.Is(got.err, failure) {
+		t.Fatalf("err = %v, want %v", got.err, failure)
+	}
+	if errors.Is(got.err, context.Canceled) {
+		t.Fatalf("err = %v, want cancellation separated from genuine failure", got.err)
+	}
+}
+
+func TestRunBoundedReconcileReturnsCancellationWithoutFailures(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{}, 2)
+	type result struct {
+		count int
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		count, _, err := runBoundedReconcile(ctx, 2, 2, func(ctx context.Context, _ int) error {
+			started <- struct{}{}
+			<-ctx.Done()
+			return ctx.Err()
+		})
+		done <- result{count: count, err: err}
+	}()
+	<-started
+	<-started
+	cancel()
+	got := <-done
+	if got.count != 2 {
+		t.Fatalf("count = %d, want 2", got.count)
+	}
+	if !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("err = %v, want context canceled", got.err)
+	}
+}
+
+func TestRunBoundedReconcileRetainsMixedCancellationError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	failure := errors.New("storage failed")
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := runBoundedReconcile(ctx, 1, 1, func(ctx context.Context, _ int) error {
+			close(started)
+			<-ctx.Done()
+			return errors.Join(ctx.Err(), failure)
+		})
+		done <- err
+	}()
+	<-started
+	cancel()
+	err := <-done
+	if !errors.Is(err, failure) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want retained cancellation and %v", err, failure)
+	}
+}
+
+func TestRunBoundedReconcileRetainsPanicDuringCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := runBoundedReconcile(ctx, 1, 1, func(ctx context.Context, _ int) error {
+			close(started)
+			<-ctx.Done()
+			panic("provider failure")
+		})
+		done <- err
+	}()
+	<-started
+	cancel()
+	err := <-done
+	if err == nil || !strings.Contains(err.Error(), "machine reconciliation 0 panicked: provider failure") {
+		t.Fatalf("err = %v, want provider panic", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want panic separated from cancellation", err)
+	}
+}
+
+func TestRunBoundedReconcileBoundsReportedFailures(t *testing.T) {
+	failures := make([]error, maximumReportedReconcileErrors+2)
+	for i := range failures {
+		failures[i] = fmt.Errorf("failure %d", i)
+	}
+	_, failed, err := runBoundedReconcile(context.Background(), len(failures), 1, func(
+		_ context.Context,
+		i int,
+	) error {
+		return failures[i]
+	})
+	if failed != len(failures) {
+		t.Fatalf("failed = %d, want omitted failures counted in %d", failed, len(failures))
+	}
+	for _, failure := range failures[:maximumReportedReconcileErrors] {
+		if !errors.Is(err, failure) {
+			t.Fatalf("err = %v, want retained failure %v", err, failure)
+		}
+	}
+	if errors.Is(err, failures[maximumReportedReconcileErrors]) {
+		t.Fatalf("err = %v, want excess failure omitted", err)
+	}
+	if !strings.Contains(err.Error(), "2 additional machine reconciliation errors omitted") {
+		t.Fatalf("err = %v, want omitted error count", err)
+	}
+}
+
+func TestRunBoundedReconcileReturnsTaskPanic(t *testing.T) {
+	failure := errors.New("provider failed")
+	count, failed, err := runBoundedReconcile(context.Background(), 3, 2, func(_ context.Context, i int) error {
+		switch i {
+		case 0:
+			return failure
+		case 1:
+			panic("provider failure")
+		}
+		return nil
+	})
+	if count != 3 || failed != 2 {
+		t.Fatalf("count = %d, failed = %d, want 3 and 2", count, failed)
+	}
+	if !errors.Is(err, failure) || !strings.Contains(err.Error(), "machine reconciliation 1 panicked: provider failure") {
+		t.Fatalf("err = %v, want the returned failure and the contained provider panic", err)
+	}
+}
+
+func TestRunBoundedReconcileLimitsConcurrency(t *testing.T) {
+	var current atomic.Int32
+	var maxSeen atomic.Int32
+	arrived := make(chan struct{})
+	release := make(chan struct{})
+	type result struct {
+		count int
+		err   error
+	}
+	results := make(chan result, 1)
+	go func() {
+		count, _, err := runBoundedReconcile(context.Background(), 20, 3, func(_ context.Context, _ int) error {
+			inFlight := current.Add(1)
+			for {
+				observedMax := maxSeen.Load()
+				if inFlight <= observedMax || maxSeen.CompareAndSwap(observedMax, inFlight) {
+					break
+				}
+			}
+			select {
+			case arrived <- struct{}{}:
+			case <-release:
+			}
+			<-release
+			current.Add(-1)
+			return nil
+		})
+		results <- result{count: count, err: err}
+	}()
+	for range 3 {
+		select {
+		case <-arrived:
+		case <-time.After(5 * time.Second):
+			t.Fatal("reconcile tasks did not reach the concurrency limit")
+		}
+	}
+	close(release)
+	res := <-results
+	if res.err != nil {
+		t.Fatalf("run bounded reconcile: %v", res.err)
+	}
+	if res.count != 20 {
+		t.Fatalf("count = %d, want 20", res.count)
+	}
+	if got := maxSeen.Load(); got != 3 {
+		t.Fatalf("max concurrency = %d, want 3", got)
+	}
+}
+
+type provisionRetryProvider struct {
+	provision func() (providers.ProvisionMachineResult, error)
+}
+
+func (p provisionRetryProvider) ProvisionMachine(
+	context.Context,
+	uuid.UUID,
+	uuid.UUID,
+	executionstore.MachineProvisioningConfig,
+	string,
+	map[string]string,
+	bool,
+) (providers.ProvisionMachineResult, error) {
+	return p.provision()
+}
+
+func (provisionRetryProvider) ProvisioningTimeout() time.Duration {
+	return time.Minute
+}
+
+func (provisionRetryProvider) PrepareProvisioning(
+	context.Context,
+	executionstore.MachineProvisioningConfig,
+) (executionstore.MachineResourceFacts, error) {
+	return executionstore.MachineResourceFacts{}, errors.New("not implemented")
+}
+
+func (provisionRetryProvider) ValidateMachineConfig(executionstore.MachineProvisioningConfig, map[string]string) error {
+	return nil
+}
+
+func (provisionRetryProvider) InspectMachine(
+	context.Context,
+	uuid.UUID,
+	uuid.UUID,
+	executionstore.MachineProvisioningConfig,
+	string,
+) (string, bool, error) {
+	return "", false, errors.New("not implemented")
+}
+
+func (provisionRetryProvider) CheckConnection(context.Context, executionstore.MachineProvisioningConfig) error {
+	return nil
+}
+
+func (provisionRetryProvider) DeleteMachine(
+	context.Context,
+	uuid.UUID,
+	uuid.UUID,
+	executionstore.MachineProvisioningConfig,
+	string,
+) error {
+	return errors.New("not implemented")
+}
+
+func provisionWithRetryForTest(
+	ctx context.Context,
+	provision func() (providers.ProvisionMachineResult, error),
+) (providers.ProvisionMachineResult, error) {
+	return provisionMachineWithRetry(
+		ctx,
+		provisionRetryProvider{provision: provision},
+		uuid.UUID{},
+		uuid.UUID{},
+		executionstore.MachineProvisioningConfig{},
+		"",
+		nil,
+		true,
+	)
+}
+
+func stubProvisionRetryDelays(t *testing.T) {
+	t.Helper()
+	saved := providerProvisionRetryDelays
+	providerProvisionRetryDelays = [...]time.Duration{
+		time.Millisecond,
+		time.Millisecond,
+		time.Millisecond,
+	}
+	t.Cleanup(func() {
+		providerProvisionRetryDelays = saved
+	})
+}
+
+func TestProvisionMachineWithRetrySucceedsAndPreservesObservation(t *testing.T) {
+	stubProvisionRetryDelays(t)
+	providerErr := errors.New("temporary provider failure")
+	calls := 0
+	result, err := provisionWithRetryForTest(
+		context.Background(),
+		func() (providers.ProvisionMachineResult, error) {
+			calls++
+			switch calls {
+			case 1:
+				return providers.ProvisionMachineResult{ProviderResourceID: "resource-1"}, providerErr
+			case 2:
+				return providers.ProvisionMachineResult{}, providerErr
+			default:
+				return providers.ProvisionMachineResult{ProviderResourceID: "resource-1", SandboxURL: "https://sandbox.test/"}, nil
+			}
+		},
+	)
+	if err != nil {
+		t.Fatalf("provision with retry: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("provision calls = %d, want 3", calls)
+	}
+	if result.ProviderResourceID != "resource-1" || result.SandboxURL != "https://sandbox.test/" {
+		t.Fatalf("provision result = %+v", result)
+	}
+}
+
+func TestProvisionMachineWithRetryExhaustsAttempts(t *testing.T) {
+	stubProvisionRetryDelays(t)
+	providerErr := errors.New("provider unavailable")
+	calls := 0
+	result, err := provisionWithRetryForTest(
+		context.Background(),
+		func() (providers.ProvisionMachineResult, error) {
+			calls++
+			return providers.ProvisionMachineResult{ProviderResourceID: "resource-1"}, providerErr
+		},
+	)
+	if !errors.Is(err, providerErr) {
+		t.Fatalf("provision error = %v, want %v", err, providerErr)
+	}
+	if calls != providerProvisionRetryAttempts {
+		t.Fatalf("provision calls = %d, want %d", calls, providerProvisionRetryAttempts)
+	}
+	if result.ProviderResourceID != "resource-1" {
+		t.Fatalf("provision result = %+v, want observed resource", result)
+	}
+}
+
+func TestProvisionMachineWithRetryPreservesProviderErrorWhenWaitExpires(t *testing.T) {
+	providerErr := errors.New("provider unavailable")
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	calls := 0
+	result, err := provisionWithRetryForTest(
+		ctx,
+		func() (providers.ProvisionMachineResult, error) {
+			calls++
+			return providers.ProvisionMachineResult{ProviderResourceID: "resource-1"}, providerErr
+		},
+	)
+	if !errors.Is(err, providerErr) {
+		t.Fatalf("provision error = %v, want %v", err, providerErr)
+	}
+	if calls != 1 {
+		t.Fatalf("provision calls = %d, want 1", calls)
+	}
+	if result.ProviderResourceID != "resource-1" {
+		t.Fatalf("provision result = %+v, want observed resource", result)
+	}
+}
+
+func TestProviderProvisionRetryDelayHonorsRetryAfter(t *testing.T) {
+	providerErr := providers.WithResponse(
+		errors.New("rate limited"),
+		providers.HTTPResponse{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     http.Header{"Retry-After": []string{"12"}},
+		},
+	)
+	if delay := providerProvisionRetryDelay(0, providerErr); delay != 12*time.Second {
+		t.Fatalf("retry delay = %s, want 12s", delay)
+	}
+	if delay := providerProvisionRetryDelay(1, errors.New("provider unavailable")); delay != 2*time.Second {
+		t.Fatalf("retry delay = %s, want 2s", delay)
+	}
+}
+
+func TestProvisionMachineWithRetryDiscardsReplacedResource(t *testing.T) {
+	stubProvisionRetryDelays(t)
+	calls := 0
+	result, err := provisionWithRetryForTest(
+		context.Background(),
+		func() (providers.ProvisionMachineResult, error) {
+			calls++
+			switch calls {
+			case 1:
+				return providers.ProvisionMachineResult{ProviderResourceID: "resource-1"},
+					errors.New("delete stale sandbox: unavailable")
+			case 2:
+				return providers.ProvisionMachineResult{}, fmt.Errorf("sandbox was deleted: %w", providers.ErrResourceReplaced)
+			default:
+				return providers.ProvisionMachineResult{ProviderResourceID: "resource-2"}, nil
+			}
+		},
+	)
+	if err != nil {
+		t.Fatalf("provision after replacement: %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("provision calls = %d, want 3", calls)
+	}
+	if result.ProviderResourceID != "resource-2" {
+		t.Fatalf("provision result = %+v, want replaced resource", result)
+	}
+}
+
+func TestProvisionMachineWithRetryStopsOnPermanentError(t *testing.T) {
+	stubProvisionRetryDelays(t)
+	calls := 0
+	result, err := provisionWithRetryForTest(
+		context.Background(),
+		func() (providers.ProvisionMachineResult, error) {
+			calls++
+			return providers.ProvisionMachineResult{ProviderResourceID: "resource-1"},
+				fmt.Errorf("snapshot too large: %w", providers.ErrPermanent)
+		},
+	)
+	if !errors.Is(err, providers.ErrPermanent) {
+		t.Fatalf("provision error = %v, want permanent error", err)
+	}
+	if calls != 1 {
+		t.Fatalf("provision calls = %d, want 1", calls)
+	}
+	if result.ProviderResourceID != "resource-1" {
+		t.Fatalf("provision result = %+v, want observed resource", result)
+	}
+}
+
+func TestProvisionMachineWithRetryRejectsConflictingResources(t *testing.T) {
+	stubProvisionRetryDelays(t)
+	calls := 0
+	result, err := provisionWithRetryForTest(
+		context.Background(),
+		func() (providers.ProvisionMachineResult, error) {
+			calls++
+			if calls == 1 {
+				return providers.ProvisionMachineResult{ProviderResourceID: "resource-1"}, errors.New("ambiguous failure")
+			}
+			return providers.ProvisionMachineResult{ProviderResourceID: "resource-2"}, nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "conflicting resource ids") {
+		t.Fatalf("provision error = %v, want conflicting resource ids", err)
+	}
+	if result.ProviderResourceID != "resource-1" {
+		t.Fatalf("provision result = %+v, want first observed resource", result)
+	}
+}
+
+func TestConnectionCheckFailure(t *testing.T) {
+	const (
+		rejected    = "The provider rejected this API key."
+		forbidden   = "This API key doesn't have access to the configured workspace or resources."
+		notFound    = "The provider couldn't find the configured workspace, environment, or API."
+		rateLimited = "The provider is rate limiting requests. Try again in a minute."
+		unreachable = "Couldn't reach the provider. Try again in a moment."
+	)
+	httpStatus := func(code int) error {
+		return fmt.Errorf("check: %w", providers.WithResponse(
+			fmt.Errorf("provider API returned HTTP %d", code),
+			providers.HTTPResponse{StatusCode: code},
+		))
+	}
+	request := func(err error) error {
+		return fmt.Errorf(
+			"provider request failed: %w",
+			&url.Error{Op: "Get", URL: "https://api.example", Err: err},
+		)
+	}
+	for _, test := range []struct {
+		name         string
+		err          error
+		want         string
+		wantUpstream bool
+	}{
+		{"http 401", httpStatus(401), rejected, false},
+		{"http 403", httpStatus(403), forbidden, false},
+		{"http 404", httpStatus(404), notFound, false},
+		{"http 429", httpStatus(429), rateLimited, true},
+		{"http 502", httpStatus(502), unreachable, true},
+		{"http 418", httpStatus(418), "The provider returned an unexpected error (HTTP 418).", false},
+		{
+			"grpc unauthenticated",
+			fmt.Errorf("failed to get auth token: %w", status.Error(codes.Unauthenticated, "Token not found")),
+			rejected,
+			false,
+		},
+		{"grpc permission denied", status.Error(codes.PermissionDenied, "denied"), forbidden, false},
+		{"grpc not found", status.Error(codes.NotFound, "No such environment 'staging'"), notFound, false},
+		{"grpc resource exhausted", status.Error(codes.ResourceExhausted, "slow down"), rateLimited, true},
+		{"grpc unavailable", status.Error(codes.Unavailable, "down"), unreachable, true},
+		{
+			"blocked address",
+			request(fmt.Errorf("dial: %w", ssrf.ErrBlockedAddress)),
+			"This API address isn't allowed.",
+			false,
+		},
+		{
+			"unknown host",
+			request(&net.DNSError{Err: "no such host", Name: "api.example", IsNotFound: true}),
+			"Couldn't find the provider's API. Check the region or API URL.",
+			false,
+		},
+		{
+			"dns timeout",
+			request(&net.DNSError{Err: "i/o timeout", Name: "api.example", IsTimeout: true}),
+			unreachable,
+			true,
+		},
+		{"timeout", fmt.Errorf("wait: %w", context.DeadlineExceeded), unreachable, true},
+		{"connection refused", request(errors.New("connection refused")), unreachable, true},
+		{
+			"unknown",
+			errors.New("decode provider response: unexpected end of JSON input"),
+			"The provider returned an unexpected error.",
+			true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			message, upstream := connectionCheckFailure(test.err)
+			if message != test.want || upstream != test.wantUpstream {
+				t.Fatalf("failure = (%q, %t), want (%q, %t)", message, upstream, test.want, test.wantUpstream)
+			}
+		})
+	}
+}

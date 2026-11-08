@@ -1,0 +1,412 @@
+package executionstore
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"slices"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/omnara-ai/omnara/internal/modelenvelope"
+	"github.com/omnara-ai/omnara/internal/storage/internal/dbsqlc"
+	"github.com/omnara-ai/omnara/internal/storage/internal/storeutil"
+	"github.com/omnara-ai/omnara/internal/storage/storeerr"
+)
+
+type AgentTurnRecord struct {
+	ID                    uuid.UUID `json:"id"`
+	ProjectID             uuid.UUID `json:"project_id"`
+	AgentID               uuid.UUID `json:"agent_id"`
+	TurnSequence          int64     `json:"turn_sequence"`
+	LatestEventID         uuid.UUID `json:"latest_event_id,omitempty"`
+	LatestSemanticEventID uuid.UUID `json:"latest_semantic_event_id,omitempty"`
+}
+
+type AgentEventReadRecord struct {
+	ID             uuid.UUID `json:"id"`
+	OrgID          uuid.UUID `json:"org_id"`
+	ProjectID      uuid.UUID `json:"project_id"`
+	AgentID        uuid.UUID `json:"agent_id"`
+	TurnID         uuid.UUID `json:"turn_id"`
+	TurnSequence   int64     `json:"turn_sequence,omitempty"`
+	IsOpeningEvent bool      `json:"is_opening_event"`
+	Sequence       int64     `json:"sequence"`
+	EventKind      string    `json:"event_kind"`
+	InputKind      string    `json:"input_kind,omitempty"`
+	ActorID        uuid.UUID `json:"actor_id,omitzero"`
+	AgentInputID   uuid.UUID `json:"agent_input_id,omitzero"`
+	// InputIdempotencyKey echoes the caller-chosen idempotency key of the
+	// content input behind this event, so producers can correlate their own
+	// submissions. Empty for events from any other input path.
+	InputIdempotencyKey            string                         `json:"input_idempotency_key,omitempty"`
+	ControlType                    string                         `json:"control_type,omitempty"`
+	TargetInteractionID            uuid.UUID                      `json:"target_interaction_id,omitzero"`
+	AgentConfigID                  uuid.UUID                      `json:"agent_config_id,omitzero"`
+	ToolCallID                     uuid.UUID                      `json:"tool_call_id,omitempty"`
+	ToolOutcome                    ToolResultOutcome              `json:"tool_outcome,omitempty"`
+	ModelCallContextID             uuid.UUID                      `json:"model_call_context_id,omitempty"`
+	ModelStopReason                modelenvelope.StopReason       `json:"model_stop_reason,omitempty"`
+	ContextCheckpointID            uuid.UUID                      `json:"context_checkpoint_id,omitempty"`
+	SummarizedThroughEventSequence int64                          `json:"summarized_through_event_sequence,omitempty"`
+	CheckpointSummary              string                         `json:"checkpoint_summary,omitempty"`
+	ContentBlocks                  json.RawMessage                `json:"content_blocks"`
+	ModelUsage                     modelenvelope.Usage            `json:"model_usage,omitzero"`
+	ProviderMetadata               modelenvelope.ProviderMetadata `json:"provider_metadata,omitzero"`
+	CreatedAt                      time.Time                      `json:"created_at"`
+}
+
+type AgentEventFrontier struct {
+	AgentID       uuid.UUID
+	EventSequence int64
+}
+
+type AgentTurnReadRecord struct {
+	AgentTurnRecord
+	EventCount          int64
+	StartedAt           time.Time
+	UpdatedAt           time.Time
+	OpeningEvents       []AgentEventReadRecord
+	LatestEvent         AgentEventReadRecord
+	LatestSemanticEvent AgentEventReadRecord
+}
+
+const (
+	// DefaultAgentEventsReadPageLimit is the public default page size for agent event timelines.
+	DefaultAgentEventsReadPageLimit int32 = 100
+	// MaxAgentEventsReadPageLimit is the public maximum page size for agent event timelines.
+	MaxAgentEventsReadPageLimit int32 = 500
+	// DefaultAgentTurnsReadPageLimit is the public default page size for agent turn timelines.
+	DefaultAgentTurnsReadPageLimit int32 = 25
+	// MaxAgentTurnsReadPageLimit is the public maximum page size for agent turn timelines.
+	MaxAgentTurnsReadPageLimit int32 = 100
+
+	defaultAgentEventsReadLimit = DefaultAgentEventsReadPageLimit
+	maxAgentEventsReadLimit     = MaxAgentEventsReadPageLimit + 1
+	defaultAgentTurnsReadLimit  = DefaultAgentTurnsReadPageLimit
+	maxAgentTurnsReadLimit      = MaxAgentTurnsReadPageLimit + 1
+)
+
+func (s *Store) ListAgentEventsForRead(
+	ctx context.Context,
+	projectID, agentID uuid.UUID,
+	afterSequence int64,
+	limit int32,
+) ([]AgentEventReadRecord, error) {
+	if projectID == uuid.Nil || agentID == uuid.Nil {
+		return nil, errors.New("project and agent are required")
+	}
+	if limit <= 0 {
+		limit = defaultAgentEventsReadLimit
+	}
+	if limit > maxAgentEventsReadLimit {
+		limit = maxAgentEventsReadLimit
+	}
+	if err := s.requireAgentInProject(ctx, projectID, agentID); err != nil {
+		return nil, err
+	}
+	rows, err := s.q.ListAgentEventsForRead(
+		ctx,
+		dbsqlc.ListAgentEventsForReadParams{
+			ProjectID:     projectID,
+			AgentID:       agentID,
+			AfterSequence: afterSequence,
+			PageLimit:     limit,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list agent events for read: %w", err)
+	}
+	out := make([]AgentEventReadRecord, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, agentEventReadRecordFromSQLC(row))
+	}
+	return out, nil
+}
+
+func (s *Store) ListAgentEventFrontiers(
+	ctx context.Context,
+	agentIDs []uuid.UUID,
+) ([]AgentEventFrontier, error) {
+	if len(agentIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := s.q.ListAgentEventFrontiers(
+		ctx,
+		dbsqlc.ListAgentEventFrontiersParams{AgentIds: agentIDs},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list agent event frontiers: %w", err)
+	}
+	frontiers := make([]AgentEventFrontier, 0, len(rows))
+	for _, row := range rows {
+		frontiers = append(frontiers, AgentEventFrontier{
+			AgentID:       row.AgentID,
+			EventSequence: row.EventSequence,
+		})
+	}
+	return frontiers, nil
+}
+
+// ListAgentEventsBeforeForRead returns one older event page for an agent,
+// chronological within the page. A beforeSequence of 0 means the latest
+// events; page beyond limit rows to detect older history.
+func (s *Store) ListAgentEventsBeforeForRead(
+	ctx context.Context,
+	projectID, agentID uuid.UUID,
+	beforeSequence int64,
+	limit int32,
+) ([]AgentEventReadRecord, error) {
+	if projectID == uuid.Nil || agentID == uuid.Nil {
+		return nil, errors.New("project and agent are required")
+	}
+	if limit <= 0 {
+		limit = defaultAgentEventsReadLimit
+	}
+	if limit > maxAgentEventsReadLimit {
+		limit = maxAgentEventsReadLimit
+	}
+	if err := s.requireAgentInProject(ctx, projectID, agentID); err != nil {
+		return nil, err
+	}
+	rows, err := s.q.ListAgentEventsBeforeForRead(
+		ctx,
+		dbsqlc.ListAgentEventsBeforeForReadParams{
+			ProjectID:      projectID,
+			AgentID:        agentID,
+			BeforeSequence: beforeSequence,
+			PageLimit:      limit,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list agent events before for read: %w", err)
+	}
+	out := make([]AgentEventReadRecord, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, agentEventReadRecordFromSQLC(row))
+	}
+	slices.Reverse(out)
+	return out, nil
+}
+
+func (s *Store) ListTurnEventsForRead(
+	ctx context.Context,
+	projectID, agentID, turnID uuid.UUID,
+	beforeSequence int64,
+	limit int32,
+) ([]AgentEventReadRecord, error) {
+	if projectID == uuid.Nil || agentID == uuid.Nil || turnID == uuid.Nil {
+		return nil, errors.New("project, agent, and turn are required")
+	}
+	if limit <= 0 {
+		limit = defaultAgentEventsReadLimit
+	}
+	if limit > maxAgentEventsReadLimit {
+		limit = maxAgentEventsReadLimit
+	}
+	if err := s.requireAgentTurnInProject(ctx, projectID, agentID, turnID); err != nil {
+		return nil, err
+	}
+	return listTurnEventsForReadTx(ctx, s.q, projectID, agentID, turnID, beforeSequence, limit)
+}
+
+func listTurnEventsForReadTx(
+	ctx context.Context,
+	qtx *dbsqlc.Queries,
+	projectID, agentID, turnID uuid.UUID,
+	beforeSequence int64,
+	limit int32,
+) ([]AgentEventReadRecord, error) {
+	rows, err := qtx.ListTurnEventsForRead(
+		ctx,
+		dbsqlc.ListTurnEventsForReadParams{
+			ProjectID:      projectID,
+			AgentID:        agentID,
+			TurnID:         turnID,
+			BeforeSequence: beforeSequence,
+			PageLimit:      limit,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list turn events for read: %w", err)
+	}
+	out := make([]AgentEventReadRecord, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, agentEventReadRecordFromSQLC(row))
+	}
+	slices.Reverse(out)
+	return out, nil
+}
+
+func (s *Store) ListAgentTurnsForRead(
+	ctx context.Context,
+	projectID, agentID uuid.UUID,
+	beforeTurnSequence int64,
+	limit int32,
+) ([]AgentTurnReadRecord, error) {
+	if projectID == uuid.Nil || agentID == uuid.Nil {
+		return nil, errors.New("project and agent are required")
+	}
+	if limit <= 0 {
+		limit = defaultAgentTurnsReadLimit
+	}
+	if limit > maxAgentTurnsReadLimit {
+		limit = maxAgentTurnsReadLimit
+	}
+	if err := s.requireAgentInProject(ctx, projectID, agentID); err != nil {
+		return nil, err
+	}
+	return listAgentTurnsForReadTx(ctx, s.q, projectID, agentID, beforeTurnSequence, limit)
+}
+
+func listAgentTurnsForReadTx(
+	ctx context.Context,
+	qtx *dbsqlc.Queries,
+	projectID, agentID uuid.UUID,
+	beforeTurnSequence int64,
+	limit int32,
+) ([]AgentTurnReadRecord, error) {
+	rows, err := qtx.ListAgentTurnsForRead(
+		ctx,
+		dbsqlc.ListAgentTurnsForReadParams{
+			ProjectID:          projectID,
+			AgentID:            agentID,
+			BeforeTurnSequence: beforeTurnSequence,
+			PageLimit:          limit,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list agent turns for read: %w", err)
+	}
+	out := make([]AgentTurnReadRecord, 0, len(rows))
+	turnIDs := make([]uuid.UUID, 0, len(rows))
+	for _, row := range rows {
+		turn := AgentTurnReadRecord{
+			AgentTurnRecord: AgentTurnRecord{
+				ID:                    row.ID,
+				ProjectID:             row.ProjectID,
+				AgentID:               row.AgentID,
+				TurnSequence:          row.TurnSequence,
+				LatestEventID:         row.LatestEventID,
+				LatestSemanticEventID: row.LatestSemanticEventID,
+			},
+			EventCount: row.EventCount,
+		}
+		out = append(out, turn)
+		turnIDs = append(turnIDs, row.ID)
+	}
+	if len(turnIDs) == 0 {
+		return out, nil
+	}
+	boundaryRows, err := qtx.ListTurnBoundaryEventsForRead(
+		ctx,
+		dbsqlc.ListTurnBoundaryEventsForReadParams{
+			ProjectID: projectID,
+			AgentID:   agentID,
+			TurnIds:   turnIDs,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list turn boundary events for read: %w", err)
+	}
+	turnIndex := make(map[uuid.UUID]int, len(out))
+	for i := range out {
+		turnIndex[out[i].ID] = i
+	}
+	for _, row := range boundaryRows {
+		event := agentEventReadRecordFromSQLC(row)
+		i, ok := turnIndex[event.TurnID]
+		if !ok {
+			continue
+		}
+		if event.IsOpeningEvent {
+			if out[i].StartedAt.IsZero() {
+				out[i].StartedAt = event.CreatedAt
+			}
+			out[i].OpeningEvents = append(out[i].OpeningEvents, event)
+		}
+		if event.ID == out[i].LatestEventID {
+			out[i].LatestEvent = event
+			out[i].UpdatedAt = event.CreatedAt
+		}
+		if event.ID == out[i].LatestSemanticEventID {
+			out[i].LatestSemanticEvent = event
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) requireAgentInProject(ctx context.Context, projectID, agentID uuid.UUID) error {
+	owned, err := s.q.AgentExistsInProject(
+		ctx,
+		dbsqlc.AgentExistsInProjectParams{ProjectID: projectID, ID: agentID},
+	)
+	if err != nil {
+		return fmt.Errorf("check agent project ownership: %w", err)
+	}
+	if !owned {
+		return storeerr.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) requireAgentTurnInProject(ctx context.Context, projectID, agentID, turnID uuid.UUID) error {
+	owned, err := s.q.AgentTurnExistsInProject(
+		ctx,
+		dbsqlc.AgentTurnExistsInProjectParams{ProjectID: projectID, AgentID: agentID, ID: turnID},
+	)
+	if err != nil {
+		return fmt.Errorf("check agent turn project ownership: %w", err)
+	}
+	if !owned {
+		return storeerr.ErrNotFound
+	}
+	return nil
+}
+
+func agentEventReadRecordFromSQLC(row dbsqlc.AgentEventReadProjection) AgentEventReadRecord {
+	record := AgentEventReadRecord{
+		ID:                  row.ID,
+		OrgID:               row.OrgID,
+		ProjectID:           row.ProjectID,
+		AgentID:             row.AgentID,
+		TurnID:              row.TurnID,
+		TurnSequence:        row.TurnSequence,
+		IsOpeningEvent:      row.IsOpeningEvent,
+		Sequence:            row.Sequence,
+		EventKind:           row.EventKind,
+		InputKind:           stringFromSQLCText(row.InputKind),
+		ControlType:         stringFromSQLCText(row.ControlType),
+		ToolCallID:          storeutil.IDFromPtr(row.ToolCallID),
+		ToolOutcome:         ToolResultOutcome(stringFromSQLCText(row.ToolOutcome)),
+		ModelCallContextID:  storeutil.IDFromPtr(row.ModelCallContextID),
+		ModelStopReason:     modelenvelope.StopReason(stringFromSQLCText(row.ModelStopReason)),
+		ContextCheckpointID: storeutil.IDFromPtr(row.ContextCheckpointID),
+		CheckpointSummary:   stringFromSQLCText(row.CheckpointSummary),
+		ContentBlocks:       normalizedJSONArray(row.ContentBlocks),
+		ModelUsage: modelUsageFromSQLC(
+			row.InputTokensTotal,
+			row.UncachedInputTokens,
+			row.CacheReadInputTokens,
+			row.CacheWriteInputTokens,
+			row.OutputTokensTotal,
+			row.ReasoningOutputTokens,
+		),
+		CreatedAt: row.CreatedAt,
+	}
+	if row.ProviderMetadata != nil {
+		record.ProviderMetadata = providerMetadataFromSQLC(*row.ProviderMetadata)
+	}
+	record.ActorID = storeutil.IDFromPtr(row.ActorID)
+	record.AgentInputID = storeutil.IDFromPtr(row.AgentInputID)
+	record.TargetInteractionID = storeutil.IDFromPtr(row.TargetInteractionID)
+	record.AgentConfigID = storeutil.IDFromPtr(row.AgentConfigID)
+	if stringFromSQLCText(row.IdempotencyScope) == "content_input" {
+		record.InputIdempotencyKey = stringFromSQLCText(row.InputIdempotencyKey)
+	}
+	if row.SummarizedThroughEventSequence != nil {
+		record.SummarizedThroughEventSequence = *row.SummarizedThroughEventSequence
+	}
+	return record
+}

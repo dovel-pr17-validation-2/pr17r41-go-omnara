@@ -1,0 +1,223 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Omnara",
+  "seo": {
+    "metatags": {
+      "canonical": "https://docs.omnara.com",
+      "og:site_name": "Omnara Docs",
+      "twitter:card": "summary_large_image"
+    }
+  },
+  "logo": {
+    "dark": "/logo/omnara-logo.svg",
+    "light": "/logo/omnara-logo.svg"
+  },
+  "favicon": "/favicon.ico",
+  "colors": {
+    "primary": "#4372cf",
+    "light": "#81a1df",
+    "dark": "#3162c2"
+  },
+  "background": {
+    "color": {
+      "dark": "#0b0b0c"
+    },
+    "decoration": "gradient"
+  },
+  "appearance": {
+    "default": "dark",
+    "strict": true
+  },
+  "fonts": {
+    "heading": {
+      "family": "Inter",
+      "weight": 600
+    },
+    "body": {
+      "family": "Inter",
+      "weight": 400
+    }
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Support",
+        "href": "/support"
+      },
+      {
+        "label": "GitHub",
+        "href": "https://github.com/omnara-ai/omnara"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Dashboard",
+      "href": "https://app.omnara.com"
+    }
+  },
+  "navigation": {
+    "global": {
+      "anchors": [
+        {
+          "anchor": "Discord",
+          "icon": "discord",
+          "href": "https://discord.gg/Dc46sYk6e3"
+        }
+      ]
+    },
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "concepts"
+            ]
+          },
+          {
+            "group": "Examples",
+            "pages": [
+              "examples/overview",
+              {
+                "group": "GTM agents",
+                "pages": [
+                  "examples/x-signal-agent",
+                  "examples/reddit-signal-agent",
+                  "examples/linkedin-signal-agent",
+                  "examples/seo-audit-agent"
+                ]
+              },
+              "examples/posthog-analytics-agent",
+              {
+                "group": "Engineering",
+                "pages": [
+                  "examples/sre-agent",
+                  "examples/slack-coding-agent",
+                  "examples/pr-review-agent"
+                ]
+              },
+              {
+                "group": "Operations",
+                "pages": [
+                  "examples/browser-agent",
+                  "examples/email-agent"
+                ]
+              },
+              "examples/video-generation-agent"
+            ]
+          },
+          {
+            "group": "Agents",
+            "pages": [
+              "agents/overview",
+              "agents/configuration",
+              "agents/failure-handling"
+            ]
+          },
+          {
+            "group": "Inputs & events",
+            "pages": [
+              "events/sending-input",
+              "events/streaming",
+              "events/webhooks",
+              "events/interactions",
+              "events/artifacts"
+            ]
+          },
+          {
+            "group": "Tools",
+            "pages": [
+              "tools/permissions",
+              "tools/built-in",
+              "tools/custom",
+              "tools/mcp",
+              "tools/skills"
+            ]
+          },
+          {
+            "group": "Machines",
+            "pages": [
+              "machines/overview",
+              "machines/connect",
+              "machines/pools",
+              {
+                "group": "Sandbox providers",
+                "icon": "cloud",
+                "pages": [
+                  "machines/providers/overview",
+                  "machines/providers/agent37",
+                  "machines/providers/arker",
+                  "machines/providers/blaxel",
+                  "machines/providers/boxd",
+                  "machines/providers/createos",
+                  "machines/providers/daytona",
+                  "machines/providers/e2b",
+                  "machines/providers/freestyle",
+                  "machines/providers/modal",
+                  "machines/providers/superserve",
+                  "machines/providers/tenki",
+                  "machines/providers/unikraft"
+                ]
+              }
+            ]
+          },
+          {
+            "group": "Organization",
+            "pages": [
+              "organization/model-providers",
+              "organization/secrets",
+              "organization/members"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/overview",
+              "integrations/slack",
+              "integrations/github",
+              "integrations/discord"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API reference",
+        "groups": [
+          {
+            "group": "API reference",
+            "pages": [
+              "api/overview",
+              "api/authentication",
+              "integrations/custom-integrations"
+            ]
+          },
+          {
+            "group": "Endpoints",
+            "openapi": {
+              "source": "api-reference/openapi.yaml",
+              "directory": "api-reference/endpoints"
+            }
+          }
+        ]
+      },
+      {
+        "tab": "Changelog",
+        "icon": "list",
+        "pages": [
+          "changelog"
+        ]
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "x": "https://twitter.com/omnaraai",
+      "linkedin": "https://linkedin.com/company/omnara",
+      "discord": "https://discord.gg/Dc46sYk6e3"
+    }
+  }
+}

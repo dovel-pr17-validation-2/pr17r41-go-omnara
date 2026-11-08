@@ -1,0 +1,255 @@
+package processaction
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"regexp"
+	"strings"
+)
+
+const (
+	MaxWaitMilliseconds        = 30 * 1000
+	MaxPayloadWaitMilliseconds = 24 * 60 * 60 * 1000
+	LegacyMaxWaitMilliseconds  = 10 * 1000
+	LongWaitDaemonVersion      = "0.2.6"
+
+	MaxObservationBytes     = 64 * 1024
+	DefaultObservationBytes = 8 * 1024
+	MaxWriteBytes           = 128 * 1024
+
+	AgentOutputBytes               = 16 * 1024
+	AgentHeadBytes                 = 2 * 1024
+	DefaultCommandWaitMilliseconds = 5 * 1000
+	InteractiveQuietMilliseconds   = 1000
+	OutputWindowDaemonVersion      = "0.2.15"
+)
+
+// Process output replaces NUL bytes and invalid UTF-8, which Postgres cannot
+// store, with these symbols.
+const (
+	NULSymbol         = "\u2400"
+	InvalidUTF8Symbol = "\uFFFD"
+)
+
+func MinOutputRawBytes(output string) int {
+	return len(output) -
+		(len(NULSymbol)-1)*strings.Count(output, NULSymbol) -
+		(len(InvalidUTF8Symbol)-1)*strings.Count(output, InvalidUTF8Symbol)
+}
+
+type Kind string
+
+const (
+	KindWrite     Kind = "write"
+	KindRead      Kind = "read"
+	KindInterrupt Kind = "interrupt"
+	KindTerminate Kind = "terminate"
+	KindWatch     Kind = "watch"
+)
+
+func (kind Kind) Valid() bool {
+	switch kind {
+	case KindWrite, KindRead, KindInterrupt, KindTerminate, KindWatch:
+		return true
+	default:
+		return false
+	}
+}
+
+func (kind Kind) Mutating() bool {
+	switch kind {
+	case KindWrite, KindInterrupt, KindTerminate, KindWatch:
+		return true
+	default:
+		return false
+	}
+}
+
+type WritePayload struct {
+	Data string `json:"data"`
+}
+
+func DecodeWritePayload(raw json.RawMessage) (WritePayload, error) {
+	var payload WritePayload
+	if err := decodeObject(raw, &payload); err != nil {
+		return WritePayload{}, err
+	}
+	if payload.Data == "" {
+		return WritePayload{}, errors.New("write payload requires non-empty data")
+	}
+	if len(payload.Data) > MaxWriteBytes {
+		return WritePayload{}, fmt.Errorf(
+			"write data cannot exceed %d bytes",
+			MaxWriteBytes,
+		)
+	}
+	return payload, nil
+}
+
+type WatchPayload struct {
+	Pattern        string `json:"pattern,omitempty"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+	Cursor         *int64 `json:"cursor,omitempty"`
+}
+
+const (
+	MaxWatchPatternBytes = 500
+	DefaultWatchSeconds  = 5 * 60
+	MaxWatchSeconds      = 60 * 60
+	WatchDaemonVersion   = OutputWindowDaemonVersion
+)
+
+const (
+	WatchReportIntervalSeconds = 10
+	MaxWatchReportLines        = 20
+)
+
+func MaxWatchReports(timeoutSeconds int) int {
+	return (timeoutSeconds+WatchReportIntervalSeconds-1)/WatchReportIntervalSeconds + 2
+}
+
+func DecodeWatchPayload(raw json.RawMessage) (WatchPayload, error) {
+	var payload WatchPayload
+	if err := decodeObject(raw, &payload); err != nil {
+		return WatchPayload{}, err
+	}
+	if payload.TimeoutSeconds < 0 || payload.TimeoutSeconds > MaxWatchSeconds {
+		return WatchPayload{}, fmt.Errorf("timeout_seconds must be between 0 and %d", MaxWatchSeconds)
+	}
+	if payload.Cancels() {
+		if payload.Pattern != "" || payload.Cursor != nil {
+			return WatchPayload{}, errors.New("timeout_seconds 0 cancels the watch and takes no pattern or offset")
+		}
+		return payload, nil
+	}
+	if err := ValidateWatchPattern(payload.Pattern); err != nil {
+		return WatchPayload{}, err
+	}
+	if payload.Cursor != nil && *payload.Cursor < 0 {
+		return WatchPayload{}, errors.New("cursor cannot be negative")
+	}
+	return payload, nil
+}
+
+func (payload WatchPayload) Cancels() bool {
+	return payload.TimeoutSeconds == 0
+}
+
+func ValidateWatchPattern(pattern string) error {
+	if pattern == "" || len(pattern) > MaxWatchPatternBytes {
+		return fmt.Errorf("pattern must be 1 to %d bytes", MaxWatchPatternBytes)
+	}
+	if strings.Contains(pattern, "\x00") {
+		return errors.New("pattern cannot contain NUL")
+	}
+	if _, err := regexp.Compile(pattern); err != nil {
+		return fmt.Errorf("pattern is not a valid regular expression: %w", err)
+	}
+	return nil
+}
+
+type ReadPayload struct {
+	Cursor   *int64 `json:"cursor,omitempty"`
+	MaxBytes int    `json:"max_bytes,omitempty"`
+	WaitMS   int    `json:"wait_ms,omitempty"`
+	OutputWait
+}
+
+type OutputWait struct {
+	WaitForExit bool `json:"wait_for_exit,omitempty"`
+	QuietMS     int  `json:"quiet_ms,omitempty"`
+	HeadBytes   int  `json:"head_bytes,omitempty"`
+}
+
+func (wait OutputWait) Validate(maxBytes int) error {
+	if wait.QuietMS < 0 || wait.QuietMS > MaxWaitMilliseconds {
+		return fmt.Errorf("quiet_ms must be between 0 and %d", MaxWaitMilliseconds)
+	}
+	if wait.QuietMS > 0 && !wait.WaitForExit {
+		return errors.New("quiet_ms requires wait_for_exit")
+	}
+	if wait.HeadBytes < 0 || (wait.HeadBytes > 0 && wait.HeadBytes >= maxBytes) {
+		return fmt.Errorf("head_bytes must be between 0 and %d", maxBytes-1)
+	}
+	return nil
+}
+
+func (wait OutputWait) Zero() bool {
+	return wait == OutputWait{}
+}
+
+type ReadObservation struct {
+	ProcessID     string `json:"process_id"`
+	Output        string `json:"output"`
+	Cursor        int64  `json:"cursor"`
+	NextCursor    int64  `json:"next_cursor"`
+	Truncated     bool   `json:"truncated"`
+	OutputTail    string `json:"output_tail,omitempty"`
+	OmittedCursor int64  `json:"omitted_cursor,omitempty"`
+	TailCursor    int64  `json:"tail_cursor,omitempty"`
+}
+
+func DecodeReadPayload(raw json.RawMessage) (ReadPayload, error) {
+	var payload ReadPayload
+	if err := decodeObject(raw, &payload); err != nil {
+		return ReadPayload{}, err
+	}
+	if payload.Cursor != nil && *payload.Cursor < 0 {
+		return ReadPayload{}, errors.New("cursor cannot be negative")
+	}
+	if payload.MaxBytes < 0 || payload.MaxBytes > MaxObservationBytes {
+		return ReadPayload{}, fmt.Errorf(
+			"max_bytes must be between 0 and %d",
+			MaxObservationBytes,
+		)
+	}
+	if payload.WaitMS < 0 || payload.WaitMS > MaxPayloadWaitMilliseconds {
+		return ReadPayload{}, fmt.Errorf(
+			"wait_ms must be between 0 and %d",
+			MaxPayloadWaitMilliseconds,
+		)
+	}
+	if err := payload.OutputWait.Validate(payload.ObservationBytes()); err != nil {
+		return ReadPayload{}, err
+	}
+	return payload, nil
+}
+
+func (payload ReadPayload) ObservationBytes() int {
+	if payload.MaxBytes == 0 {
+		return DefaultObservationBytes
+	}
+	return payload.MaxBytes
+}
+
+func DecodeEmptyPayload(raw json.RawMessage) error {
+	return decodeObject(raw, &struct{}{})
+}
+
+func decodeObject(raw json.RawMessage, dst any) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	if fields == nil {
+		return errors.New("payload must be a JSON object")
+	}
+	for name, value := range fields {
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("payload field %s cannot be null", name)
+		}
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err == nil || !errors.Is(err, io.EOF) {
+		return errors.New("payload must contain one JSON object")
+	}
+	return nil
+}

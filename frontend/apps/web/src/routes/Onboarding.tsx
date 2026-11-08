@@ -1,0 +1,164 @@
+import { useCreateOrganization, usePendingInvitations } from '@omnara/react'
+import type { SyntheticEvent } from 'react'
+import { useState } from 'react'
+
+import { BrandMark } from '@/components/brand/OmnaraMark'
+import { PendingInvitationList } from '@/components/invitations/PendingInvitationList'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import { Field, FieldGroup, FieldLabel } from '@/components/ui/field'
+import { Input } from '@/components/ui/input'
+import { ResourceNameFieldError } from '@/components/ui/resource-name-error'
+import { isDeviceApprovalReturnTo, safeReturnTo } from '@/lib/auth-return-to'
+import { resourceNameValid } from '@/lib/resource-name'
+import { errorMessage } from '@/lib/submit-status'
+import { useLogout } from '@/lib/use-logout'
+
+type OnboardingAction = { kind: 'idle' } | { kind: 'creating' } | { kind: 'error'; message: string }
+
+interface OnboardingState {
+  name: string
+  idempotencyKey: string
+  action: OnboardingAction
+}
+
+function initialOnboardingState(): OnboardingState {
+  return { name: '', idempotencyKey: crypto.randomUUID(), action: { kind: 'idle' } }
+}
+
+export function Onboarding() {
+  const { data } = usePendingInvitations()
+  const pending = data.data
+  const createOrganization = useCreateOrganization()
+  const returnTo = safeReturnTo(new URLSearchParams(window.location.search).get('return_to'))
+  const approvingDevice = isDeviceApprovalReturnTo(returnTo)
+
+  const [state, setState] = useState<OnboardingState>(initialOnboardingState)
+  const creating = state.action.kind === 'creating'
+  const error = state.action.kind === 'error' ? state.action.message : null
+
+  async function createOrg(event: SyntheticEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setState((prev) => ({ ...prev, action: { kind: 'creating' } }))
+    try {
+      await createOrganization.mutateAsync({
+        body: { name: state.name },
+        idempotencyKey: state.idempotencyKey,
+      })
+      window.location.assign(returnTo)
+    } catch (err) {
+      setState((prev) => ({
+        ...prev,
+        action: { kind: 'error', message: errorMessage(err, 'Could not create organization') },
+      }))
+    }
+  }
+
+  return (
+    <div className="flex min-h-svh flex-col items-center justify-center gap-8 p-6">
+      <div className="type-card-title flex items-center gap-2 text-base">
+        <BrandMark />
+        Omnara
+      </div>
+
+      <div className="flex w-full max-w-md flex-col gap-6">
+        <div className="flex flex-col gap-1 text-center">
+          <h1 className="type-title">Welcome to Omnara</h1>
+          <p className="text-muted-foreground text-sm">
+            {pending.length > 0
+              ? 'Accept an invitation or create your own organization'
+              : 'Create your organization'}
+            {approvingDevice
+              ? ', then we will bring you back to approve the CLI login.'
+              : ' to get started.'}
+          </p>
+        </div>
+
+        {error && <p className="text-destructive text-center text-sm">{error}</p>}
+
+        <PendingInvitationList
+          invitations={pending}
+          onAccepted={() => {
+            window.location.assign(returnTo)
+          }}
+        />
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Create an organization</CardTitle>
+            <CardDescription>You become the owner and can invite teammates later.</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <form
+              onSubmit={(event) => {
+                void createOrg(event)
+              }}
+            >
+              <FieldGroup>
+                <Field>
+                  <FieldLabel htmlFor="org-name">Organization name</FieldLabel>
+                  <Input
+                    id="org-name"
+                    required
+                    value={state.name}
+                    autoComplete="organization"
+                    placeholder="Acme Inc."
+                    onChange={(event) => {
+                      setState((prev) => ({
+                        ...prev,
+                        name: event.target.value,
+                        idempotencyKey: crypto.randomUUID(),
+                      }))
+                    }}
+                  />
+                  <ResourceNameFieldError value={state.name} />
+                </Field>
+                <Button
+                  type="submit"
+                  className="w-full"
+                  disabled={creating || !resourceNameValid(state.name)}
+                  loading={creating}
+                >
+                  Create organization
+                </Button>
+              </FieldGroup>
+            </form>
+          </CardContent>
+        </Card>
+      </div>
+
+      <OnboardingFooter returnTo={returnTo} />
+    </div>
+  )
+}
+
+function OnboardingFooter({ returnTo }: { returnTo: string }) {
+  const { status, logout } = useLogout()
+  return (
+    <footer className="text-muted-foreground flex flex-col items-center gap-1 text-sm">
+      <div className="flex items-center gap-4">
+        <a
+          href={
+            returnTo === '/'
+              ? '/user/account'
+              : `/user/account?return_to=${encodeURIComponent(returnTo)}`
+          }
+          className="hover:text-foreground underline-offset-4 hover:underline"
+        >
+          Account settings
+        </a>
+        <button
+          type="button"
+          className="hover:text-foreground underline-offset-4 hover:underline disabled:opacity-50"
+          disabled={status.kind === 'pending'}
+          onClick={() => {
+            void logout()
+          }}
+        >
+          Log out
+        </button>
+      </div>
+      {status.kind === 'error' && <p className="text-destructive text-xs">{status.message}</p>}
+    </footer>
+  )
+}

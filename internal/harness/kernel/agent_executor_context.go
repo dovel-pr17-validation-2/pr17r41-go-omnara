@@ -1,0 +1,543 @@
+package kernel
+
+import (
+	"context"
+	"errors"
+	"strings"
+
+	"github.com/google/uuid"
+	"github.com/omnara-ai/omnara/internal/agentconfig"
+	"github.com/omnara-ai/omnara/internal/mcp"
+	"github.com/omnara-ai/omnara/internal/model"
+	"github.com/omnara-ai/omnara/internal/modelcontext"
+	"github.com/omnara-ai/omnara/internal/modelenvelope"
+	"github.com/omnara-ai/omnara/internal/modelretry"
+	"github.com/omnara-ai/omnara/internal/storage/executionstore"
+	"github.com/omnara-ai/omnara/internal/storage/storeerr"
+)
+
+type modelStepState string
+
+const (
+	modelStepWaiting modelStepState = "waiting"
+	modelStepDone    modelStepState = "done"
+	modelStepToolUse modelStepState = "tool_use"
+)
+
+const (
+	preSendErrorCodeCaptureAgentConfigFailed  = "capture_agent_config_failed"
+	preSendErrorCodeCompileAgentConfigFailed  = "compile_agent_config_failed"
+	preSendErrorCodeInitializeMCPFailed       = "initialize_mcp_connections_failed"
+	preSendErrorCodeResolveModelFailed        = "resolve_model_failed"
+	preSendErrorCodeBuildModelContextFailed   = "build_model_context_failed"
+	preSendErrorCodeLoadReplayPolicyFailed    = "load_provider_replay_policy_failed"
+	preSendErrorCodePrepareModelRequestFailed = "prepare_model_request_failed"
+)
+
+type modelStep struct {
+	State               modelStepState
+	Context             executionstore.ModelCallContextRecord
+	Bundle              modelcontext.Bundle
+	Envelope            modelenvelope.ResponseEnvelope
+	Response            model.Response
+	Resolved            model.ResolvedClient
+	StreamedToolCallIDs map[string]uuid.UUID
+}
+
+func (e AgentExecutor) executeModelStep(
+	ctx context.Context, input ModelWorkExecution, builder modelcontext.Builder, resolver model.Resolver,
+) (modelStep, error) {
+	var snapshot executionstore.AgentConfigSnapshotRecord
+	var claim executionstore.ModelCallClaim
+	var err error
+	if input.Kind == executionstore.ModelWorkResume {
+		claim, err = e.Store.Execution().ClaimNextModelCallContext(ctx, executionstore.ClaimNextModelCallContextInput{
+			ProjectID:                     input.ProjectID,
+			AgentID:                       input.AgentID,
+			PredecessorModelCallContextID: input.ModelCallContextID,
+			RuntimeLockID:                 input.RuntimeLockID,
+		})
+		if err != nil {
+			return modelStep{}, err
+		}
+		if claim.Claimed {
+			snapshot, err = e.Store.Execution().CaptureAgentConfigForEventWatermark(
+				ctx,
+				input.ProjectID,
+				input.AgentID,
+				claim.Context.InputEventSequence,
+			)
+			if err != nil {
+				return e.recordNormalPreSendFailure(
+					ctx, input, claim, model.ResolvedClient{}, err,
+					modelretry.PreSendFailure{
+						Code:    preSendErrorCodeCaptureAgentConfigFailed,
+						Message: "Omnara could not load the agent configuration for this model attempt.",
+					},
+				)
+			}
+		}
+	} else {
+		prepared, prepareErr := e.Store.Execution().PrepareNormalModelCall(ctx, executionstore.PrepareNormalModelCallInput{
+			ProjectID:                input.ProjectID,
+			AgentID:                  input.AgentID,
+			RuntimeLockID:            input.RuntimeLockID,
+			OpeningInputIDs:          input.InputIDs,
+			SourceModelCallContextID: input.SourceModelCallContextID,
+			SourceModelOutputID:      input.SourceModelOutputID,
+		})
+		err = prepareErr
+		claim, snapshot = prepared.Claim, prepared.Snapshot
+	}
+	if err != nil {
+		return modelStep{}, err
+	}
+	if !claim.Claimed {
+		if claim.Created &&
+			claim.Context.ErrorCode == storeerr.ManagedWorkAdmissionDeniedCode {
+			e.notifyModelFailure(ctx, input)
+		}
+		state := modelStepWaiting
+		if claim.Context.State != executionstore.ModelCallContextStarted &&
+			claim.Context.RecoveryKind != executionstore.ModelCallRecoveryRetry {
+			state = modelStepDone
+		}
+		return modelStep{State: state, Context: claim.Context}, nil
+	}
+	contract, err := agentconfig.RuntimeContractFromCompiled(
+		snapshot.AgentConfig.CompiledDefinition,
+		snapshot.AgentConfig.EffectiveDefinitionHash,
+	)
+	if err != nil {
+		return e.recordNormalPreSendFailure(
+			ctx, input, claim, model.ResolvedClient{}, err,
+			modelretry.PreSendFailure{
+				Code: preSendErrorCodeCompileAgentConfigFailed,
+				Message: "Omnara could not load the compiled agent configuration " +
+					"for this model attempt.",
+			},
+		)
+	}
+	var mcpTrigger mcp.ConnectionTrigger
+	switch input.Kind {
+	case executionstore.ModelWorkStart:
+		mcpTrigger = mcp.TriggerTurnStart
+	case executionstore.ModelWorkResume:
+		mcpTrigger = mcp.TriggerTurnResume
+	case executionstore.ModelWorkContinue:
+		mcpTrigger = mcp.TriggerTurnContinue
+	}
+	if mcpTrigger != 0 {
+		if err := e.ensureMCPConnections(
+			ctx,
+			claim.Context.OrgID,
+			input,
+			contract,
+			mcpTrigger,
+		); err != nil {
+			return e.recordNormalPreSendFailure(
+				ctx, input, claim, model.ResolvedClient{}, err,
+				modelretry.PreSendFailure{
+					Code:    preSendErrorCodeInitializeMCPFailed,
+					Message: "Omnara could not initialize the configured MCP connections.",
+				},
+			)
+		}
+	}
+	selection := modelSelectionForContext(claim.Context, contract.Model)
+	resolved, err := resolver.Resolve(ctx, selection)
+	if err != nil {
+		if ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			return modelStep{}, err
+		}
+		return e.recordNormalPreSendFailure(
+			ctx, input, claim, model.ResolvedClient{}, err,
+			modelretry.PreSendFailure{
+				Code:    preSendErrorCodeResolveModelFailed,
+				Message: "Omnara could not resolve the configured model for this attempt.",
+			},
+		)
+	}
+	if err := validateResolvedModelContext(resolved, claim.Context); err != nil {
+		return e.recordNormalFailure(ctx, input, claim, resolved, err, false, model.Response{})
+	}
+	client := resolved.Client
+	apiFormat, apiVariant, hasAPIIdentity := model.APIIdentityForClient(client)
+	if !hasAPIIdentity {
+		cause := model.ProviderError{
+			Kind:    model.ErrorKindInvalidRequest,
+			Source:  "model",
+			Code:    "missing_api_identity",
+			Message: "The configured model client does not declare its API format and variant.",
+		}
+		return e.recordNormalFailure(ctx, input, claim, resolved, cause, false, model.Response{})
+	}
+	capabilities := model.CapabilitiesForClient(client)
+	bundle, err := builder.Build(ctx, modelcontext.BuildInput{
+		ProjectID:                  input.ProjectID,
+		AgentID:                    input.AgentID,
+		TurnID:                     input.TurnID,
+		OpeningInputIDs:            input.InputIDs,
+		Now:                        input.Now,
+		AgentConfigSnapshot:        &snapshot,
+		MediaProjector:             model.MediaProjectorForClient(client),
+		TextAttachmentBudgetTokens: model.TextAttachmentBudgetTokens(client),
+	})
+	if errors.Is(err, modelcontext.ErrOpeningMediaBudgetExceeded) {
+		cause := model.ProviderError{
+			Kind:    model.ErrorKindInvalidRequest,
+			Source:  modelErrorSourceForClient(client),
+			Code:    "opening_media_too_large",
+			Message: "The media attached to the current inputs is too large for one model request.",
+			Cause:   err,
+		}
+		return e.recordNormalFailure(ctx, input, claim, resolved, cause, false, model.Response{})
+	}
+	if err != nil {
+		return e.recordNormalPreSendFailure(
+			ctx, input, claim, resolved, err,
+			modelretry.PreSendFailure{
+				Code:    preSendErrorCodeBuildModelContextFailed,
+				Message: "Omnara could not construct the model context for this attempt.",
+			},
+		)
+	}
+	if err := ensureModelSupportsTools(
+		client,
+		capabilities,
+		contract.RequiresModelToolSupport() || len(bundle.ToolSpecs) > 0,
+	); err != nil {
+		cause := model.ProviderError{
+			Kind:    model.ErrorKindInvalidRequest,
+			Source:  "model_capabilities",
+			Code:    "required_tools_unsupported",
+			Message: err.Error(),
+		}
+		return e.recordNormalFailure(ctx, input, claim, resolved, cause, false, model.Response{})
+	}
+
+	policy, err := modelretry.RequestPolicyForModelCall(
+		ctx,
+		e.Store.Execution(),
+		input.ProjectID,
+		input.AgentID,
+		claim.Context.ID,
+		model.RequestPolicyFromCapabilities(capabilities),
+	)
+	if err != nil {
+		return e.recordNormalPreSendFailure(
+			ctx, input, claim, resolved, err,
+			modelretry.PreSendFailure{
+				Code: preSendErrorCodeLoadReplayPolicyFailed,
+				Message: "Omnara could not determine whether provider replay is safe " +
+					"for this attempt.",
+			},
+		)
+	}
+	bundle.ConfiguredModelRevisionID = claim.Context.ConfiguredModelRevisionID
+	bundle.SafetyIdentifier = e.safetyIdentifier(input.OrgID)
+	prepared, err := model.PrepareForSend(
+		ctx,
+		client,
+		model.PrepareForSendInput{
+			Context:     bundle,
+			Policy:      policy,
+			ErrorSource: modelErrorSourceForClient(client),
+		},
+	)
+	if err != nil {
+		return e.recordNormalPreSendFailure(
+			ctx, input, claim, resolved, err,
+			modelretry.PreSendFailure{
+				Code:    preSendErrorCodePrepareModelRequestFailed,
+				Message: "Omnara could not prepare the provider request for this attempt.",
+			},
+		)
+	}
+	if prepared.InputBudget.OverBudget() {
+		trigger, triggerErr := localInputBudgetTrigger(
+			prepared.InputBudget,
+			modelErrorSourceForClient(client),
+		)
+		if triggerErr != nil {
+			return modelStep{}, triggerErr
+		}
+		return e.enterContextMaintenance(ctx, input, claim, resolved, trigger, false, model.Response{})
+	}
+	request := model.Request{
+		ProviderRequest: prepared.Body,
+	}
+	var streamSink *harnessStreamSink
+	if claim.Context.AttemptNumber == 1 {
+		if streamSink = e.streamSinkForCall(
+			context.WithoutCancel(ctx),
+			input.AgentID,
+			input.TurnID,
+			claim.Context.ID,
+		); streamSink != nil {
+			request.DeltaSink = streamSink
+			defer streamSink.Close()
+		}
+	}
+	response, err := client.Respond(ctx, request)
+	if err != nil {
+		if ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			return modelStep{}, err
+		}
+		if _, classified := model.ClassifyError(err); !classified {
+			return modelStep{}, err
+		}
+		return e.recordNormalProviderFailure(
+			ctx,
+			input,
+			claim,
+			resolved,
+			policy,
+			err,
+			response,
+		)
+	}
+	envelope, err := model.NewResponseEnvelopeForStorage(
+		client.RequestedProviderModelSlug(),
+		apiFormat,
+		apiVariant,
+		response,
+	)
+	if err != nil {
+		return e.recordNormalFailure(
+			ctx,
+			input,
+			claim,
+			resolved,
+			model.MalformedProviderResponse(string(apiFormat), err),
+			true,
+			response,
+		)
+	}
+	envelope.InputFingerprint = prepared.InputFingerprint
+	step := modelStep{
+		Context:             claim.Context,
+		Bundle:              bundle,
+		Envelope:            envelope,
+		Response:            response,
+		Resolved:            resolved,
+		StreamedToolCallIDs: streamSink.ToolCallIDs(),
+	}
+	return e.finishModelResponse(ctx, input, step)
+}
+
+func (e AgentExecutor) finishModelResponse(
+	ctx context.Context,
+	input ModelWorkExecution,
+	step modelStep,
+) (modelStep, error) {
+	client := step.Resolved.Client
+	errorSource := modelErrorSourceForClient(client)
+	calls := model.ToolCallsFromEnvelope(step.Envelope)
+	reason := step.Envelope.Normalized.StopReason
+	cause := invalidModelResponse(errorSource, reason, calls)
+	if cause == nil && reason == model.StopReasonMaxTokens && len(calls) == 0 &&
+		strings.TrimSpace(step.Envelope.Text()) == "" {
+		cause = model.ProviderError{
+			Kind: model.ErrorKindTransient, Source: errorSource, Code: "model_output_no_progress",
+			Message: "The model exhausted its output allowance without producing text or a tool call.",
+		}
+	}
+	if cause != nil {
+		return e.recordNormalFailureForAttempt(
+			ctx,
+			input,
+			executionstore.ModelCallClaim{Context: step.Context, Claimed: true},
+			step.Resolved,
+			cause,
+			true,
+			step.Response,
+			modelretry.Attempt{Number: step.Context.AttemptNumber},
+		)
+	}
+	if len(calls) > 0 {
+		step.State = modelStepToolUse
+		return step, nil
+	}
+	return e.recordSuccessfulModelOutput(ctx, input, step)
+}
+
+func (e AgentExecutor) recordSuccessfulModelOutput(
+	ctx context.Context,
+	input ModelWorkExecution,
+	step modelStep,
+) (modelStep, error) {
+	_, err := e.Store.Execution().RecordModelOutputAndCompleteContext(
+		ctx,
+		executionstore.RecordModelOutputAndCompleteContextInput{
+			ProjectID:          input.ProjectID,
+			AgentID:            input.AgentID,
+			RuntimeLockID:      input.RuntimeLockID,
+			ModelCallContextID: step.Context.ID,
+			ProviderRequestID:  step.Response.ProviderRequestID,
+			ProviderResponse:   step.Envelope,
+		},
+	)
+	if err != nil {
+		return modelStep{}, err
+	}
+	step.State = modelStepDone
+	return step, nil
+}
+
+func (e AgentExecutor) recordNormalFailure(
+	ctx context.Context,
+	input ModelWorkExecution,
+	claim executionstore.ModelCallClaim,
+	resolved model.ResolvedClient,
+	cause error,
+	providerRequestStarted bool,
+	response model.Response,
+) (modelStep, error) {
+	return e.recordNormalFailureForAttempt(
+		ctx,
+		input,
+		claim,
+		resolved,
+		cause,
+		providerRequestStarted,
+		response,
+		modelretry.Attempt{Number: claim.Context.AttemptNumber},
+	)
+}
+
+func (e AgentExecutor) recordNormalProviderFailure(
+	ctx context.Context,
+	input ModelWorkExecution,
+	claim executionstore.ModelCallClaim,
+	resolved model.ResolvedClient,
+	policy model.RequestPolicy,
+	cause error,
+	response model.Response,
+) (modelStep, error) {
+	return e.recordNormalFailureForAttempt(
+		ctx,
+		input,
+		claim,
+		resolved,
+		cause,
+		true,
+		response,
+		modelretry.Attempt{
+			Number: claim.Context.AttemptNumber,
+			ProviderReplayCutoffCanAdvance: policy.ProviderReplayCutoffEventSequence <
+				claim.Context.InputEventSequence,
+		},
+	)
+}
+
+func (e AgentExecutor) recordNormalFailureForAttempt(
+	ctx context.Context,
+	input ModelWorkExecution,
+	claim executionstore.ModelCallClaim,
+	resolved model.ResolvedClient,
+	cause error,
+	providerRequestStarted bool,
+	response model.Response,
+	attempt modelretry.Attempt,
+) (modelStep, error) {
+	if trigger, ok := providerInputFailureTrigger(cause); ok {
+		return e.enterContextMaintenance(
+			ctx,
+			input,
+			claim,
+			resolved,
+			trigger,
+			providerRequestStarted,
+			response,
+		)
+	}
+	now := e.now()
+	evidence, decision := modelretry.Decide(
+		cause,
+		attempt,
+		claim.Context.ID.String(),
+		now,
+	)
+	if decision.Action == modelretry.ActionRetry {
+		decision.RetryDelay = e.modelRetryDelay(decision.RetryDelay)
+	}
+
+	failureEvidence := collectNormalCallFailureEvidence(
+		resolved,
+		evidence.RequestID,
+		providerRequestStarted,
+		response,
+	)
+	if decision.Action == modelretry.ActionRetry {
+		failureInput := executionstore.RecordRecoverableModelCallFailureInput{
+			ProjectID:               input.ProjectID,
+			AgentID:                 input.AgentID,
+			ModelCallContextID:      claim.Context.ID,
+			RuntimeLockID:           input.RuntimeLockID,
+			RecoveryKind:            executionstore.ModelCallRecoveryRetry,
+			APIFormat:               failureEvidence.APIFormat,
+			APIVariant:              failureEvidence.APIVariant,
+			ProviderRequestID:       failureEvidence.ProviderRequestID,
+			ProviderResponseID:      failureEvidence.ProviderResponseID,
+			ErrorKind:               evidence.Kind,
+			ErrorCode:               evidence.Code,
+			ErrorMessage:            evidence.Message,
+			ErrorDetails:            evidence.Details,
+			RetryDelay:              decision.RetryDelay,
+			Usage:                   failureEvidence.Usage,
+			ProviderReportedCostUSD: failureEvidence.ProviderReportedCostUSD,
+			ProviderMetadata:        failureEvidence.ProviderMetadata,
+		}
+		contextRecord, err := e.Store.Execution().RecordRetryableModelCallFailure(ctx, failureInput)
+		if err != nil {
+			return modelStep{}, errors.Join(cause, err)
+		}
+		return modelStep{State: modelStepWaiting, Context: contextRecord, Resolved: resolved}, nil
+	}
+	_, err := e.Store.Execution().RecordModelCallErrorAndCompleteContext(
+		ctx,
+		executionstore.RecordModelCallErrorAndCompleteContextInput{
+			ProjectID:               input.ProjectID,
+			AgentID:                 input.AgentID,
+			RuntimeLockID:           input.RuntimeLockID,
+			ModelCallContextID:      claim.Context.ID,
+			APIFormat:               failureEvidence.APIFormat,
+			APIVariant:              failureEvidence.APIVariant,
+			ServedProviderModelSlug: failureEvidence.ServedModelSlug,
+			ProviderRequestID:       failureEvidence.ProviderRequestID,
+			ProviderResponseID:      failureEvidence.ProviderResponseID,
+			ErrorKind:               evidence.Kind,
+			ErrorCode:               evidence.Code,
+			ErrorMessage:            evidence.Message,
+			ErrorDetails:            evidence.Details,
+			Usage:                   failureEvidence.Usage,
+			ProviderReportedCostUSD: failureEvidence.ProviderReportedCostUSD,
+			ProviderMetadata:        failureEvidence.ProviderMetadata,
+		},
+	)
+	if err != nil {
+		return modelStep{}, errors.Join(cause, err)
+	}
+	e.notifyModelFailure(ctx, input)
+	return modelStep{State: modelStepDone, Context: claim.Context, Resolved: resolved}, nil
+}
+
+func (e AgentExecutor) recordNormalPreSendFailure(
+	ctx context.Context,
+	input ModelWorkExecution,
+	claim executionstore.ModelCallClaim,
+	resolved model.ResolvedClient,
+	cause error,
+	failure modelretry.PreSendFailure,
+) (modelStep, error) {
+	return e.recordNormalFailure(
+		ctx,
+		input,
+		claim,
+		resolved,
+		modelretry.NormalizePreSendFailure(cause, failure),
+		false,
+		model.Response{},
+	)
+}

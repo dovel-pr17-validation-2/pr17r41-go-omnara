@@ -1,0 +1,74 @@
+package executionstore
+
+import (
+	"github.com/omnara-ai/omnara/internal/storage/internal/dbsqlc"
+	"github.com/omnara-ai/omnara/internal/storage/internal/storeutil"
+)
+
+func agentMachineBindingRecordFromSQLC(row dbsqlc.AgentMachineBinding) AgentMachineBindingRecord {
+	return AgentMachineBindingRecord{
+		ID:                     row.ID,
+		OrgID:                  row.OrgID,
+		ProjectID:              row.ProjectID,
+		AgentID:                row.AgentID,
+		CreateToolCallID:       storeutil.IDFromPtr(row.CreateToolCallID),
+		DeleteToolCallID:       storeutil.IDFromPtr(row.DeleteToolCallID),
+		MachineID:              row.MachineID,
+		BindingKind:            AgentMachineBindingKind(row.BindingKind),
+		State:                  AgentMachineBindingState(row.State),
+		Description:            row.Description,
+		Cwd:                    row.Cwd,
+		EnvOverlay:             row.EnvOverlay,
+		SecretEnvOverlay:       row.SecretEnvOverlay,
+		DeleteAfterIdleMinutes: storeutil.IntPtr(row.DeleteAfterIdleMinutes),
+		Metadata:               row.Metadata,
+		CreatedAt:              row.CreatedAt,
+		UpdatedAt:              row.UpdatedAt,
+	}
+}
+
+func agentMachineBindingRecordFromListSQLC(
+	row dbsqlc.ListAgentMachineBindingsRow,
+) AgentMachineBindingRecord {
+	return AgentMachineBindingRecord{
+		ID:               row.ID,
+		OrgID:            row.OrgID,
+		ProjectID:        row.ProjectID,
+		AgentID:          row.AgentID,
+		CreateToolCallID: storeutil.IDFromPtr(row.CreateToolCallID),
+		DeleteToolCallID: storeutil.IDFromPtr(row.DeleteToolCallID),
+		MachineID:        row.MachineID,
+		BindingKind:      AgentMachineBindingKind(row.BindingKind),
+		State:            AgentMachineBindingState(row.State),
+		Description:      row.Description,
+		Cwd:              row.EffectiveCwd,
+		EnvOverlay:       row.EnvOverlay,
+		SecretEnvOverlay: row.SecretEnvOverlay,
+		Metadata:         row.Metadata,
+		CreatedAt:        row.CreatedAt,
+		UpdatedAt:        row.UpdatedAt,
+	}
+}
+
+func executableAgentMachineBindingRecordFromSQLC(
+	row dbsqlc.ListExecutableAgentMachineBindingsRow,
+) AgentMachineBindingRecord {
+	return AgentMachineBindingRecord{
+		ID:               row.ID,
+		OrgID:            row.OrgID,
+		ProjectID:        row.ProjectID,
+		AgentID:          row.AgentID,
+		CreateToolCallID: storeutil.IDFromPtr(row.CreateToolCallID),
+		DeleteToolCallID: storeutil.IDFromPtr(row.DeleteToolCallID),
+		MachineID:        row.MachineID,
+		BindingKind:      AgentMachineBindingKind(row.BindingKind),
+		State:            AgentMachineBindingState(row.State),
+		Description:      row.Description,
+		Cwd:              row.EffectiveCwd,
+		EnvOverlay:       row.EnvOverlay,
+		SecretEnvOverlay: row.SecretEnvOverlay,
+		Metadata:         row.Metadata,
+		CreatedAt:        row.CreatedAt,
+		UpdatedAt:        row.UpdatedAt,
+	}
+}

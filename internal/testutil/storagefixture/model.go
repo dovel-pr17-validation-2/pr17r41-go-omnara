@@ -1,0 +1,115 @@
+package storagefixture
+
+import (
+	"context"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/omnara-ai/omnara/internal/agentconfig"
+	"github.com/omnara-ai/omnara/internal/storage/executionstore"
+	"github.com/omnara-ai/omnara/internal/storage/modelstore"
+	"github.com/omnara-ai/omnara/internal/storage/storeerr"
+	"github.com/stretchr/testify/require"
+)
+
+func DefaultModelInput(orgID, providerID uuid.UUID, name string) modelstore.CreateConfiguredModelInput {
+	return modelstore.CreateConfiguredModelInput{
+		OrgID: orgID, ModelProviderConfigID: providerID, Name: name, ProviderModelSlug: name,
+		ContextWindowTokens: 128000, MaxOutputTokens: new(8192),
+	}
+}
+
+func SeedModel(
+	t testing.TB,
+	ctx context.Context,
+	models *modelstore.Store,
+	projectID uuid.UUID,
+	input modelstore.CreateConfiguredModelInput,
+) modelstore.ConfiguredModelRecord {
+	t.Helper()
+	configuredModel, err := models.CreateConfiguredModel(ctx, input)
+	require.NoError(t, err, "create test configured model %q", input.Name)
+	_, err = models.CreateProjectModelGrant(ctx, modelstore.CreateProjectModelGrantInput{
+		OrgID: input.OrgID, ProjectID: projectID, ConfiguredModelID: configuredModel.ID,
+	})
+	require.NoError(t, err, "grant test configured model %q", input.Name)
+	return configuredModel
+}
+
+func SeedModelForAgentYAML(
+	t testing.TB,
+	ctx context.Context,
+	models *modelstore.Store,
+	orgID, projectID uuid.UUID,
+	sourceYAML string,
+) modelstore.ConfiguredModelRecord {
+	t.Helper()
+	source, err := agentconfig.ParseSource(agentconfig.SourceFormatYAML, []byte(sourceYAML))
+	require.NoError(t, err, "parse agent config source model")
+	providerConfigName, configuredModelName := source.Model.ProviderConfig, source.Model.Name
+	if providerConfigName == "" {
+		providerConfigName = "openai-prod"
+	}
+	if configuredModelName == "" {
+		configuredModelName = "gpt-test"
+	}
+	providerConfig, err := models.GetModelProviderConfigByName(ctx, orgID, providerConfigName)
+	require.NoError(t, err, "load test provider config %q", providerConfigName)
+	input := DefaultModelInput(orgID, providerConfig.ID, configuredModelName)
+	input.DefaultMaxOutputTokens = new(4096)
+	return EnsureModelAccess(t, ctx, models, projectID, input)
+}
+
+// EnsureModelAccess preserves existing model and grant settings, using seed only
+// when the selected fixture model does not exist.
+func EnsureModelAccess(
+	t testing.TB,
+	ctx context.Context,
+	models *modelstore.Store,
+	projectID uuid.UUID,
+	seed modelstore.CreateConfiguredModelInput,
+) modelstore.ConfiguredModelRecord {
+	t.Helper()
+	configuredModel, err := models.GetConfiguredModelByName(ctx, seed.OrgID, seed.ModelProviderConfigID, seed.Name)
+	if storeerr.IsNotFound(err) {
+		return SeedModel(t, ctx, models, projectID, seed)
+	}
+	require.NoError(t, err, "load existing fixture model %q", seed.Name)
+	_, err = models.GetActiveProjectModelGrantForConfiguredModel(ctx, seed.OrgID, projectID, configuredModel.ID)
+	if storeerr.IsNotFound(err) {
+		_, err = models.CreateProjectModelGrant(ctx, modelstore.CreateProjectModelGrantInput{
+			OrgID: seed.OrgID, ProjectID: projectID, ConfiguredModelID: configuredModel.ID,
+		})
+	}
+	require.NoError(t, err, "grant fixture access to configured model %q", seed.Name)
+	return configuredModel
+}
+
+func SeedModelAndCompileAgentYAML(
+	t testing.TB,
+	ctx context.Context,
+	models *modelstore.Store,
+	execution *executionstore.Store,
+	orgID, projectID uuid.UUID,
+	sourceYAML string,
+) agentconfig.Result {
+	t.Helper()
+	configuredModel := SeedModelForAgentYAML(t, ctx, models, orgID, projectID, sourceYAML)
+	compiled, err := agentconfig.Compile(agentconfig.SourceFormatYAML, []byte(sourceYAML), agentconfig.CompileOptions{
+		ResolveModelSelection: func(string, string) (agentconfig.ResolvedModelSelection, error) {
+			supportsTools := configuredModel.SupportsTools
+			return agentconfig.ResolvedModelSelection{
+				ConfiguredModelID: configuredModel.ID,
+				SupportsTools:     &supportsTools,
+			}, nil
+		},
+		ResolveMachineName: func(machineName string) (uuid.UUID, error) {
+			return execution.ResolveAgentConfigMachineName(ctx, projectID, machineName)
+		},
+		ResolveMachinePoolName: func(machinePoolName string) (uuid.UUID, error) {
+			return execution.ResolveAgentConfigMachinePoolName(ctx, orgID, projectID, machinePoolName)
+		},
+	})
+	require.NoError(t, err, "compile resolved agent yaml")
+	return compiled
+}

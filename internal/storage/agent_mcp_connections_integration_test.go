@@ -1,0 +1,351 @@
+//go:build integration
+
+package storage
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"testing"
+
+	"github.com/omnara-ai/omnara/internal/agentconfig"
+	"github.com/omnara-ai/omnara/internal/jsoncanonical"
+	"github.com/omnara-ai/omnara/internal/storage/executionstore"
+	"github.com/omnara-ai/omnara/internal/storage/storeerr"
+	"github.com/omnara-ai/omnara/internal/toolpermission"
+	"github.com/stretchr/testify/require"
+)
+
+func TestAgentMCPConnectionsLifecycle(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+	seedMigratedDB(t, ctx, pool)
+
+	store := newIntegrationStore(pool)
+	user, err := store.CreateVerifiedUser(
+		ctx,
+		CreateVerifiedUserInput{Email: "mcp-connection@example.com", DisplayName: "MCP Connection User"},
+	)
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	agent := createLaunchTestAgent(t, ctx, store, "idem-mcp-connection-agent", `
+instruction: Use MCP later.
+model:
+  provider_config: openai-prod
+  name: gpt-test
+mcp:
+  docs:
+    url: https://example.com/mcp
+    permission:
+      mode: always_ask
+      parameters: {}
+`)
+	launch, err := store.Execution().LaunchAgent(
+		ctx,
+		executionstore.LaunchAgentInput{
+			ProjectID:      testProjectID,
+			ProfileID:      agent.ID,
+			AgentConfigID:  agent.CurrentConfigID,
+			LaunchedBy:     userPrincipal(user.ID),
+			IdempotencyKey: "idem-mcp-connection-agent",
+		},
+	)
+	if err != nil {
+		t.Fatalf("launch agent: %v", err)
+	}
+	if len(launch.MCPServers) != 1 || len(launch.MCPConnections) != 1 {
+		t.Fatalf(
+			"expected launch to load mcp config and create connection, servers=%+v connections=%+v",
+			launch.MCPServers,
+			launch.MCPConnections,
+		)
+	}
+
+	conn := launch.MCPConnections[0]
+	assertInitializeError := func(want *string) {
+		t.Helper()
+		var got *string
+		require.NoError(t, pool.QueryRow(ctx,
+			`SELECT initialize_error FROM agent_mcp_connections WHERE id = $1`, conn.ID,
+		).Scan(&got))
+		require.Equal(t, want, got)
+	}
+	assertInitializeError(nil)
+	require.Empty(t, conn.InitializeError)
+	if conn.State != executionstore.MCPConnectionStateInitializing || conn.Generation != 1 || conn.RequestSequence != 1 {
+		t.Fatalf("unexpected new mcp connection: %+v", conn)
+	}
+	wrongProjectID := seedAdditionalProjectForTest(t, ctx, pool, "mcp_connection_wrong_scope")
+	catalog := seedCatalogForTest(t, ctx, store, "https://example.com/mcp", `[{"name":"search"}]`)
+	if _, err := store.Execution().MarkMCPConnectionReady(ctx, executionstore.MarkMCPConnectionReadyInput{
+		ProjectID:          wrongProjectID,
+		AgentID:            launch.Agent.ID,
+		ID:                 conn.ID,
+		GenerationObserved: conn.Generation,
+		MCPSessionID:       "wrong-project-session",
+		ProtocolVersion:    "2025-11-25",
+		CatalogID:          catalog.ID,
+	}); !errors.Is(err, storeerr.ErrStateTransitionConflict) {
+		t.Fatalf("wrong-project ready error = %v, want state transition conflict", err)
+	}
+	if _, changed, err := store.Execution().BeginMCPConnectionInitialization(
+		ctx,
+		wrongProjectID,
+		launch.Agent.ID,
+		conn.ID,
+	); err != nil || changed {
+		t.Fatalf("wrong-project initialization changed=%t err=%v, want false/nil", changed, err)
+	}
+	if _, err := store.Execution().MarkMCPConnectionFailed(
+		ctx,
+		wrongProjectID,
+		launch.Agent.ID,
+		conn.ID,
+		conn.Generation,
+		"wrong project",
+	); !errors.Is(err, storeerr.ErrStateTransitionConflict) {
+		t.Fatalf("wrong-project failure error = %v, want state transition conflict", err)
+	}
+	if _, changed, err := store.Execution().MarkMCPConnectionExpired(
+		ctx,
+		wrongProjectID,
+		launch.Agent.ID,
+		conn.ID,
+		conn.Generation,
+	); err != nil || changed {
+		t.Fatalf("wrong-project expiration changed=%t err=%v, want false/nil", changed, err)
+	}
+	if _, err := store.Execution().NextMCPRequestSequence(
+		ctx,
+		wrongProjectID,
+		launch.Agent.ID,
+		conn.ID,
+	); !errors.Is(err, storeerr.ErrNotFound) {
+		t.Fatalf("wrong-project request sequence error = %v, want not found", err)
+	}
+	unchanged, found, err := store.Execution().GetMCPConnection(ctx, testProjectID, launch.Agent.ID, "docs")
+	if err != nil || !found {
+		t.Fatalf("load connection after wrong-project mutations: found=%t err=%v", found, err)
+	}
+	if unchanged.State != executionstore.MCPConnectionStateInitializing || unchanged.Generation != conn.Generation ||
+		unchanged.RequestSequence != conn.RequestSequence {
+		t.Fatalf("wrong-project mutations changed connection: before=%+v after=%+v", conn, unchanged)
+	}
+	replayedLaunch, err := store.Execution().LaunchAgent(
+		ctx,
+		executionstore.LaunchAgentInput{
+			ProjectID:      testProjectID,
+			ProfileID:      agent.ID,
+			AgentConfigID:  agent.CurrentConfigID,
+			LaunchedBy:     userPrincipal(user.ID),
+			IdempotencyKey: "idem-mcp-connection-agent",
+		},
+	)
+	if err != nil {
+		t.Fatalf("replay launch: %v", err)
+	}
+	if replayedLaunch.Created || replayedLaunch.Agent.ID != launch.Agent.ID ||
+		len(replayedLaunch.MCPConnections) != 0 {
+		t.Fatalf("launch replay should return only the current agent: %+v", replayedLaunch)
+	}
+
+	failure := "upstream unavailable"
+	failed, err := store.Execution().MarkMCPConnectionFailed(
+		ctx, testProjectID, launch.Agent.ID, conn.ID, conn.Generation, failure,
+	)
+	require.NoError(t, err)
+	require.Equal(t, failure, failed.InitializeError)
+	assertInitializeError(&failure)
+	retrying, changed, err := store.Execution().BeginMCPConnectionInitialization(
+		ctx, testProjectID, launch.Agent.ID, conn.ID,
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Empty(t, retrying.InitializeError)
+	assertInitializeError(nil)
+
+	ready, err := store.Execution().MarkMCPConnectionReady(ctx, executionstore.MarkMCPConnectionReadyInput{
+		ProjectID:          testProjectID,
+		AgentID:            launch.Agent.ID,
+		ID:                 conn.ID,
+		GenerationObserved: conn.Generation,
+		MCPSessionID:       "remote-session",
+		ProtocolVersion:    "2025-11-25",
+		CatalogID:          catalog.ID,
+	})
+	if err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	assertInitializeError(nil)
+	require.Empty(t, ready.InitializeError)
+	if ready.State != executionstore.MCPConnectionStateReady || ready.MCPSessionID != "remote-session" ||
+		ready.ProtocolVersion != "2025-11-25" || !ready.UsesCatalog() ||
+		!jsoncanonical.Equal(ready.ToolsSnapshot, json.RawMessage(`[{"name":"search"}]`)) {
+		t.Fatalf("unexpected ready connection: %+v", ready)
+	}
+	seq, err := store.Execution().NextMCPRequestSequence(ctx, testProjectID, launch.Agent.ID, conn.ID)
+	if err != nil {
+		t.Fatalf("next request sequence: %v", err)
+	}
+	if seq != 1 {
+		t.Fatalf("first request sequence = %d, want 1", seq)
+	}
+	expired, changed, err := store.Execution().MarkMCPConnectionExpired(
+		ctx,
+		testProjectID,
+		launch.Agent.ID,
+		conn.ID,
+		ready.Generation,
+	)
+	if err != nil {
+		t.Fatalf("mark expired: %v", err)
+	}
+	if !changed || expired.State != executionstore.MCPConnectionStateExpired || expired.Generation != ready.Generation+1 ||
+		expired.MCPSessionID != "" {
+		t.Fatalf("unexpected expired connection: changed=%t record=%+v", changed, expired)
+	}
+	if string(expired.ServerCapabilities) != "{}" || string(expired.ServerInfo) != "{}" ||
+		string(expired.ToolsSnapshot) != "[]" {
+		t.Fatalf("expired connection should clear ready metadata: %+v", expired)
+	}
+	if _, changed, err := store.Execution().MarkMCPConnectionExpired(
+		ctx,
+		testProjectID,
+		launch.Agent.ID,
+		conn.ID,
+		ready.Generation,
+	); err != nil ||
+		changed {
+		t.Fatalf("stale generation expiration should be no-op, changed=%t err=%v", changed, err)
+	}
+	reinitializing, changed, err := store.Execution().BeginMCPConnectionInitialization(
+		ctx,
+		testProjectID,
+		launch.Agent.ID,
+		conn.ID,
+	)
+	if err != nil {
+		t.Fatalf("begin reinitialization: %v", err)
+	}
+	if !changed || reinitializing.State != executionstore.MCPConnectionStateInitializing ||
+		reinitializing.Generation != expired.Generation {
+		t.Fatalf("unexpected reinitializing connection: changed=%t record=%+v", changed, reinitializing)
+	}
+	if _, err := store.Execution().MarkMCPConnectionReady(ctx, executionstore.MarkMCPConnectionReadyInput{
+		ProjectID:          testProjectID,
+		AgentID:            launch.Agent.ID,
+		ID:                 conn.ID,
+		GenerationObserved: ready.Generation,
+		MCPSessionID:       "stale-session",
+		ProtocolVersion:    "2025-11-25",
+		CatalogID:          catalog.ID,
+	}); !errors.Is(err, storeerr.ErrStateTransitionConflict) {
+		t.Fatalf("stale generation ready should conflict, got %v", err)
+	}
+	if _, err := store.Execution().MarkMCPConnectionFailed(
+		ctx,
+		testProjectID,
+		launch.Agent.ID,
+		conn.ID,
+		ready.Generation,
+		"stale failure",
+	); !errors.Is(
+		err,
+		storeerr.ErrStateTransitionConflict,
+	) {
+		t.Fatalf("stale generation failed should conflict, got %v", err)
+	}
+	current, found, err := store.Execution().GetMCPConnection(ctx, testProjectID, launch.Agent.ID, "docs")
+	if err != nil || !found {
+		t.Fatalf("load current mcp connection: found=%t err=%v", found, err)
+	}
+	if current.State != executionstore.MCPConnectionStateInitializing || current.Generation != expired.Generation ||
+		current.MCPSessionID != "" ||
+		current.InitializeError != "" {
+		t.Fatalf("stale completion should not mutate current generation: %+v", current)
+	}
+	if _, found, err := store.Execution().GetMCPConnection(
+		ctx, wrongProjectID, launch.Agent.ID, "docs",
+	); err != nil || found {
+		t.Fatalf("wrong project lookup should not find connection, found=%t err=%v", found, err)
+	}
+	removed, err := store.Execution().ReconcileAgentMCPConnections(ctx, testProjectID, launch.Agent.ID, nil)
+	if err != nil {
+		t.Fatalf("reconcile removed server: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed reconciliation returned connections: %+v", removed)
+	}
+	expired, found, err = store.Execution().GetMCPConnection(ctx, testProjectID, launch.Agent.ID, "docs")
+	if err != nil || !found {
+		t.Fatalf("load removed connection: found=%t err=%v", found, err)
+	}
+	if expired.State != executionstore.MCPConnectionStateExpired || expired.Generation != current.Generation+1 {
+		t.Fatalf("removed connection was not expired: %+v", expired)
+	}
+
+	readded, err := store.Execution().ReconcileAgentMCPConnections(
+		ctx,
+		testProjectID,
+		launch.Agent.ID,
+		launch.MCPServers,
+	)
+	if err != nil {
+		t.Fatalf("reconcile re-added server: %v", err)
+	}
+	if len(readded) != 1 || readded[0].State != executionstore.MCPConnectionStateExpired ||
+		readded[0].MCPSessionID != "" || !readded[0].UpdatedAt.Equal(expired.UpdatedAt) {
+		t.Fatalf("re-added server reused stale connection: %+v", readded)
+	}
+	_, _, err = store.Execution().BeginMCPConnectionInitialization(ctx, testProjectID, launch.Agent.ID, conn.ID)
+	require.NoError(t, err)
+	_, err = store.Execution().MarkMCPConnectionFailed(
+		ctx, testProjectID, launch.Agent.ID, conn.ID, expired.Generation, failure,
+	)
+	require.NoError(t, err)
+	assertInitializeError(&failure)
+	servers := append([]agentconfig.RuntimeMCPServer(nil), launch.MCPServers...)
+	servers[0].URL = "https://changed.example.com/mcp"
+	updated, err := store.Execution().ReconcileAgentMCPConnections(ctx, testProjectID, launch.Agent.ID, servers)
+	require.NoError(t, err)
+	require.Len(t, updated, 1)
+	require.Empty(t, updated[0].InitializeError)
+	assertInitializeError(nil)
+	_, err = store.Execution().MarkMCPConnectionFailed(
+		ctx, testProjectID, launch.Agent.ID, conn.ID, updated[0].Generation, "",
+	)
+	require.NoError(t, err)
+	assertInitializeError(nil)
+}
+
+func TestRuntimeMCPServerResolveTool(t *testing.T) {
+	t.Parallel()
+	disabled := false
+	allowPermission := toolpermission.DefaultSelection(toolpermission.ModeAlwaysAllow)
+	server := agentconfig.RuntimeMCPServer{
+		ServerKey:      "docs",
+		URL:            "https://example.com/mcp",
+		DefaultEnabled: true,
+		Permission:     toolpermission.DefaultSelection(toolpermission.ModeAlwaysAsk),
+		Tools: map[string]agentconfig.RuntimeMCPTool{
+			"search": {
+				RemoteName: "search",
+				Permission: &allowPermission,
+			},
+			"delete": {RemoteName: "delete", Enabled: &disabled},
+		},
+	}
+	if resolution, ok := server.ResolveTool("search"); !ok ||
+		resolution.Permission.Mode != toolpermission.ModeAlwaysAllow {
+		t.Fatalf("search resolution = permission=%+v ok=%t", resolution, ok)
+	}
+	if resolution, ok := server.ResolveTool("other"); !ok ||
+		resolution.Permission.Mode != toolpermission.ModeAlwaysAsk {
+		t.Fatalf("default resolution = permission=%+v ok=%t", resolution, ok)
+	}
+	if _, ok := server.ResolveTool("delete"); ok {
+		t.Fatalf("delete should be disabled")
+	}
+}

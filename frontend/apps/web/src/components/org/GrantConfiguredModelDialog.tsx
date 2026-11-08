@@ -1,0 +1,123 @@
+import { useCreateProjectModelGrant } from '@omnara/react'
+import { type ConfiguredModel } from '@omnara/sdk'
+import { type SyntheticEvent, useState } from 'react'
+
+import { ProjectShareChips } from '@/components/projects/ProjectShareChips'
+import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Field, FieldDescription, FieldGroup } from '@/components/ui/field'
+import { collectGrantFailures } from '@/lib/grant-failures'
+import type { SubmitStatus } from '@/lib/submit-status'
+import { idle, statusError, submitError, submitting } from '@/lib/submit-status'
+
+interface GrantConfiguredModelState {
+  projectIds: string[]
+  grantedProjectIds: string[]
+  // Grants run as parallel mutateAsync calls, so the mutation's isPending is
+  // not a reliable in-flight signal; track the submitting phase explicitly.
+  status: SubmitStatus
+}
+
+export function GrantConfiguredModelDialog({
+  open,
+  onOpenChange,
+  orgId,
+  model,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  orgId: string
+  model: ConfiguredModel
+}) {
+  const createProjectModelGrant = useCreateProjectModelGrant(orgId)
+  const [state, setState] = useState<GrantConfiguredModelState>({
+    projectIds: [],
+    grantedProjectIds: [],
+    status: idle,
+  })
+  const isSubmitting = state.status.phase === 'submitting'
+  const errorMessage = statusError(state.status)
+
+  async function submit(event: SyntheticEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setState((prev) => ({ ...prev, status: submitting }))
+    try {
+      const results = await Promise.allSettled(
+        state.projectIds.map((projectID) =>
+          createProjectModelGrant.mutateAsync({
+            projectID,
+            configured_model_id: model.id,
+          }),
+        ),
+      )
+      const failures = collectGrantFailures(state.projectIds, results)
+      if (failures) {
+        setState({
+          projectIds: failures.failedProjectIds,
+          grantedProjectIds: [
+            ...state.grantedProjectIds,
+            ...state.projectIds.filter((_, index) => results[index]?.status === 'fulfilled'),
+          ],
+          status: { phase: 'error', message: failures.message },
+        })
+        return
+      }
+      setState({ projectIds: [], grantedProjectIds: [], status: idle })
+      onOpenChange(false)
+    } catch (err) {
+      const status = submitError(err, 'Could not share model')
+      setState((prev) => ({ ...prev, status }))
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Share configured model</DialogTitle>
+          <DialogDescription>Let agents in a project use {model.name}.</DialogDescription>
+        </DialogHeader>
+        <form
+          onSubmit={(event) => {
+            void submit(event)
+          }}
+        >
+          <FieldGroup>
+            <Field>
+              <ProjectShareChips
+                orgId={orgId}
+                isProjectEligible={(project) => project.access.can_manage_access}
+                value={state.projectIds}
+                onChange={(projectIds) => {
+                  setState((prev) => ({ ...prev, projectIds }))
+                }}
+                disabled={isSubmitting}
+                excludedProjectIds={state.grantedProjectIds}
+              />
+              <FieldDescription>
+                Selected projects will be able to use {model.name}.
+              </FieldDescription>
+            </Field>
+            {errorMessage && <p className="text-destructive text-sm">{errorMessage}</p>}
+            <DialogFooter>
+              <Button
+                type="submit"
+                disabled={isSubmitting || state.projectIds.length === 0}
+                loading={isSubmitting}
+              >
+                Share model
+              </Button>
+            </DialogFooter>
+          </FieldGroup>
+        </form>
+      </DialogContent>
+    </Dialog>
+  )
+}

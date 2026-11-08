@@ -1,0 +1,823 @@
+//go:build integration
+
+package httpapi
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"sort"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/omnara-ai/omnara/internal/agentconfig"
+	"github.com/omnara-ai/omnara/internal/agentconfigcompile"
+	"github.com/omnara-ai/omnara/internal/integrationdefinition"
+	"github.com/omnara-ai/omnara/internal/publicid"
+	"github.com/omnara-ai/omnara/internal/storage"
+	"github.com/omnara-ai/omnara/internal/storage/executionstore"
+	"github.com/omnara-ai/omnara/internal/storage/integrationstore"
+	"github.com/omnara-ai/omnara/internal/testutil"
+	"github.com/stretchr/testify/require"
+)
+
+func TestListAgents(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+
+	handler := newIntegrationServer(pool)
+	store := integrationStoreForHandler(t, handler)
+
+	project := bootstrapPublicHTTPProject(t, handler, "list-agents")
+	configResp := createPublicHTTPAgentConfig(
+		t,
+		handler,
+		project,
+		"list-agents",
+		"yaml",
+		"instruction: Help.\nmodel:\n  provider_config: openai-prod\n  name: gpt-test\n",
+		project.AdminToken,
+		http.StatusCreated,
+	)
+	configID := mustPublicHTTPID(t, publicid.KindAgentConfig, testutil.RequireType[string](t, configResp["id"]))
+
+	const agentCount = 5
+	wantOrder := make([]string, 0, agentCount)
+	agents := make([]executionstore.AgentRecord, 0, agentCount)
+	var base time.Time
+	for i := range agentCount {
+		name := "Agent " + string(rune('A'+i))
+		idempotencyKey := "list-agents-" + string(rune('a'+i))
+		var agent executionstore.AgentRecord
+		if i == 0 {
+			var err error
+			agent, err = store.Execution().CreateAgentFixture(ctx, executionstore.AgentFixtureInput{
+				ProjectID:       project.ProjectUUID,
+				Name:            name,
+				CurrentConfigID: configID,
+			})
+			if err != nil {
+				t.Fatalf("seed agent %d: %v", i, err)
+			}
+			base = agent.CreatedAt
+		} else {
+			createdAt := base.Add(time.Duration(i) * time.Minute)
+			if i == 3 {
+				createdAt = base.Add(2 * time.Minute)
+			}
+			agent = seedListAgentAt(
+				t,
+				ctx,
+				pool,
+				store,
+				project,
+				configID,
+				name,
+				idempotencyKey,
+				createdAt,
+			)
+		}
+		agents = append(agents, agent)
+	}
+	sortedAgents := append([]executionstore.AgentRecord(nil), agents...)
+	sort.Slice(sortedAgents, func(i, j int) bool {
+		if !sortedAgents[i].CreatedAt.Equal(sortedAgents[j].CreatedAt) {
+			return sortedAgents[i].CreatedAt.After(sortedAgents[j].CreatedAt)
+		}
+		return bytes.Compare(sortedAgents[i].ID[:], sortedAgents[j].ID[:]) > 0
+	})
+	for _, agent := range sortedAgents {
+		publicAgentID, err := publicid.Encode(publicid.KindAgent, agent.ID)
+		if err != nil {
+			t.Fatalf("encode agent id: %v", err)
+		}
+		wantOrder = append(wantOrder, publicAgentID)
+	}
+
+	slackTargetAgentID := seedListAgentsSlackTarget(
+		t,
+		ctx,
+		handler,
+		store,
+		pool,
+		project,
+		agents[1],
+		base.Add(2*time.Hour),
+	)
+
+	agentsPath := project.ProjectPath + "/agents"
+
+	got := make([]string, 0, agentCount)
+	seen := map[string]bool{}
+	cursor := ""
+	pages := 0
+	for {
+		path := agentsPath + "?limit=2"
+		if cursor != "" {
+			path += "&cursor=" + cursor
+		}
+		page := requestJSONWithHeaders(
+			t,
+			handler,
+			http.MethodGet,
+			path,
+			"",
+			"",
+			http.StatusOK,
+			authHeaders(project.AdminToken),
+		)
+		data := testutil.RequireType[[]any](t, page["data"])
+		if len(data) > 2 {
+			t.Fatalf("page returned %d items, want <= limit 2", len(data))
+		}
+		for _, raw := range data {
+			row := testutil.RequireType[map[string]any](t, raw)
+			id := testutil.RequireType[string](t, row["id"])
+			if _, ok := row["name"].(string); !ok {
+				t.Fatalf("list agent missing required name: %+v", row)
+			}
+			model, ok := row["model"].(map[string]any)
+			if !ok {
+				t.Fatalf("list agent missing model: %+v", row)
+			}
+			if model["provider_config"] != "openai-prod" || model["name"] != "gpt-test" {
+				t.Fatalf("list agent model = %+v, want openai-prod/gpt-test", model)
+			}
+			if seen[id] {
+				t.Fatalf("cursor paging returned duplicate agent %s", id)
+			}
+			if id == slackTargetAgentID {
+				assertListAgentsIntegrationTarget(
+					t,
+					row,
+					"slack",
+					map[string]any{"channel_id": "C0BAK8REEGY", "thread_ts": "1783382417.000100"},
+					"agent-testing",
+					"https://slack.com/app_redirect?channel=C0BAK8REEGY&team=TLISTAGENTS",
+				)
+			}
+			seen[id] = true
+			got = append(got, id)
+		}
+		pages++
+		if pages > agentCount+2 {
+			t.Fatalf("pagination did not terminate; got=%v", got)
+		}
+		next, ok := page["next_cursor"]
+		if !ok {
+			t.Fatalf("response missing next_cursor: %+v", page)
+		}
+		if next == nil {
+			break
+		}
+		cursor = testutil.RequireType[string](t, next)
+	}
+
+	if len(got) != agentCount {
+		t.Fatalf("paged %d agents, want %d: %v", len(got), agentCount, got)
+	}
+	for i := range wantOrder {
+		if got[i] != wantOrder[i] {
+			t.Fatalf(
+				"order mismatch at %d: got %s want %s (full got=%v want=%v)",
+				i,
+				got[i],
+				wantOrder[i],
+				got,
+				wantOrder,
+			)
+		}
+	}
+
+	for _, sortBy := range []string{"name", "-name"} {
+		wantNames := []string{"Agent A", "Agent B", "Agent C", "Agent D", "Agent E"}
+		if sortBy == "-name" {
+			sort.Sort(sort.Reverse(sort.StringSlice(wantNames)))
+		}
+		var gotNames []string
+		cursor := ""
+		for pages := 0; ; pages++ {
+			require.Less(t, pages, agentCount, "pagination did not terminate")
+			page := requestJSONWithHeaders(
+				t, handler, http.MethodGet,
+				agentsPath+"?limit=2&sort="+sortBy+"&cursor="+cursor,
+				"", "", http.StatusOK, authHeaders(project.AdminToken),
+			)
+			rows := testutil.RequireType[[]any](t, page["data"])
+			require.LessOrEqual(t, len(rows), 2)
+			for _, raw := range rows {
+				row := testutil.RequireType[map[string]any](t, raw)
+				gotNames = append(gotNames, testutil.RequireType[string](t, row["name"]))
+				if row["id"] == slackTargetAgentID {
+					assertListAgentsIntegrationTarget(
+						t, row, "slack", map[string]any{"channel_id": "C0BAK8REEGY", "thread_ts": "1783382417.000100"}, "agent-testing",
+						"https://slack.com/app_redirect?channel=C0BAK8REEGY&team=TLISTAGENTS",
+					)
+				}
+			}
+			if page["next_cursor"] == nil {
+				break
+			}
+			cursor = testutil.RequireType[string](t, page["next_cursor"])
+		}
+		require.Equal(t, wantNames, gotNames, "sort=%s", sortBy)
+	}
+
+	for _, sortBy := range []string{"-created_at", "name"} {
+		path := "/api/v1/orgs/" + project.OrgID + "/agents?name=Agent%20B&include_usage=true&sort=" + sortBy
+		rows := listOrgRows(t, handler, path, project.AdminToken)
+		require.Len(t, rows, 1)
+		require.Equal(t, slackTargetAgentID, rows[0]["id"])
+		require.Equal(t, project.ProjectID, rows[0]["project_id"])
+		require.NotContains(t, rows[0], "subagent_key")
+		require.NotContains(t, rows[0], "parent_agent_id")
+		assertListAgentsIntegrationTarget(
+			t, rows[0], "slack",
+			map[string]any{"channel_id": "C0BAK8REEGY", "thread_ts": "1783382417.000100"},
+			"agent-testing", "https://slack.com/app_redirect?channel=C0BAK8REEGY&team=TLISTAGENTS",
+		)
+	}
+
+	full := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		agentsPath+"?limit=100",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	if full["next_cursor"] != nil {
+		t.Fatalf("single full page should have null next_cursor, got %v", full["next_cursor"])
+	}
+	if data := testutil.RequireType[[]any](t, full["data"]); len(data) != agentCount {
+		t.Fatalf("full page returned %d agents, want %d", len(data), agentCount)
+	}
+
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		agentsPath+"?cursor=not-a-valid-cursor",
+		"",
+		"",
+		http.StatusBadRequest,
+		authHeaders(project.AdminToken),
+	)
+
+	firstPage := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		agentsPath+"?limit=1",
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	topLevelCursor := testutil.RequireType[string](t, firstPage["next_cursor"])
+	parentAgentID, err := publicid.Encode(publicid.KindAgent, agents[0].ID)
+	if err != nil {
+		t.Fatalf("encode parent agent id: %v", err)
+	}
+	for _, query := range []string{
+		"?include_subagents=true&cursor=",
+		"?parent_agent_id=" + parentAgentID + "&cursor=",
+		"?agent_profile_id=aprf_abcdefghijklmnopqrstuvwxyz&cursor=",
+	} {
+		requestJSONWithHeaders(
+			t,
+			handler,
+			http.MethodGet,
+			agentsPath+query+topLevelCursor,
+			"",
+			"",
+			http.StatusBadRequest,
+			authHeaders(project.AdminToken),
+		)
+	}
+
+	otherOrg := bootstrapPublicHTTPProject(t, handler, "list-agents-other-org")
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		agentsPath,
+		"",
+		"",
+		http.StatusNotFound,
+		authHeaders(otherOrg.AdminToken),
+	)
+}
+
+func TestListAgentsChildrenWithActivity(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+	handler := newIntegrationServer(pool)
+	store := integrationStoreForHandler(t, handler)
+	project := bootstrapPublicHTTPProject(t, handler, "list-agent-children")
+	parentLaunch := createHTTPRuntimeAgent(
+		t, ctx, store, project.OrgUUID, project.ProjectUUID, project.AdminUserUUID, "list-agent-children",
+	)
+	parent := parentLaunch.Agent
+	active := spawnHTTPSubagentForTest(t, ctx, store, parent, parentLaunch.AgentConfig.ID, "active-child", "worker")
+	archived := spawnHTTPSubagentForTest(t, ctx, store, parent, parentLaunch.AgentConfig.ID, "archived-child", "worker")
+	if _, _, err := store.Execution().ArchiveAgent(
+		ctx, project.ProjectUUID, archived.ID, httpUserPrincipal(project.AdminUserUUID),
+	); err != nil {
+		t.Fatalf("archive child: %v", err)
+	}
+	parentPublicID := testPublicID(t, publicid.KindAgent, parent.ID)
+	activePublicID := testPublicID(t, publicid.KindAgent, active.ID)
+	archivedPublicID := testPublicID(t, publicid.KindAgent, archived.ID)
+	childrenPath := project.ProjectPath + "/agents?sort=created_at&parent_agent_id=" + parentPublicID
+
+	listed := requestJSONWithHeaders(
+		t, handler, http.MethodGet, childrenPath, "", "", http.StatusOK, authHeaders(project.AdminToken),
+	)
+	rows := testutil.RequireType[[]any](t, listed["data"])
+	if len(rows) != 1 {
+		t.Fatalf("children without archived = %+v, want the active child only", rows)
+	}
+	activeRow := testutil.RequireType[map[string]any](t, rows[0])
+	activity := testutil.RequireType[map[string]any](t, activeRow["activity"])
+	if activeRow["id"] != activePublicID || activeRow["subagent_key"] != "worker" ||
+		activeRow["parent_agent_id"] != parentPublicID || activity["state"] != "idle" {
+		t.Fatalf("active child row = %+v, want an idle worker under the parent", activeRow)
+	}
+	if _, ok := activity["last_activity_at"].(string); !ok {
+		t.Fatalf("active child activity = %+v, want last_activity_at", activity)
+	}
+
+	withArchived := requestJSONWithHeaders(
+		t, handler, http.MethodGet, childrenPath+"&include_archived=true", "", "", http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	rows = testutil.RequireType[[]any](t, withArchived["data"])
+	if len(rows) != 2 {
+		t.Fatalf("children with archived = %+v, want both children", rows)
+	}
+	archivedRow := testutil.RequireType[map[string]any](t, rows[1])
+	archivedActivity := testutil.RequireType[map[string]any](t, archivedRow["activity"])
+	if archivedRow["id"] != archivedPublicID || archivedRow["state"] != "archived" ||
+		archivedActivity["state"] != "archived" {
+		t.Fatalf("archived child row = %+v, want an archived worker", archivedRow)
+	}
+
+	detail := requestJSONWithHeaders(
+		t, handler, http.MethodGet, project.ProjectPath+"/agents/"+parentPublicID, "", "", http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	if _, ok := detail["subagents"]; ok {
+		t.Fatalf("get agent still embeds subagents: %+v", detail)
+	}
+	detailAgent := testutil.RequireType[map[string]any](t, detail["agent"])
+	detailActivity := testutil.RequireType[map[string]any](t, detailAgent["activity"])
+	if detailActivity["state"] != "idle" {
+		t.Fatalf("get agent activity = %+v, want idle", detailActivity)
+	}
+	if _, ok := detailActivity["last_activity_at"].(string); !ok {
+		t.Fatalf("get agent activity = %+v, want last_activity_at", detailActivity)
+	}
+}
+
+func TestListAgentsByActivityState(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+	handler := newIntegrationServer(pool)
+	store := integrationStoreForHandler(t, handler)
+	project := bootstrapPublicHTTPProject(t, handler, "list-agents-activity")
+
+	idleA := createHTTPRuntimeAgent(
+		t, ctx, store, project.OrgUUID, project.ProjectUUID, project.AdminUserUUID, "list-activity-idle-a",
+	)
+	idleB := createHTTPRuntimeAgent(
+		t, ctx, store, project.OrgUUID, project.ProjectUUID, project.AdminUserUUID, "list-activity-idle-b",
+	)
+	running := createHTTPRuntimeAgent(
+		t, ctx, store, project.OrgUUID, project.ProjectUUID, project.AdminUserUUID, "list-activity-running",
+	)
+	archived := createHTTPRuntimeAgent(
+		t, ctx, store, project.OrgUUID, project.ProjectUUID, project.AdminUserUUID, "list-activity-archived",
+	)
+	waiting := createHTTPRuntimeAgent(
+		t, ctx, store, project.OrgUUID, project.ProjectUUID, project.AdminUserUUID, "list-activity-waiting",
+	)
+	idleIDs := []uuid.UUID{idleA.Agent.ID, idleB.Agent.ID, archived.Agent.ID}
+	if _, err := pool.Exec(ctx, `DELETE FROM agent_wakeups WHERE agent_id = ANY($1)`, idleIDs); err != nil {
+		t.Fatalf("clear idle wakeups: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM agent_runtime_locks WHERE agent_id = ANY($1)`, idleIDs); err != nil {
+		t.Fatalf("clear idle runtime locks: %v", err)
+	}
+	if _, err := pool.Exec(
+		ctx,
+		`UPDATE agent_execution_state SET logical_ready_at = NULL, incomplete_tools = false WHERE agent_id = ANY($1)`,
+		idleIDs,
+	); err != nil {
+		t.Fatalf("clear idle execution state: %v", err)
+	}
+	// Open the question first: recording the waiting agent's tool call claims
+	// queued agent work, which would consume the running agent's wakeup.
+	createHTTPInteractionForAgent(
+		t, ctx, store, project.OrgUUID, project.ProjectUUID, project.AdminUserUUID, waiting.Agent, "question", "",
+		json.RawMessage(`{"questions":[{"prompt":"Ship?","options":[{"label":"Yes"},{"label":"No"}]}]}`),
+	)
+	if _, err := pool.Exec(
+		ctx,
+		`INSERT INTO agent_wakeups(agent_id, ready_at, updated_at)
+		 VALUES ($1, statement_timestamp(), statement_timestamp())
+		 ON CONFLICT (agent_id) DO UPDATE SET
+		   ready_at = EXCLUDED.ready_at,
+		   updated_at = EXCLUDED.updated_at`,
+		running.Agent.ID,
+	); err != nil {
+		t.Fatalf("mark running agent: %v", err)
+	}
+	if _, _, err := store.Execution().ArchiveAgent(
+		ctx, project.ProjectUUID, archived.Agent.ID, httpUserPrincipal(project.AdminUserUUID),
+	); err != nil {
+		t.Fatalf("archive agent: %v", err)
+	}
+
+	idleAID := testPublicID(t, publicid.KindAgent, idleA.Agent.ID)
+	idleBID := testPublicID(t, publicid.KindAgent, idleB.Agent.ID)
+	runningID := testPublicID(t, publicid.KindAgent, running.Agent.ID)
+	archivedID := testPublicID(t, publicid.KindAgent, archived.Agent.ID)
+	waitingID := testPublicID(t, publicid.KindAgent, waiting.Agent.ID)
+	agentsPath := project.ProjectPath + "/agents"
+	listPath := func(query string) string { return agentsPath + "?" + query }
+
+	// The console sorts by -updated_at and the API defaults to -created_at; the
+	// two sorts run different list queries, so cover the filter on both.
+	for _, order := range []string{"-created_at", "-updated_at"} {
+		t.Run(order, func(t *testing.T) {
+			t.Parallel()
+			cases := []struct {
+				state string
+				want  []string
+			}{
+				{"idle", []string{idleAID, idleBID}},
+				{"running", []string{runningID}},
+				{"waiting_on_interaction", []string{waitingID}},
+				{"archived", []string{archivedID}},
+			}
+			for _, tc := range cases {
+				listed := requestJSONWithHeaders(
+					t, handler, http.MethodGet, listPath("activity_state="+tc.state+"&sort="+order), "", "",
+					http.StatusOK, authHeaders(project.AdminToken),
+				)
+				require.ElementsMatch(t, tc.want, listedAgentIDs(t, listed), "activity_state=%s", tc.state)
+				for _, id := range tc.want {
+					require.Equal(t, tc.state, listedAgentActivity(t, listed, id))
+				}
+			}
+
+			// Page through the idle filter one row at a time: each match comes
+			// back exactly once and the last page carries no cursor.
+			var paged []string
+			cursor := ""
+			for page := 0; ; page++ {
+				require.Less(t, page, 3, "idle pagination did not end")
+				query := "activity_state=idle&limit=1&sort=" + order
+				if cursor != "" {
+					query += "&cursor=" + cursor
+				}
+				listed := requestJSONWithHeaders(
+					t, handler, http.MethodGet, listPath(query), "", "", http.StatusOK,
+					authHeaders(project.AdminToken),
+				)
+				paged = append(paged, listedAgentIDs(t, listed)...)
+				next, _ := listed["next_cursor"].(string)
+				if next == "" {
+					break
+				}
+				if page == 0 {
+					requestJSONWithHeaders(
+						t, handler, http.MethodGet,
+						listPath("activity_state=running&limit=1&sort="+order+"&cursor="+next), "", "",
+						http.StatusBadRequest, authHeaders(project.AdminToken),
+					)
+				}
+				cursor = next
+			}
+			require.ElementsMatch(t, []string{idleAID, idleBID}, paged)
+		})
+	}
+
+	requestJSONWithHeaders(
+		t, handler, http.MethodGet, listPath("activity_state=nope"), "", "", http.StatusBadRequest,
+		authHeaders(project.AdminToken),
+	)
+}
+
+func listedAgentIDs(t *testing.T, listed map[string]any) []string {
+	t.Helper()
+	rows := testutil.RequireType[[]any](t, listed["data"])
+	ids := make([]string, 0, len(rows))
+	for _, raw := range rows {
+		row := testutil.RequireType[map[string]any](t, raw)
+		ids = append(ids, testutil.RequireType[string](t, row["id"]))
+	}
+	return ids
+}
+
+func listedAgentActivity(t *testing.T, listed map[string]any, agentID string) string {
+	t.Helper()
+	for _, raw := range testutil.RequireType[[]any](t, listed["data"]) {
+		row := testutil.RequireType[map[string]any](t, raw)
+		if testutil.RequireType[string](t, row["id"]) != agentID {
+			continue
+		}
+		activity := testutil.RequireType[map[string]any](t, row["activity"])
+		return testutil.RequireType[string](t, activity["state"])
+	}
+	t.Fatalf("agent %s missing from list: %+v", agentID, listed)
+	return ""
+}
+
+func TestListAgentsByProfile(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+
+	handler := newIntegrationServer(pool)
+	project := bootstrapPublicHTTPProject(t, handler, "list-agents-by-profile")
+	config := createPublicHTTPAgentConfig(
+		t,
+		handler,
+		project,
+		"list-agents-by-profile",
+		"yaml",
+		"instruction: Help.\nmodel:\n  provider_config: openai-prod\n  name: gpt-test\n",
+		project.AdminToken,
+		http.StatusCreated,
+	)
+	configID := testutil.RequireType[string](t, config["id"])
+	firstProfile := createPublicHTTPAgentProfile(
+		t,
+		handler,
+		project,
+		"list-agents-by-profile-first",
+		"First Profile",
+		configID,
+		project.AdminToken,
+		http.StatusCreated,
+	)
+	secondProfile := createPublicHTTPAgentProfile(
+		t,
+		handler,
+		project,
+		"list-agents-by-profile-second",
+		"Second Profile",
+		configID,
+		project.AdminToken,
+		http.StatusCreated,
+	)
+	firstProfileID := testutil.RequireType[string](t, firstProfile["id"])
+	secondProfileID := testutil.RequireType[string](t, secondProfile["id"])
+
+	profileLaunch := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents",
+		`{"profile":"`+firstProfileID+`","config":"`+configID+`"}`,
+		"idem-list-agents-by-profile-first-launch",
+		http.StatusCreated,
+		authHeaders(project.AdminToken),
+	)
+	profileAgent := testutil.RequireType[map[string]any](t, profileLaunch["agent"])
+	if got := profileAgent["agent_profile_id"]; got != firstProfileID {
+		t.Fatalf("launched agent agent_profile_id = %v, want %s", got, firstProfileID)
+	}
+
+	configLaunch := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents",
+		`{"config":"`+configID+`"}`,
+		"idem-list-agents-by-profile-config-launch",
+		http.StatusCreated,
+		authHeaders(project.AdminToken),
+	)
+	configAgent := testutil.RequireType[map[string]any](t, configLaunch["agent"])
+	if _, ok := configAgent["agent_profile_id"]; ok {
+		t.Fatalf("config-only agent unexpectedly has agent_profile_id: %+v", configAgent)
+	}
+
+	firstPage := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents?agent_profile_id="+firstProfileID,
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	firstData := testutil.RequireType[[]any](t, firstPage["data"])
+	if len(firstData) != 1 {
+		t.Fatalf("first profile returned %d agents, want 1", len(firstData))
+	}
+	if got := testutil.RequireType[map[string]any](t, firstData[0])["id"]; got != profileAgent["id"] {
+		t.Fatalf("first profile agent = %v, want %v", got, profileAgent["id"])
+	}
+
+	secondPage := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents?agent_profile_id="+secondProfileID,
+		"",
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	if data := testutil.RequireType[[]any](t, secondPage["data"]); len(data) != 0 {
+		t.Fatalf("second profile returned %d agents, want 0", len(data))
+	}
+}
+
+func seedListAgentAt(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	store *storage.Store,
+	project publicHTTPProject,
+	configID uuid.UUID,
+	name string,
+	idempotencyKey string,
+	createdAt time.Time,
+) executionstore.AgentRecord {
+	t.Helper()
+	id := uuid.New()
+	if err := pool.QueryRow(ctx, `
+WITH inserted AS (
+    INSERT INTO agents (
+        id, root_agent_id, org_id, project_id, state, name, current_config_id,
+        idempotency_key, created_at, updated_at
+    )
+    VALUES ($7, $7, $1, $2, 'active', $3, $4, $5, $6, $6)
+    RETURNING id
+)
+INSERT INTO agent_execution_state (agent_id, incomplete_tools)
+SELECT id, false FROM inserted
+RETURNING agent_id
+`, project.OrgUUID, project.ProjectUUID, name, configID, idempotencyKey, createdAt, id).Scan(&id); err != nil {
+		t.Fatalf("seed agent at creation time: %v", err)
+	}
+	record, err := store.Execution().GetAgentInProject(ctx, project.ProjectUUID, id)
+	if err != nil {
+		t.Fatalf("load agent seeded at creation time: %v", err)
+	}
+	return record
+}
+
+func seedListAgentsSlackTarget(
+	t *testing.T,
+	ctx context.Context,
+	handler http.Handler,
+	store *storage.Store,
+	pool *pgxpool.Pool,
+	project publicHTTPProject,
+	agent executionstore.AgentRecord,
+	now time.Time,
+) string {
+	t.Helper()
+	profile := createSlackReadyHTTPProfile(
+		t,
+		handler,
+		project,
+		"list-agents-target",
+		project.AdminToken,
+	)
+	profileID := mustPublicHTTPID(t, publicid.KindAgentProfile, testutil.RequireType[string](t, profile["id"]))
+	install := createSlackHTTPInstall(
+		t,
+		ctx,
+		project,
+		profileID,
+		"ALISTAGENTS",
+		"TLISTAGENTS",
+		"ULISTAGENTSBOT",
+		"signing-secret-list-agents",
+	)
+	require.Equal(t, integrationdefinition.SlackThread, install.IntegrationKind)
+	base, found, err := store.Execution().GetAgentConfig(ctx, project.ProjectUUID, agent.CurrentConfigID)
+	require.NoError(t, err)
+	require.True(t, found)
+	derived, err := agentconfigcompile.DeriveIntegrationConfig(ctx, store, project.OrgUUID, project.ProjectUUID,
+		agentconfig.CompileOptions{}, base, agentconfig.IntegrationCapabilitiesSource{
+			InteractionHandlers: map[string]agentconfig.AgentConfigIntegrationCapabilitySource{
+				install.Name: {},
+			},
+		})
+	require.NoError(t, err)
+	_, err = store.Execution().ChangeAgentConfig(ctx, executionstore.ChangeAgentConfigInput{
+		CreateAgentConfigInput: derived.CreateInput(project.ProjectUUID),
+		AgentID:                agent.ID, ExpectedCurrentConfigID: base.ID, ActorType: "user", ActorID: project.AdminUserUUID,
+		IdempotencyKey: "list-agents-handler",
+	})
+	require.NoError(t, err)
+	address := integrationstore.ConversationAddress{Kind: "thread", Ref: "C0BAK8REEGY:1783382417.000100"}
+	tx, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback(ctx) }()
+	require.NoError(t, integrationstore.LockIntegrationsTx(ctx, tx, project.ProjectUUID, nil, install.ID))
+	require.NoError(t, integrationstore.LockConversationTx(ctx, tx, project.ProjectUUID, install.ID, address))
+	_, err = tx.Exec(ctx, "SELECT id FROM agents WHERE id=$1 FOR UPDATE", agent.ID)
+	require.NoError(t, err)
+	require.NoError(t, store.Integrations().AssignAgentIntegrationConversationTx(
+		ctx, tx, project.ProjectUUID, agent.ID, install.ID, address,
+	))
+	require.NoError(t, tx.Commit(ctx))
+	_, _, err = store.Integrations().AcceptIntegrationReceipt(ctx, integrationstore.VerifiedIntegrationReceipt{
+		ProjectID: project.ProjectUUID, IntegrationID: install.ID,
+		ReceiptKey: "list-origin", Payload: []byte(`{"verified":true}`),
+	})
+	require.NoError(t, err)
+	receipt, found, err := store.Integrations().ClaimIntegrationInbox(ctx, integrationstore.ClaimIntegrationInboxInput{
+		ProjectID: project.ProjectUUID, IntegrationID: install.ID, LeaseDuration: time.Minute,
+	})
+	require.NoError(t, err)
+	require.True(t, found)
+	actor, err := executionstore.IntegrationActorParams(install, "ULISTINPUT", nil)
+	require.NoError(t, err)
+	plan, err := json.Marshal(map[string]any{
+		"message": executionstore.InboxMessage{
+			Scope: integrationdefinition.Scope{Slack: &integrationdefinition.SlackScope{
+				ChannelID: "C0BAK8REEGY", ThreadTS: "1783382417.000100",
+			}},
+			Origin: &executionstore.AgentInputOrigin{
+				IntegrationID: install.ID, Address: address,
+			},
+			Actor: &actor, SemanticKey: "list-origin",
+			ContentBlocks: json.RawMessage(`[{"type":"text","text":"list origin"}]`),
+		},
+		"recipients": map[string]executionstore.InboxInputRecipient{"recipient": {AgentID: agent.ID}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.Integrations().WithIntegrationInboxLease(ctx, receipt.Lease(),
+		func(w *integrationstore.IntegrationInboxLeaseTx) error { return w.FreezePlan(ctx, plan) }))
+	_, err = store.Execution().AdmitInboxInputRecipient(ctx, receipt.Lease(), "recipient", nil)
+	require.NoError(t, err)
+	claim, found, err := store.Execution().ClaimNextAgentWork(ctx, httpTestClaimInput())
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, executionstore.AgentWorkModel, claim.Kind)
+	require.Len(t, claim.Model.AdmittedInputTurn.Inputs, 1)
+	require.Equal(t, agent.ID, claim.Model.AdmittedInputTurn.Inputs[0].AgentID)
+	if err := store.Integrations().UpdateIntegrationTargetDisplayNamesByScopeRefPrefix(
+		ctx,
+		project.ProjectUUID,
+		install.ID,
+		"C0BAK8REEGY",
+		"agent-testing",
+	); err != nil {
+		t.Fatalf("seed Slack conversation display name: %v", err)
+	}
+	publicAgentID, err := publicid.Encode(publicid.KindAgent, agent.ID)
+	if err != nil {
+		t.Fatalf("encode Slack target agent id: %v", err)
+	}
+	return publicAgentID
+}
+
+func assertListAgentsIntegrationTarget(
+	t *testing.T,
+	row map[string]any,
+	provider string,
+	conversation map[string]any,
+	displayName string,
+	providerURI string,
+) {
+	t.Helper()
+	raw, ok := row["integration_target"]
+	if !ok {
+		t.Fatalf("list agent missing integration target: %+v", row)
+	}
+	target, ok := raw.(map[string]any)
+	if !ok {
+		t.Fatalf("integration target has unexpected shape: %+v", raw)
+	}
+	// Released clients still interpret this field as a transport, not an integration type.
+	if got := target["provider"]; got != provider {
+		t.Fatalf("integration target provider = %v, want %q", got, provider)
+	}
+	require.Equal(t, conversation, target["conversation"])
+	if got := target["display_name"]; got != displayName {
+		t.Fatalf("integration target display_name = %v, want %q", got, displayName)
+	}
+	if got := target["provider_uri"]; got != providerURI {
+		t.Fatalf("integration target provider_uri = %v, want %q", got, providerURI)
+	}
+}

@@ -1,0 +1,351 @@
+package compaction
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/google/uuid"
+	"github.com/omnara-ai/omnara/internal/model"
+	"github.com/omnara-ai/omnara/internal/modelretry"
+	"github.com/omnara-ai/omnara/internal/storage/executionstore"
+	"github.com/omnara-ai/omnara/internal/storage/storeerr"
+)
+
+func (r Runner) RunClaimed(
+	ctx context.Context,
+	input RunInput,
+	claim executionstore.ModelCallClaim,
+) (RunResult, error) {
+	if err := r.validate(input); err != nil {
+		return RunResult{}, err
+	}
+	if err := validateInitialCompactionClaim(input, claim); err != nil {
+		return RunResult{}, err
+	}
+	if !claim.Claimed {
+		return RunResult{State: RunTerminal, ModelCallContextID: claim.Context.ID}, nil
+	}
+	protectOpening, err := r.openingEventsRequireVerbatimRetention(ctx, input)
+	if err != nil {
+		return RunResult{}, err
+	}
+	if protectOpening && input.Plan.EventSequenceEnd >= input.OpeningEventSequence {
+		return RunResult{}, errors.New("compaction must retain unanswered opening events")
+	}
+
+	prior, hasPrior, err := r.Store.GetLatestApplicableContextCheckpoint(
+		ctx,
+		input.Plan.ProjectID,
+		input.Plan.AgentID,
+		input.Plan.InputEventSequence,
+	)
+	if err != nil {
+		return RunResult{}, err
+	}
+	priorSummary := ""
+	wantStart := int64(1)
+	if hasPrior {
+		priorSummary = prior.Summary
+		wantStart = prior.SummarizedThroughEventSequence + 1
+	}
+	if input.Plan.EventSequenceStart != wantStart {
+		return RunResult{}, fmt.Errorf(
+			"compaction source starts at %d, want cumulative boundary %d",
+			input.Plan.EventSequenceStart,
+			wantStart,
+		)
+	}
+
+	snapshot, err := r.Store.CaptureAgentConfigForEventWatermark(
+		ctx,
+		input.Plan.ProjectID,
+		input.Plan.AgentID,
+		input.Plan.InputEventSequence,
+	)
+	if err != nil {
+		return RunResult{}, err
+	}
+	selection, err := compactionModelSelection(claim.Context, snapshot)
+	if err != nil {
+		return r.recordPreSendFailure(
+			ctx, input, claim, err,
+			modelretry.PreSendFailure{
+				Code: compactionErrorCodeBuildModelSelectionFailed,
+				Message: "Omnara could not construct the configured model selection " +
+					"for compaction.",
+			},
+			providerAttemptEvidence{},
+		)
+	}
+	resolved, err := r.Resolver.Resolve(ctx, selection)
+	if err != nil {
+		if ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			return RunResult{}, err
+		}
+		return r.recordPreSendFailure(
+			ctx, input, claim, err,
+			modelretry.PreSendFailure{
+				Code:    compactionErrorCodeResolveModelFailed,
+				Message: "Omnara could not resolve the configured model for compaction.",
+			},
+			providerAttemptEvidence{},
+		)
+	}
+
+	if err := validateResolvedRevision(resolved, claim.Context.ConfiguredModelRevisionID); err != nil {
+		return r.recordFailure(ctx, input, claim, err, providerAttemptEvidence{})
+	}
+	client := resolved.Client
+	apiFormat, apiVariant, hasAPIIdentity := model.APIIdentityForClient(client)
+	if !hasAPIIdentity {
+		return r.recordFailure(
+			ctx,
+			input,
+			claim,
+			model.ProviderError{
+				Kind:    model.ErrorKindInvalidRequest,
+				Source:  "model",
+				Code:    "missing_api_identity",
+				Message: fmt.Sprintf("model client %T does not declare an API format and variant", client),
+			},
+			providerAttemptEvidence{},
+		)
+	}
+	providerAttempt := providerAttemptEvidence{APIFormat: apiFormat, APIVariant: apiVariant}
+	errorSource := modelErrorSourceForAPIFormat(apiFormat)
+	summaryClient, policy, err := compactionModel(client, errorSource)
+	if err != nil {
+		return r.recordPreSendFailure(
+			ctx, input, claim, err,
+			modelretry.PreSendFailure{
+				Code:    compactionErrorCodePrepareRequestFailed,
+				Message: "Omnara could not prepare a valid compaction request policy.",
+			},
+			providerAttempt,
+		)
+	}
+	boundaryWindow, err := r.loadCompactionBoundaryWindow(ctx, input.Plan)
+	if err != nil {
+		return r.recordPreSendFailure(
+			ctx, input, claim, err,
+			modelretry.PreSendFailure{
+				Code:    compactionErrorCodeLoadSourceFailed,
+				Message: "Omnara could not load the durable source events for compaction.",
+			},
+			providerAttempt,
+		)
+	}
+	preparedRequest, err := largestFittingCompactionRequest(
+		ctx,
+		input,
+		priorSummary,
+		boundaryWindow.sourceEvents,
+		boundaryWindow.witnessEvents,
+		boundaryWindow.atomicGroups,
+		summaryClient,
+		policy,
+		errorSource,
+		claim.Context.SourceExcerptReductionCount,
+	)
+	if err != nil {
+		return r.recordPreSendFailure(
+			ctx, input, claim, err,
+			modelretry.PreSendFailure{
+				Code:    compactionErrorCodePrepareRequestFailed,
+				Message: "Omnara could not prepare the compaction request.",
+			},
+			providerAttempt,
+		)
+	}
+	if preparedRequest.sourceEnd == 0 {
+		return r.recordFailure(
+			ctx,
+			input,
+			claim,
+			irreducibleCompactionError("no safe closed source prefix remains"),
+			providerAttempt,
+		)
+	}
+	if preparedRequest.sourceEnd < input.Plan.EventSequenceEnd {
+		return r.replaceCompactionSource(
+			ctx,
+			input,
+			claim,
+			compactionSourceAdjustmentError(
+				boundaryWindow.sourceEvents,
+				boundaryWindow.witnessEvents,
+				boundaryWindow.atomicGroups,
+				input.Plan.EventSequenceEnd,
+			),
+			providerAttempt,
+			preparedRequest.sourceEnd,
+		)
+	}
+	prepared := preparedRequest.prepared
+	sourceText := preparedRequest.sourceText
+	if claim.Context.SourceExcerptReductionCount > 0 {
+		original, err := renderCompactionSource(input, boundaryWindow.sourceEvents, nil)
+		if err != nil {
+			return RunResult{}, err
+		}
+		sourceText = original.sourceText
+	}
+
+	response, err := summaryClient.Respond(
+		ctx,
+		model.Request{
+			ProviderRequest: prepared.Body,
+		},
+	)
+	providerAttempt.ProviderRequestStarted = true
+	providerAttempt.Response = response
+	if err != nil {
+		if ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			return RunResult{}, err
+		}
+		if _, classified := model.ClassifyError(err); !classified {
+			return RunResult{}, err
+		}
+		return r.recordFailure(ctx, input, claim, err, providerAttempt)
+	}
+	if err := model.ValidateProviderResponse(response); err != nil {
+		return r.recordFailure(
+			ctx,
+			input,
+			claim,
+			withCompactionFailureReason(compactionFailureSummaryInvalid, model.MalformedProviderResponse(errorSource, err)),
+			providerAttempt,
+		)
+	}
+	summary, err := validateCompactionResponse(errorSource, response)
+	if err != nil {
+		return r.recordFailure(ctx, input, claim, err, providerAttempt)
+	}
+	if notice := preparedRequest.omissionNotice; notice != "" {
+		summary += "\n\n" + notice
+	}
+	if err := validateSummaryReduction(priorSummary, sourceText, summary); err != nil {
+		return r.recordFailure(ctx, input, claim, err, providerAttempt)
+	}
+	checkpoint, err := r.Store.PublishContextCheckpoint(
+		ctx,
+		executionstore.PublishContextCheckpointInput{
+			ProjectID:               input.Plan.ProjectID,
+			AgentID:                 input.Plan.AgentID,
+			RuntimeLockID:           input.RuntimeLockID,
+			ModelCallContextID:      claim.Context.ID,
+			Summary:                 summary,
+			APIFormat:               apiFormat,
+			APIVariant:              apiVariant,
+			ProviderRequestID:       response.ProviderRequestID,
+			ProviderResponseID:      response.ID,
+			Usage:                   response.Usage,
+			ProviderReportedCostUSD: response.ProviderReportedCostUSD,
+			ProviderMetadata:        response.ProviderMetadata,
+		},
+	)
+	if err != nil {
+		if errors.Is(err, storeerr.ErrCheckpointBoundaryUnsafe) {
+			nextEnd, adjustmentErr := r.nextSmallerSourceEnd(ctx, input.Plan)
+			if adjustmentErr != nil {
+				return RunResult{}, errors.Join(err, adjustmentErr)
+			}
+			cause := model.ProviderError{
+				Kind:    model.ErrorKindInvalidRequest,
+				Source:  "compaction",
+				Code:    "compaction_source_boundary_adjustment",
+				Message: "The planned compaction source does not end at a safe model-visible boundary.",
+			}
+			if nextEnd > 0 {
+				return r.replaceCompactionSource(
+					ctx,
+					input,
+					claim,
+					cause,
+					providerAttempt,
+					nextEnd,
+				)
+			}
+			return r.recordFailure(
+				ctx,
+				input,
+				claim,
+				irreducibleCompactionError("no safe closed source prefix remains"),
+				providerAttempt,
+			)
+		}
+		return RunResult{}, err
+	}
+	return RunResult{
+		State:              RunCompleted,
+		ModelCallContextID: claim.Context.ID,
+		Checkpoint:         &checkpoint,
+	}, nil
+}
+
+func validateInitialCompactionClaim(input RunInput, claim executionstore.ModelCallClaim) error {
+	contextRow := claim.Context
+	matchesRequest := claim.Created &&
+		contextRow.ID != uuid.Nil &&
+		contextRow.ProjectID == input.Plan.ProjectID &&
+		contextRow.AgentID == input.Plan.AgentID &&
+		contextRow.OperationKind == executionstore.ModelCallOperationCompaction &&
+		contextRow.InputEventSequence == input.Plan.InputEventSequence &&
+		contextRow.SourceEventSequenceEnd != nil &&
+		*contextRow.SourceEventSequenceEnd == input.Plan.EventSequenceEnd &&
+		contextRow.RuntimeLockID == input.RuntimeLockID
+	started := claim.Claimed && contextRow.State == executionstore.ModelCallContextStarted
+	denied := !claim.Claimed &&
+		contextRow.State == executionstore.ModelCallContextFailed &&
+		contextRow.RecoveryKind == ""
+	if !matchesRequest || (!started && !denied) {
+		return fmt.Errorf(
+			"initial compaction claim does not match the requested operation: %w",
+			storeerr.ErrStateTransitionConflict,
+		)
+	}
+	return nil
+}
+
+func (r Runner) recordPreSendFailure(
+	ctx context.Context,
+	input RunInput,
+	claim executionstore.ModelCallClaim,
+	cause error,
+	failure modelretry.PreSendFailure,
+	providerAttempt providerAttemptEvidence,
+) (RunResult, error) {
+	if errors.Is(cause, storeerr.ErrStateTransitionConflict) {
+		return RunResult{}, cause
+	}
+	return r.recordFailure(
+		ctx,
+		input,
+		claim,
+		modelretry.NormalizePreSendFailure(cause, failure),
+		providerAttempt,
+	)
+}
+
+func (r Runner) validate(input RunInput) error {
+	if r.Store == nil {
+		return errors.New("compaction store is required")
+	}
+	if r.Resolver == nil {
+		return errors.New("compaction model resolver is required")
+	}
+	if input.Plan.ProjectID == uuid.Nil || input.Plan.AgentID == uuid.Nil ||
+		input.Plan.InputEventSequence <= 0 || input.Plan.EventSequenceStart <= 0 ||
+		input.Plan.EventSequenceEnd <= 0 || input.Plan.EventSequenceEnd < input.Plan.EventSequenceStart ||
+		input.Plan.EventSequenceEnd > input.Plan.InputEventSequence {
+		return errors.New("valid cumulative compaction plan is required")
+	}
+	if input.TurnID == uuid.Nil || len(input.OpeningInputIDs) == 0 || input.RuntimeLockID == uuid.Nil {
+		return errors.New("turn, opening input ids, and runtime lock are required")
+	}
+	if input.OpeningEventSequence <= 0 || input.OpeningEventSequence > input.Plan.InputEventSequence {
+		return errors.New("compaction opening events exceed its model context frontier")
+	}
+	return nil
+}

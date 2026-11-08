@@ -1,0 +1,582 @@
+package executionstore
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/omnara-ai/omnara/internal/storage/internal/agentexecution"
+	"github.com/omnara-ai/omnara/internal/storage/internal/dbsqlc"
+	"github.com/omnara-ai/omnara/internal/storage/internal/lifecyclelock"
+	"github.com/omnara-ai/omnara/internal/storage/internal/storeutil"
+	"github.com/omnara-ai/omnara/internal/storage/management"
+	"github.com/omnara-ai/omnara/internal/storage/storeerr"
+)
+
+const defaultProviderRuntimePageSize int32 = 200
+
+// ProviderRuntimeScopeKey is an opaque, non-secret identity for provider
+// resources that can be observed with one credential and provider config.
+type ProviderRuntimeScopeKey string
+
+type ProviderRuntimeCandidate struct {
+	ScopeKey                     ProviderRuntimeScopeKey
+	OrgID                        uuid.UUID
+	MachineID                    uuid.UUID
+	MachinePoolID                uuid.UUID
+	Provider                     string
+	ProviderResourceID           string
+	MachineProvisioning          MachineProvisioningConfig
+	LifecycleVersion             int64
+	CurrentDaemonRuntimeID       uuid.UUID
+	InactiveSince                time.Time
+	ProviderRuntimeMismatchSince *time.Time
+	WakeAttemptExpiresAt         *time.Time
+	WakeAttemptExpired           bool
+	ManagementKind               management.Kind
+	ProviderConfig               json.RawMessage
+	ProviderAuthSecretID         uuid.UUID
+	ProviderAuthEnvVar           string
+	ProviderAuthVersionID        uuid.UUID
+}
+
+type ListProviderRuntimeCandidatesInput struct {
+	AfterMachineID uuid.UUID
+	Limit          int32
+}
+
+type ProviderRuntimeMismatchCursor struct {
+	MismatchSince time.Time
+	MachineID     uuid.UUID
+}
+
+type ListDueProviderRuntimeMismatchesInput struct {
+	After             ProviderRuntimeMismatchCursor
+	Limit             int32
+	ConfirmationGrace time.Duration
+	InactivityGrace   time.Duration
+}
+
+func (s *Store) ListProviderRuntimeDiscoveryCandidates(
+	ctx context.Context,
+	input ListProviderRuntimeCandidatesInput,
+) ([]ProviderRuntimeCandidate, error) {
+	rows, err := s.q.ListProviderRuntimeDiscoveryCandidates(
+		ctx,
+		dbsqlc.ListProviderRuntimeDiscoveryCandidatesParams{
+			CursorSet:      input.AfterMachineID != uuid.Nil,
+			AfterMachineID: input.AfterMachineID,
+			RowLimit:       providerRuntimePageLimit(input.Limit),
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list provider runtime discovery candidates: %w", err)
+	}
+	out := make([]ProviderRuntimeCandidate, 0, len(rows))
+	for _, row := range rows {
+		candidate, err := providerRuntimeCandidateFromColumns(
+			row.ScopeKey,
+			row.OrgID,
+			row.MachineID,
+			row.MachinePoolID,
+			row.Provider,
+			row.ProviderResourceID,
+			row.Cpu,
+			row.MemoryMb,
+			row.ProviderOptions,
+			row.LifecycleVersion,
+			row.CurrentDaemonRuntimeID,
+			row.InactiveSince,
+			row.ProviderRuntimeMismatchSince,
+			row.WakeAttemptExpiresAt,
+			row.WakeAttemptExpired,
+			row.ManagementKind,
+			row.ProviderConfig,
+			row.ProviderAuthSecretID,
+			row.ProviderAuthEnvVar,
+			row.ProviderAuthVersionID,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("decode provider runtime discovery candidate: %w", err)
+		}
+		out = append(out, candidate)
+	}
+	return out, nil
+}
+
+func (s *Store) ListDueProviderRuntimeMismatches(
+	ctx context.Context,
+	input ListDueProviderRuntimeMismatchesInput,
+) ([]ProviderRuntimeCandidate, error) {
+	cursorSet := input.After.MachineID != uuid.Nil
+	if cursorSet != !input.After.MismatchSince.IsZero() {
+		return nil, errors.New("due provider runtime cursor requires mismatch time and machine id")
+	}
+	if input.ConfirmationGrace < time.Millisecond || input.InactivityGrace < time.Millisecond {
+		return nil, errors.New(
+			"provider runtime reconciliation graces must be at least one millisecond",
+		)
+	}
+	rows, err := s.q.ListDueProviderRuntimeMismatches(
+		ctx,
+		dbsqlc.ListDueProviderRuntimeMismatchesParams{
+			ConfirmationGraceMilliseconds: input.ConfirmationGrace.Milliseconds(),
+			InactivityGraceMilliseconds:   input.InactivityGrace.Milliseconds(),
+			CursorSet:                     cursorSet,
+			AfterMismatchSince:            input.After.MismatchSince,
+			AfterMachineID:                input.After.MachineID,
+			RowLimit:                      providerRuntimePageLimit(input.Limit),
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list due provider runtime mismatches: %w", err)
+	}
+	out := make([]ProviderRuntimeCandidate, 0, len(rows))
+	for _, row := range rows {
+		candidate, err := providerRuntimeCandidateFromColumns(
+			row.ScopeKey,
+			row.OrgID,
+			row.MachineID,
+			row.MachinePoolID,
+			row.Provider,
+			row.ProviderResourceID,
+			row.Cpu,
+			row.MemoryMb,
+			row.ProviderOptions,
+			row.LifecycleVersion,
+			row.CurrentDaemonRuntimeID,
+			row.InactiveSince,
+			row.ProviderRuntimeMismatchSince,
+			row.WakeAttemptExpiresAt,
+			row.WakeAttemptExpired,
+			row.ManagementKind,
+			row.ProviderConfig,
+			row.ProviderAuthSecretID,
+			row.ProviderAuthEnvVar,
+			row.ProviderAuthVersionID,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("decode due provider runtime mismatch: %w", err)
+		}
+		out = append(out, candidate)
+	}
+	return out, nil
+}
+
+func providerRuntimePageLimit(limit int32) int32 {
+	if limit <= 0 {
+		limit = defaultProviderRuntimePageSize
+	}
+	return limit
+}
+
+func providerRuntimeCandidateFromColumns(
+	scopeKey string,
+	orgID, machineID uuid.UUID,
+	machinePoolID *uuid.UUID,
+	provider string,
+	providerResourceID *string,
+	cpu, memoryMB *int32,
+	providerOptions *json.RawMessage,
+	lifecycleVersion int64,
+	currentDaemonRuntimeID *uuid.UUID,
+	inactiveSince time.Time,
+	mismatchSince *time.Time,
+	wakeAttemptExpiresAt *time.Time,
+	wakeAttemptExpired bool,
+	managementKind string,
+	providerConfig json.RawMessage,
+	providerAuthSecretID *uuid.UUID,
+	providerAuthEnvVar string,
+	providerAuthVersionID *uuid.UUID,
+) (ProviderRuntimeCandidate, error) {
+	if machinePoolID == nil || providerResourceID == nil || currentDaemonRuntimeID == nil ||
+		*providerResourceID == "" || scopeKey == "" {
+		return ProviderRuntimeCandidate{}, errors.New("provider runtime candidate is missing required identity")
+	}
+	kind := management.Kind(managementKind)
+	if err := management.Validate(kind); err != nil {
+		return ProviderRuntimeCandidate{}, err
+	}
+	provisioning, err := machineProvisioningFromColumns(
+		storeutil.IntPtr(cpu),
+		storeutil.IntPtr(memoryMB),
+		rawMessageFromSQLCPtr(providerOptions),
+	)
+	if err != nil {
+		return ProviderRuntimeCandidate{}, err
+	}
+	return ProviderRuntimeCandidate{
+		ScopeKey:                     ProviderRuntimeScopeKey(scopeKey),
+		OrgID:                        orgID,
+		MachineID:                    machineID,
+		MachinePoolID:                *machinePoolID,
+		Provider:                     provider,
+		ProviderResourceID:           *providerResourceID,
+		MachineProvisioning:          provisioning,
+		LifecycleVersion:             lifecycleVersion,
+		CurrentDaemonRuntimeID:       *currentDaemonRuntimeID,
+		InactiveSince:                inactiveSince,
+		ProviderRuntimeMismatchSince: mismatchSince,
+		WakeAttemptExpiresAt:         wakeAttemptExpiresAt,
+		WakeAttemptExpired:           wakeAttemptExpired,
+		ManagementKind:               kind,
+		ProviderConfig:               providerConfig,
+		ProviderAuthSecretID:         storeutil.IDFromPtr(providerAuthSecretID),
+		ProviderAuthEnvVar:           providerAuthEnvVar,
+		ProviderAuthVersionID:        storeutil.IDFromPtr(providerAuthVersionID),
+	}, nil
+}
+
+func (s *Store) MarkProviderRuntimeMismatch(
+	ctx context.Context,
+	candidate ProviderRuntimeCandidate,
+) (bool, error) {
+	if candidate.ProviderRuntimeMismatchSince != nil {
+		return false, nil
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return false, fmt.Errorf("begin provider runtime mismatch mark: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := dbsqlc.New(tx)
+
+	if err := lifecyclelock.Machines(
+		ctx,
+		tx,
+		[]lifecyclelock.MachineRef{{
+			OrgID:     candidate.OrgID,
+			MachineID: candidate.MachineID,
+		}},
+	); errors.Is(err, storeerr.ErrNotFound) {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("lock machine for provider runtime mismatch: %w", err)
+	}
+
+	_, err = qtx.MarkProviderRuntimeMismatch(ctx, dbsqlc.MarkProviderRuntimeMismatchParams{
+		OrgID:              candidate.OrgID,
+		MachineID:          candidate.MachineID,
+		MachinePoolID:      candidate.MachinePoolID,
+		LifecycleVersion:   candidate.LifecycleVersion,
+		Provider:           candidate.Provider,
+		ProviderResourceID: storeutil.TextFromEmpty(candidate.ProviderResourceID),
+		DaemonRuntimeID:    candidate.CurrentDaemonRuntimeID,
+		InactiveSince:      candidate.InactiveSince,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("mark provider runtime mismatch: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit provider runtime mismatch mark: %w", err)
+	}
+	return true, nil
+}
+
+type ProviderRuntimeInactiveObservationResult struct {
+	Applied            bool
+	WakeAttemptCleared bool
+}
+
+func (s *Store) ApplyProviderRuntimeInactiveObservation(
+	ctx context.Context,
+	candidate ProviderRuntimeCandidate,
+) (ProviderRuntimeInactiveObservationResult, error) {
+	if candidate.ProviderRuntimeMismatchSince == nil &&
+		(candidate.WakeAttemptExpiresAt == nil || !candidate.WakeAttemptExpired) {
+		return ProviderRuntimeInactiveObservationResult{}, nil
+	}
+	row, err := s.q.ApplyProviderRuntimeInactiveObservation(
+		ctx,
+		dbsqlc.ApplyProviderRuntimeInactiveObservationParams{
+			OrgID:                candidate.OrgID,
+			MachineID:            candidate.MachineID,
+			MachinePoolID:        candidate.MachinePoolID,
+			LifecycleVersion:     candidate.LifecycleVersion,
+			Provider:             candidate.Provider,
+			ProviderResourceID:   storeutil.TextFromEmpty(candidate.ProviderResourceID),
+			MismatchSince:        candidate.ProviderRuntimeMismatchSince,
+			WakeAttemptExpiresAt: candidate.WakeAttemptExpiresAt,
+			WakeAttemptExpired:   candidate.WakeAttemptExpired,
+			DaemonRuntimeID:      candidate.CurrentDaemonRuntimeID,
+			InactiveSince:        candidate.InactiveSince,
+		})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ProviderRuntimeInactiveObservationResult{}, nil
+	}
+	if err != nil {
+		return ProviderRuntimeInactiveObservationResult{}, fmt.Errorf(
+			"apply inactive provider runtime observation: %w",
+			err,
+		)
+	}
+	return ProviderRuntimeInactiveObservationResult{
+		Applied:            true,
+		WakeAttemptCleared: row.WakeAttemptCleared,
+	}, nil
+}
+
+type ClaimProviderRuntimeMismatchDeletionInput struct {
+	Candidate         ProviderRuntimeCandidate
+	ConfirmationGrace time.Duration
+	InactivityGrace   time.Duration
+}
+
+func (s *Store) ClaimProviderRuntimeMismatchDeletion(
+	ctx context.Context,
+	input ClaimProviderRuntimeMismatchDeletionInput,
+) (PoolMachineDeletionClaim, bool, error) {
+	candidate := input.Candidate
+	if !providerRuntimeDeletionCandidateValid(candidate) ||
+		candidate.ProviderRuntimeMismatchSince == nil {
+		return PoolMachineDeletionClaim{}, false, errors.New(
+			"provider runtime mismatch deletion requires complete candidate identity",
+		)
+	}
+	if input.ConfirmationGrace < time.Millisecond || input.InactivityGrace < time.Millisecond {
+		return PoolMachineDeletionClaim{}, false, errors.New(
+			"provider runtime reconciliation graces must be at least one millisecond",
+		)
+	}
+	if !providerRuntimeWakeAllowsDeletion(candidate) {
+		return PoolMachineDeletionClaim{}, false, nil
+	}
+	type transactionResult struct {
+		claim   PoolMachineDeletionClaim
+		claimed bool
+	}
+	retried, retryErr := agentexecution.Retry(ctx,
+		"claim_provider_runtime_mismatch_deletion",
+		func(ctx context.Context) (transactionResult, error) {
+			unit, err := s.cell.Begin(ctx)
+			if err != nil {
+				return transactionResult{}, err
+			}
+			defer func() { _ = unit.Rollback(ctx) }()
+			tx := unit.DB()
+			txNotifications := unit.Notifications()
+			qtx := dbsqlc.New(tx)
+			locked, err := lockProviderRuntimeDeletionCandidate(ctx, tx, qtx, candidate)
+			if err != nil {
+				return transactionResult{}, err
+			}
+			if !locked {
+				return transactionResult{}, nil
+			}
+			row, err := qtx.ClaimProviderRuntimeMismatchDeletion(
+				ctx,
+				dbsqlc.ClaimProviderRuntimeMismatchDeletionParams{
+					ClaimTimeoutSeconds:           int64(poolMachineDeletionLeaseDuration / time.Second),
+					OrgID:                         candidate.OrgID,
+					MachineID:                     candidate.MachineID,
+					MachinePoolID:                 candidate.MachinePoolID,
+					LifecycleVersion:              candidate.LifecycleVersion,
+					Provider:                      candidate.Provider,
+					ProviderResourceID:            storeutil.TextFromEmpty(candidate.ProviderResourceID),
+					MismatchSince:                 *candidate.ProviderRuntimeMismatchSince,
+					ConfirmationGraceMilliseconds: input.ConfirmationGrace.Milliseconds(),
+					WakeAttemptExpiresAt:          candidate.WakeAttemptExpiresAt,
+					DaemonRuntimeID:               candidate.CurrentDaemonRuntimeID,
+					InactiveSince:                 candidate.InactiveSince,
+					InactivityGraceMilliseconds:   input.InactivityGrace.Milliseconds(),
+				},
+			)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return transactionResult{}, nil
+			}
+			if err != nil {
+				return transactionResult{}, fmt.Errorf(
+					"claim provider runtime mismatch deletion: %w",
+					err,
+				)
+			}
+			claim := providerRuntimeMismatchDeletionClaimFromSQLC(row)
+			claim, err = s.finalizePoolMachineDeletionClaimTx(
+				ctx,
+				unit,
+				qtx,
+				txNotifications,
+				claim,
+
+				ProcessToolReasonMachineUnreachable,
+			)
+			if err != nil {
+				return transactionResult{}, err
+			}
+			if err := unit.Commit(ctx, "claim provider runtime mismatch deletion"); err != nil {
+				return transactionResult{}, err
+			}
+			return transactionResult{claim, true}, nil
+		})
+	return retried.claim, retried.claimed, retryErr
+}
+
+func (s *Store) ClaimProviderRuntimeTerminatedDeletion(
+	ctx context.Context,
+	candidate ProviderRuntimeCandidate,
+) (PoolMachineDeletionClaim, bool, error) {
+	if !providerRuntimeDeletionCandidateValid(candidate) {
+		return PoolMachineDeletionClaim{}, false, errors.New(
+			"provider runtime terminated deletion requires complete candidate identity",
+		)
+	}
+	if !providerRuntimeWakeAllowsDeletion(candidate) {
+		return PoolMachineDeletionClaim{}, false, nil
+	}
+	type transactionResult struct {
+		claim   PoolMachineDeletionClaim
+		claimed bool
+	}
+	retried, retryErr := agentexecution.Retry(ctx,
+		"claim_provider_runtime_terminated_deletion",
+		func(ctx context.Context) (transactionResult, error) {
+			unit, err := s.cell.Begin(ctx)
+			if err != nil {
+				return transactionResult{}, err
+			}
+			defer func() { _ = unit.Rollback(ctx) }()
+			tx := unit.DB()
+			qtx := dbsqlc.New(tx)
+			locked, err := lockProviderRuntimeDeletionCandidate(ctx, tx, qtx, candidate)
+			if err != nil {
+				return transactionResult{}, err
+			}
+			if !locked {
+				return transactionResult{}, nil
+			}
+			row, err := qtx.ClaimProviderRuntimeTerminatedDeletion(
+				ctx,
+				dbsqlc.ClaimProviderRuntimeTerminatedDeletionParams{
+					ClaimTimeoutSeconds:  int64(poolMachineDeletionLeaseDuration / time.Second),
+					OrgID:                candidate.OrgID,
+					MachineID:            candidate.MachineID,
+					MachinePoolID:        candidate.MachinePoolID,
+					LifecycleVersion:     candidate.LifecycleVersion,
+					Provider:             candidate.Provider,
+					ProviderResourceID:   storeutil.TextFromEmpty(candidate.ProviderResourceID),
+					MismatchSince:        candidate.ProviderRuntimeMismatchSince,
+					WakeAttemptExpiresAt: candidate.WakeAttemptExpiresAt,
+					DaemonRuntimeID:      candidate.CurrentDaemonRuntimeID,
+					InactiveSince:        candidate.InactiveSince,
+				},
+			)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return transactionResult{}, nil
+			}
+			if err != nil {
+				return transactionResult{}, fmt.Errorf(
+					"claim provider runtime terminated deletion: %w",
+					err,
+				)
+			}
+			claim := providerRuntimeTerminatedDeletionClaimFromSQLC(row)
+			claim, err = s.finalizePoolMachineDeletionClaimTx(
+				ctx,
+				unit,
+				qtx,
+				unit.Notifications(),
+				claim,
+				ProcessToolReasonMachineUnreachable,
+			)
+			if err != nil {
+				return transactionResult{}, err
+			}
+			if err := unit.Commit(ctx, "claim provider runtime terminated deletion"); err != nil {
+				return transactionResult{}, err
+			}
+			return transactionResult{claim, true}, nil
+		})
+	return retried.claim, retried.claimed, retryErr
+}
+
+func providerRuntimeDeletionCandidateValid(candidate ProviderRuntimeCandidate) bool {
+	return candidate.OrgID != uuid.Nil && candidate.MachineID != uuid.Nil &&
+		candidate.MachinePoolID != uuid.Nil && candidate.CurrentDaemonRuntimeID != uuid.Nil &&
+		candidate.Provider != "" && candidate.ProviderResourceID != ""
+}
+
+func providerRuntimeWakeAllowsDeletion(candidate ProviderRuntimeCandidate) bool {
+	return candidate.WakeAttemptExpiresAt == nil || candidate.WakeAttemptExpired
+}
+
+func lockProviderRuntimeDeletionCandidate(
+	ctx context.Context,
+	tx dbsqlc.DBTX,
+	qtx *dbsqlc.Queries,
+	candidate ProviderRuntimeCandidate,
+) (bool, error) {
+	if err := lifecyclelock.Pools(
+		ctx,
+		tx,
+		[]lifecyclelock.PoolRef{{
+			OrgID:  candidate.OrgID,
+			PoolID: candidate.MachinePoolID,
+		}},
+	); errors.Is(err, storeerr.ErrNotFound) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	_, err := qtx.GetProviderRuntimeProtectionPool(
+		ctx,
+		dbsqlc.GetProviderRuntimeProtectionPoolParams{
+			OrgID:                candidate.OrgID,
+			MachinePoolID:        candidate.MachinePoolID,
+			Provider:             candidate.Provider,
+			ManagementKind:       string(candidate.ManagementKind),
+			ProviderConfig:       candidate.ProviderConfig,
+			ProviderAuthSecretID: storeutil.IDFromNil(candidate.ProviderAuthSecretID),
+			ProviderAuthEnvVar:   candidate.ProviderAuthEnvVar,
+		},
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("revalidate provider runtime protection pool: %w", err)
+	}
+	if err := lifecyclelock.Machines(
+		ctx,
+		tx,
+		[]lifecyclelock.MachineRef{{
+			OrgID:     candidate.OrgID,
+			MachineID: candidate.MachineID,
+		}},
+	); errors.Is(err, storeerr.ErrNotFound) {
+		return false, nil
+	} else if err != nil {
+		return false, fmt.Errorf("lock provider runtime machine: %w", err)
+	}
+	if candidate.ManagementKind == management.Tenant {
+		if candidate.ProviderAuthSecretID == uuid.Nil || candidate.ProviderAuthVersionID == uuid.Nil {
+			return false, errors.New(
+				"tenant provider runtime deletion requires a credential version",
+			)
+		}
+		if _, err := qtx.LockProviderRuntimeCredential(
+			ctx,
+			dbsqlc.LockProviderRuntimeCredentialParams{
+				OrgID:                 candidate.OrgID,
+				ProviderAuthSecretID:  candidate.ProviderAuthSecretID,
+				ProviderAuthVersionID: storeutil.IDFromNil(candidate.ProviderAuthVersionID),
+			},
+		); errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		} else if err != nil {
+			return false, fmt.Errorf("lock provider runtime credential: %w", err)
+		}
+	} else if candidate.ProviderAuthVersionID != uuid.Nil {
+		return false, errors.New(
+			"cluster provider runtime deletion has a tenant credential version",
+		)
+	}
+	return true, nil
+}

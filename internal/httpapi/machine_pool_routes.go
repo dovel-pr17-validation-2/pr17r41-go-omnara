@@ -1,0 +1,466 @@
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/omnara-ai/omnara/internal/httpapi/apierror"
+	httpauth "github.com/omnara-ai/omnara/internal/httpapi/auth"
+	"github.com/omnara-ai/omnara/internal/httpapi/openapi"
+	"github.com/omnara-ai/omnara/internal/log/logent"
+	"github.com/omnara-ai/omnara/internal/machinepool"
+	"github.com/omnara-ai/omnara/internal/publicid"
+	"github.com/omnara-ai/omnara/internal/resourcemeta"
+	"github.com/omnara-ai/omnara/internal/resourcename"
+	"github.com/omnara-ai/omnara/internal/storage/executionstore"
+	"github.com/omnara-ai/omnara/internal/storage/identitystore"
+)
+
+func (s *Server) machinePoolResponse(record executionstore.MachinePoolRecord) (openapi.MachinePool, error) {
+	id, err := publicID(publicid.KindMachinePool, record.ID)
+	if err != nil {
+		return openapi.MachinePool{}, err
+	}
+	orgID, err := publicID(publicid.KindOrganization, record.OrgID)
+	if err != nil {
+		return openapi.MachinePool{}, err
+	}
+	var defaultMachineEnv map[string]string
+	if err := json.Unmarshal(record.DefaultMachineEnv, &defaultMachineEnv); err != nil {
+		return openapi.MachinePool{}, err
+	}
+	var defaultMachineSecretEnv map[string]openapi.SecretID
+	if err := publicSecretIDs(record.DefaultMachineSecretEnv, &defaultMachineSecretEnv); err != nil {
+		return openapi.MachinePool{}, err
+	}
+	defaultMachineProviderOptions, err := jsonMapOrFallback(record.DefaultMachineProviderOptions, json.RawMessage(`{}`))
+	if err != nil {
+		return openapi.MachinePool{}, err
+	}
+	providerConfig, err := jsonMapOrFallback(record.ProviderConfig, json.RawMessage(`{}`))
+	if err != nil {
+		return openapi.MachinePool{}, err
+	}
+	metadata, err := resourcemeta.FromJSON(record.Metadata)
+	if err != nil {
+		return openapi.MachinePool{}, err
+	}
+	response := openapi.MachinePool{
+		Id:                            id,
+		OrgId:                         orgID,
+		Name:                          record.Name,
+		ManagementKind:                openapi.ManagementKind(record.ManagementKind),
+		Description:                   record.Description,
+		Provider:                      record.Provider,
+		DefaultMachineCpu:             nullableInt32FromIntPtr(record.DefaultMachineCPU),
+		DefaultMachineMemoryMb:        nullableInt32FromIntPtr(record.DefaultMachineMemoryMB),
+		DefaultMachineEnv:             defaultMachineEnv,
+		DefaultMachineSecretEnv:       defaultMachineSecretEnv,
+		DefaultMachineProviderOptions: defaultMachineProviderOptions,
+		DefaultCwd:                    record.DefaultCwd,
+		ProviderConfig:                providerConfig,
+		RuntimeProtectionEnabled:      record.RuntimeProtectionEnabled,
+		MaxTotalMachines:              record.MaxTotalMachines,
+		MaxTotalCpu:                   nullableInt32FromIntPtr(record.MaxTotalCPU),
+		MaxTotalMemoryMb:              nullableInt32FromIntPtr(record.MaxTotalMemoryMB),
+		MinMachineCpu:                 nullableInt32FromIntPtr(record.MinMachineCPU),
+		MinMachineMemoryMb:            nullableInt32FromIntPtr(record.MinMachineMemoryMB),
+		MaxMachineCpu:                 nullableInt32FromIntPtr(record.MaxMachineCPU),
+		MaxMachineMemoryMb:            nullableInt32FromIntPtr(record.MaxMachineMemoryMB),
+		DeleteAfterIdleMinutes:        nullableInt32FromIntPtr(record.DeleteAfterIdleMinutes),
+		Metadata:                      metadata,
+		CreatedAt:                     record.CreatedAt,
+		UpdatedAt:                     record.UpdatedAt,
+	}
+	if record.ProviderAuthSecretID != uuid.Nil {
+		secretID, err := publicID(publicid.KindSecret, record.ProviderAuthSecretID)
+		if err != nil {
+			return openapi.MachinePool{}, err
+		}
+		response.ProviderAuthSecretId = &secretID
+	}
+	return response, nil
+}
+
+func (s strictOpenAPIServer) ListMachinePools(
+	ctx context.Context,
+	request openapi.ListMachinePoolsRequestObject,
+) (openapi.ListMachinePoolsResponseObject, error) {
+	org, err := orgScopeFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.listMachinePools(ctx, request, org)
+}
+
+func (s strictOpenAPIServer) listMachinePools(
+	ctx context.Context,
+	request openapi.ListMachinePoolsRequestObject,
+	org identitystore.OrgRecord,
+) (openapi.ListMachinePoolsResponseObject, error) {
+	limit, err := parseOpenAPIPageLimit(request.Params.Limit)
+	if err != nil {
+		return nil, apierror.FromCode(openapi.ErrorCodeInvalidRequest, err.Error())
+	}
+	list, err := parseResourceListQuery(resourceListQueryInput{
+		Name: request.Params.Name, Sort: optionalString(request.Params.Sort),
+		Cursor: request.Params.Cursor, ListKind: "machine_pools",
+		Scope: org.ID.String(), IDKind: publicid.KindMachinePool,
+		AllowedSorts: defaultResourceSorts,
+	})
+	if err != nil {
+		return nil, apierror.FromCode(openapi.ErrorCodeInvalidRequest, err.Error())
+	}
+	page, err := s.server.store.Execution().ListMachinePools(ctx, executionstore.ListMachinePoolsInput{
+		OrgID: org.ID,
+		Limit: limit,
+		List:  list,
+	})
+	if err != nil {
+		return nil, apierror.OrgScoped(err)
+	}
+	out := make([]openapi.MachinePool, 0, len(page.Pools))
+	for _, record := range page.Pools {
+		response, err := s.server.machinePoolResponse(record.MachinePoolRecord)
+		if err != nil {
+			return nil, err
+		}
+		response.Usage = machinePoolUsageResponse(record.Usage)
+		out = append(out, response)
+	}
+	nextCursor, err := encodeResourceListNextCursor(
+		page.HasMore, page.Next, list, "machine_pools",
+		org.ID.String(), publicid.KindMachinePool, nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return openapi.ListMachinePools200JSONResponse(
+		openapi.ListMachinePoolsResponse{Data: out, NextCursor: nullableFromPtr(nextCursor)},
+	), nil
+}
+
+func (s strictOpenAPIServer) CreateMachinePool(
+	ctx context.Context,
+	request openapi.CreateMachinePoolRequestObject,
+) (openapi.CreateMachinePoolResponseObject, error) {
+	org, err := orgScopeFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.createMachinePool(ctx, request, org)
+}
+
+const machinePoolConnectionChecksPerMinute = 10
+
+func (s strictOpenAPIServer) CheckMachinePoolConnection(
+	ctx context.Context,
+	request openapi.CheckMachinePoolConnectionRequestObject,
+) (openapi.CheckMachinePoolConnectionResponseObject, error) {
+	org, err := orgScopeFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if request.Body == nil {
+		return nil, apierror.FromCode(openapi.ErrorCodeInvalidRequest, "request body is required")
+	}
+	if s.server.machinePoolManager == nil || s.server.authLimiter == nil {
+		return nil, apierror.FromCode(openapi.ErrorCodeServiceUnavailable, "machine pool connection checks unavailable")
+	}
+	providerAuthSecretID, ok := parseOpenAPIPublicID(publicid.KindSecret, request.Body.ProviderAuthSecretId)
+	if !ok {
+		return nil, apierror.FromCode(openapi.ErrorCodeInvalidRequest, "invalid provider_auth_secret_id")
+	}
+	providerConfig, err := rawJSONFromPointer(request.Body.ProviderConfig)
+	if err != nil {
+		return nil, err
+	}
+	defaultMachineProviderOptions, err := rawJSONFromPointer(request.Body.DefaultMachineProviderOptions)
+	if err != nil {
+		return nil, err
+	}
+	principal, _ := principalFromContext(ctx)
+	if err := s.server.authLimiter.Allow(
+		ctx,
+		"machine_pool_connection_check:"+principal.ID.String(),
+		machinePoolConnectionChecksPerMinute,
+		time.Minute,
+	); errors.Is(err, httpauth.ErrRateLimited) {
+		return nil, apierror.FromCode(openapi.ErrorCodeRateLimited, "too many connection checks; try again in a few seconds")
+	} else if err != nil {
+		return nil, err
+	}
+	err = s.server.machinePoolManager.CheckPoolConnection(ctx, machinepool.PoolConnectionCheck{
+		OrgID:                         org.ID,
+		Provider:                      request.Body.Provider,
+		ProviderConfig:                providerConfig,
+		ProviderAuthSecretID:          providerAuthSecretID,
+		DefaultMachineProviderOptions: defaultMachineProviderOptions,
+	})
+	if err == nil {
+		return openapi.CheckMachinePoolConnection204Response{}, nil
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return nil, apierror.FromCode(
+			openapi.ErrorCodeUnprocessable,
+			"machine pool connection check was canceled",
+		).WithCause(err)
+	}
+	response := openapi.MachinePoolConnectionCheckError{
+		Error: err.Error(),
+		Code:  openapi.MachinePoolConnectionCheckErrorCodeUnprocessable,
+	}
+	logged := response.Error
+	var checkErr machinepool.ConnectionCheckError
+	if errors.As(err, &checkErr) {
+		response.Details = &checkErr.Details
+		logged = checkErr.Details
+	}
+	logent.MachinePoolConnectionCheckFailed(ctx, request.Body.Provider, logged)
+	if checkErr.Upstream {
+		response.Code = openapi.MachinePoolConnectionCheckErrorCodeUpstreamUnavailable
+		return openapi.CheckMachinePoolConnection424JSONResponse(response), nil
+	}
+	return openapi.CheckMachinePoolConnection422JSONResponse(response), nil
+}
+
+func (s strictOpenAPIServer) createMachinePool(
+	ctx context.Context,
+	request openapi.CreateMachinePoolRequestObject,
+	org identitystore.OrgRecord,
+) (openapi.CreateMachinePoolResponseObject, error) {
+	if request.Body == nil {
+		return nil, apierror.FromCode(openapi.ErrorCodeInvalidRequest, "request body is required")
+	}
+	canonicalName, err := resourcename.CanonicalizeRequired("machine pool name", request.Body.Name)
+	if err != nil {
+		return nil, apierror.FromCode(openapi.ErrorCodeInvalidRequest, err.Error())
+	}
+	request.Body.Name = canonicalName
+	description := ""
+	if request.Body.Description != nil {
+		description = *request.Body.Description
+	}
+	defaultCwd := ""
+	if request.Body.DefaultCwd != nil {
+		defaultCwd = *request.Body.DefaultCwd
+	}
+	defaultMachineEnv, err := rawJSONFromPointer(request.Body.DefaultMachineEnv)
+	if err != nil {
+		return nil, err
+	}
+	defaultMachineSecretEnv, err := secretIDsFromPointer(request.Body.DefaultMachineSecretEnv)
+	if err != nil {
+		return nil, err
+	}
+	defaultMachineProviderOptions, err := rawJSONFromPointer(&request.Body.DefaultMachineProviderOptions)
+	if err != nil {
+		return nil, err
+	}
+	providerConfig, err := rawJSONFromPointer(request.Body.ProviderConfig)
+	if err != nil {
+		return nil, err
+	}
+	metadata := request.Body.Metadata
+	providerAuthSecretID, ok := parseOpenAPIPublicID(publicid.KindSecret, request.Body.ProviderAuthSecretId)
+	if !ok {
+		return nil, apierror.FromCode(openapi.ErrorCodeInvalidRequest, "invalid provider_auth_secret_id")
+	}
+	runtimeProtectionEnabled := request.Body.RuntimeProtectionEnabled != nil &&
+		*request.Body.RuntimeProtectionEnabled
+	record, err := s.server.store.Execution().CreateMachinePool(ctx, executionstore.CreateMachinePoolInput{
+		OrgID:                         org.ID,
+		Name:                          request.Body.Name,
+		Description:                   description,
+		Provider:                      request.Body.Provider,
+		DefaultMachineCPU:             intPtrFromInt32(request.Body.DefaultMachineCpu),
+		DefaultMachineMemoryMB:        intPtrFromInt32(request.Body.DefaultMachineMemoryMb),
+		DefaultMachineEnv:             defaultMachineEnv,
+		DefaultMachineSecretEnv:       defaultMachineSecretEnv,
+		DefaultMachineProviderOptions: defaultMachineProviderOptions,
+		DefaultCwd:                    defaultCwd,
+		ProviderConfig:                providerConfig,
+		ProviderAuthSecretID:          providerAuthSecretID,
+		RuntimeProtectionEnabled:      runtimeProtectionEnabled,
+		MaxTotalMachines:              request.Body.MaxTotalMachines,
+		MaxTotalCPU:                   intPtrFromInt32(request.Body.MaxTotalCpu),
+		MaxTotalMemoryMB:              intPtrFromInt32(request.Body.MaxTotalMemoryMb),
+		MinMachineCPU:                 intPtrFromInt32(request.Body.MinMachineCpu),
+		MinMachineMemoryMB:            intPtrFromInt32(request.Body.MinMachineMemoryMb),
+		MaxMachineCPU:                 intPtrFromInt32(request.Body.MaxMachineCpu),
+		MaxMachineMemoryMB:            intPtrFromInt32(request.Body.MaxMachineMemoryMb),
+		DeleteAfterIdleMinutes:        intPtrFromInt32(request.Body.DeleteAfterIdleMinutes),
+		Metadata:                      metadata,
+	})
+	if err != nil {
+		return nil, apierror.OrgScoped(err)
+	}
+	response, err := s.server.machinePoolResponse(record)
+	if err != nil {
+		return nil, err
+	}
+	if record.Created {
+		return openapi.CreateMachinePool201JSONResponse(response), nil
+	}
+	return openapi.CreateMachinePool200JSONResponse(response), nil
+}
+
+func (s strictOpenAPIServer) GetMachinePool(
+	ctx context.Context,
+	request openapi.GetMachinePoolRequestObject,
+) (openapi.GetMachinePoolResponseObject, error) {
+	org, err := orgScopeFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.getMachinePool(ctx, request, org)
+}
+
+func (s strictOpenAPIServer) getMachinePool(
+	ctx context.Context,
+	request openapi.GetMachinePoolRequestObject,
+	org identitystore.OrgRecord,
+) (openapi.GetMachinePoolResponseObject, error) {
+	poolID, ok := parseOpenAPIPublicID(publicid.KindMachinePool, request.PoolID)
+	if !ok {
+		return nil, apierror.FromCode(openapi.ErrorCodeNotFound, "not found")
+	}
+	record, err := s.server.store.Execution().GetMachinePool(ctx, org.ID, poolID)
+	if err != nil {
+		return nil, apierror.OrgScoped(err)
+	}
+	usage, err := s.server.store.Execution().GetMachinePoolUsage(ctx, org.ID, poolID)
+	if err != nil {
+		return nil, apierror.OrgScoped(err)
+	}
+	response, err := s.server.machinePoolResponse(record)
+	if err != nil {
+		return nil, err
+	}
+	response.Usage = machinePoolUsageResponse(usage)
+	return openapi.GetMachinePool200JSONResponse(response), nil
+}
+
+func (s strictOpenAPIServer) UpdateMachinePool(
+	ctx context.Context,
+	request openapi.UpdateMachinePoolRequestObject,
+) (openapi.UpdateMachinePoolResponseObject, error) {
+	org, err := orgScopeFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.updateMachinePool(ctx, request, org)
+}
+
+func (s strictOpenAPIServer) updateMachinePool(
+	ctx context.Context,
+	request openapi.UpdateMachinePoolRequestObject,
+	org identitystore.OrgRecord,
+) (openapi.UpdateMachinePoolResponseObject, error) {
+	if request.Body == nil {
+		return nil, apierror.FromCode(openapi.ErrorCodeInvalidRequest, "request body is required")
+	}
+	if request.Body.Name != nil {
+		canonicalName, err := resourcename.CanonicalizeRequired("machine pool name", *request.Body.Name)
+		if err != nil {
+			return nil, apierror.FromCode(openapi.ErrorCodeInvalidRequest, err.Error())
+		}
+		request.Body.Name = &canonicalName
+	}
+	poolID, ok := parseOpenAPIPublicID(publicid.KindMachinePool, request.PoolID)
+	if !ok {
+		return nil, apierror.FromCode(openapi.ErrorCodeNotFound, "not found")
+	}
+	defaultMachineEnv, err := rawJSONFromPointer(request.Body.DefaultMachineEnv)
+	if err != nil {
+		return nil, err
+	}
+	defaultMachineSecretEnv, err := secretIDsFromPointer(request.Body.DefaultMachineSecretEnv)
+	if err != nil {
+		return nil, err
+	}
+	defaultMachineProviderOptions, err := rawJSONFromPointer(request.Body.DefaultMachineProviderOptions)
+	if err != nil {
+		return nil, err
+	}
+	providerConfig, err := rawJSONFromPointer(request.Body.ProviderConfig)
+	if err != nil {
+		return nil, err
+	}
+	metadata := request.Body.Metadata
+	var providerAuthSecretID *uuid.UUID
+	if request.Body.ProviderAuthSecretId != nil {
+		parsed, ok := parseOpenAPIPublicID(publicid.KindSecret, *request.Body.ProviderAuthSecretId)
+		if !ok {
+			return nil, apierror.FromCode(openapi.ErrorCodeInvalidRequest, "invalid provider_auth_secret_id")
+		}
+		providerAuthSecretID = &parsed
+	}
+	record, err := s.server.store.Execution().UpdateMachinePool(ctx, executionstore.UpdateMachinePoolInput{
+		OrgID:                         org.ID,
+		ID:                            poolID,
+		Name:                          request.Body.Name,
+		Description:                   request.Body.Description,
+		DefaultMachineCPU:             nullableIntPatchFromInt32(request.Body.DefaultMachineCpu),
+		DefaultMachineMemoryMB:        nullableIntPatchFromInt32(request.Body.DefaultMachineMemoryMb),
+		DefaultMachineEnv:             defaultMachineEnv,
+		DefaultMachineSecretEnv:       defaultMachineSecretEnv,
+		DefaultMachineProviderOptions: defaultMachineProviderOptions,
+		DefaultCwd:                    request.Body.DefaultCwd,
+		ProviderConfig:                providerConfig,
+		ProviderAuthSecretID:          providerAuthSecretID,
+		RuntimeProtectionEnabled:      request.Body.RuntimeProtectionEnabled,
+		MaxTotalMachines:              request.Body.MaxTotalMachines,
+		MaxTotalCPU:                   nullableIntPatchFromInt32(request.Body.MaxTotalCpu),
+		MaxTotalMemoryMB:              nullableIntPatchFromInt32(request.Body.MaxTotalMemoryMb),
+		MinMachineCPU:                 nullableIntPatchFromInt32(request.Body.MinMachineCpu),
+		MinMachineMemoryMB:            nullableIntPatchFromInt32(request.Body.MinMachineMemoryMb),
+		MaxMachineCPU:                 nullableIntPatchFromInt32(request.Body.MaxMachineCpu),
+		MaxMachineMemoryMB:            nullableIntPatchFromInt32(request.Body.MaxMachineMemoryMb),
+		DeleteAfterIdleMinutes:        nullableIntPatchFromInt32(request.Body.DeleteAfterIdleMinutes),
+		Metadata:                      metadata,
+	})
+	if err != nil {
+		return nil, apierror.OrgScoped(err)
+	}
+	response, err := s.server.machinePoolResponse(record)
+	if err != nil {
+		return nil, err
+	}
+	return openapi.UpdateMachinePool200JSONResponse(response), nil
+}
+
+func (s strictOpenAPIServer) DeleteMachinePool(
+	ctx context.Context,
+	request openapi.DeleteMachinePoolRequestObject,
+) (openapi.DeleteMachinePoolResponseObject, error) {
+	org, err := orgScopeFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.deleteMachinePool(ctx, request, org)
+}
+
+func (s strictOpenAPIServer) deleteMachinePool(
+	ctx context.Context,
+	request openapi.DeleteMachinePoolRequestObject,
+	org identitystore.OrgRecord,
+) (openapi.DeleteMachinePoolResponseObject, error) {
+	poolID, ok := parseOpenAPIPublicID(publicid.KindMachinePool, request.PoolID)
+	if !ok {
+		return nil, apierror.FromCode(openapi.ErrorCodeNotFound, "not found")
+	}
+	machines, err := s.server.store.Execution().DeleteMachinePool(ctx, org.ID, poolID)
+	if err != nil {
+		return nil, apierror.OrgScoped(err)
+	}
+	s.server.startPoolMachineDeletion(ctx, machines)
+	return openapi.DeleteMachinePool204Response{}, nil
+}
+
+func machinePoolUsageResponse(usage executionstore.MachinePoolUsageRecord) *openapi.MachinePoolUsage {
+	return &openapi.MachinePoolUsage{Machines: usage.Machines, Cpu: usage.CPU, MemoryMb: usage.MemoryMB}
+}

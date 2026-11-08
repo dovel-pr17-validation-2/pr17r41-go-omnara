@@ -1,0 +1,991 @@
+//go:build integration
+
+package httpapi
+
+import (
+	"context"
+	"net/http"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/omnara-ai/omnara/internal/publicid"
+	"github.com/omnara-ai/omnara/internal/storage/executionstore"
+	"github.com/omnara-ai/omnara/internal/testutil"
+	"github.com/omnara-ai/omnara/internal/testutil/integrationdb"
+	"github.com/stretchr/testify/require"
+)
+
+func TestPublicAgentLaunchFlow(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+
+	handler := newIntegrationServer(pool)
+	store := newIntegrationStore(pool)
+	project := bootstrapPublicHTTPProject(t, handler, "agent-launch")
+
+	machine := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		"/api/v1/orgs/"+project.OrgID+"/machines",
+		`{"display_name":"launch machine"}`,
+		"idem-agent-launch-machine",
+		http.StatusCreated,
+		authHeaders(project.AdminToken),
+	)
+	machineName := testutil.RequireType[string](t, machine["display_name"])
+	ungrantedSource := "instruction: Use the machine when helpful.\n" +
+		"model:\n" +
+		"  provider_config: openai-prod\n" +
+		"  name: gpt-test\n" +
+		"machine_sources:\n" +
+		"  - machine_name: " + machineName + "\n" +
+		"tools:\n" +
+		"  run_command: {}\n"
+	createPublicHTTPAgentConfig(
+		t,
+		handler,
+		project,
+		"agent-launch-ungranted-machine",
+		"yaml",
+		ungrantedSource,
+		project.AdminToken,
+		http.StatusBadRequest,
+	)
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/machine-grants",
+		`{"machine_id":"`+testutil.RequireType[string](t, machine["id"])+`"}`,
+		"idem-agent-launch-grant",
+		http.StatusCreated,
+		authHeaders(project.AdminToken),
+	)
+	sourceYAML := "instruction: Use the machine when helpful.\n" +
+		"model:\n" +
+		"  provider_config: openai-prod\n" +
+		"  name: gpt-test\n" +
+		"machine_sources:\n" +
+		"  - machine_name: " + machineName + "\n" +
+		"    cwd: /workspace\n"
+	config := createPublicHTTPAgentConfig(
+		t,
+		handler,
+		project,
+		"agent-launch",
+		"yaml",
+		sourceYAML,
+		project.AdminToken,
+		http.StatusCreated,
+	)
+	if _, ok := config["warnings"]; ok {
+		t.Fatalf("config contains obsolete warnings: %v", config)
+	}
+	profile := createPublicHTTPAgentProfile(
+		t,
+		handler,
+		project,
+		"agent-launch",
+		"Agent Launch",
+		testutil.RequireType[string](t, config["id"]),
+		project.AdminToken,
+		http.StatusCreated,
+	)
+	profileID := testutil.RequireType[string](t, profile["id"])
+	configID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, profile["current_config"])["id"])
+	retargetYAML := "instruction: Updated default.\nmodel:\n  provider_config: openai-prod\n  name: " +
+		"gpt-test\nmachine_sources:\n  - machine_name: " + machineName +
+		"\n    cwd: /workspace\ntools:\n  run_command: {}\n"
+	retargetConfig := createPublicHTTPAgentConfig(
+		t,
+		handler,
+		project,
+		"agent-launch-retarget",
+		"yaml",
+		retargetYAML,
+		project.AdminToken,
+		http.StatusCreated,
+	)
+	retargetConfigID := testutil.RequireType[string](t, retargetConfig["id"])
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agent-profiles/"+profileID+"/config",
+		`{"config":"`+retargetConfigID+`"}`,
+		"idem-agent-launch-retarget-missing-expected",
+		http.StatusBadRequest,
+		authHeaders(project.AdminToken),
+	)
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agent-profiles/"+profileID+"/config",
+		`{"config":"`+retargetConfigID+`","expected_current_config_id":"not-a-config-id"}`,
+		"idem-agent-launch-retarget-invalid-expected",
+		http.StatusBadRequest,
+		authHeaders(project.AdminToken),
+	)
+	retargeted := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agent-profiles/"+profileID+"/config",
+		`{"config":"`+retargetConfigID+`","expected_current_config_id":"`+configID+`"}`,
+		"idem-agent-launch-retarget",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	retargetedConfigID := testutil.RequireType[string](
+		t, testutil.RequireType[map[string]any](t, retargeted["current_config"])["id"],
+	)
+	if retargetedConfigID == configID {
+		t.Fatalf("retarget should create a new current config: %+v", retargeted)
+	}
+	currentConfig := testutil.RequireType[map[string]any](t, retargeted["current_config"])
+	compiled := testutil.RequireType[map[string]any](t, currentConfig["compiled_definition"])
+	if compiled["instruction"] != "Updated default." {
+		t.Fatalf("retarget response lost updated compiled instruction: %+v", compiled)
+	}
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agent-profiles/"+profileID+"/config",
+		`{"config":"`+configID+`","expected_current_config_id":"`+configID+`"}`,
+		"idem-agent-launch-retarget-stale",
+		http.StatusConflict,
+		authHeaders(project.AdminToken),
+	)
+	invalidMessage := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents",
+		`{"config":"`+configID+`","message":"before\u0000after"}`,
+		"idem-agent-launch-invalid-message",
+		http.StatusBadRequest,
+		authHeaders(project.AdminToken),
+	)
+	if invalidMessage["code"] != "invalid_request" {
+		t.Fatalf("invalid launch message response = %+v, want invalid_request", invalidMessage)
+	}
+
+	explicitConfig := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents",
+		`{"profile":"`+profileID+`","config":"`+configID+`","message":"start first"}`,
+		"idem-agent-launch-first",
+		http.StatusCreated,
+		authHeaders(project.AdminToken),
+	)
+	firstAgent := testutil.RequireType[map[string]any](t, explicitConfig["agent"])
+	if firstAgent["current_config_id"] != configID {
+		t.Fatalf(
+			"explicit launch did not pin requested config: %+v",
+			explicitConfig,
+		)
+	}
+	if firstAgent["state"] != "active" {
+		t.Fatalf("new public agent state = %s, want active", firstAgent["state"])
+	}
+	if explicitConfig["message"] != nil ||
+		explicitConfig["agent_input"] == nil {
+		t.Fatalf(
+			"expected launch initial agent input without message projection: %+v",
+			explicitConfig,
+		)
+	}
+	replayedFirst := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents",
+		`{"profile":"`+profileID+`","config":"`+retargetedConfigID+`","message":"ignored\u0000retry body"}`,
+		"idem-agent-launch-first",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	replayedFirstAgent := testutil.RequireType[map[string]any](t, replayedFirst["agent"])
+	if len(replayedFirst) != 1 ||
+		replayedFirstAgent["id"] != firstAgent["id"] ||
+		replayedFirstAgent["current_config_id"] != configID {
+		t.Fatalf(
+			"changed replay body did not return the current original agent: original=%+v replay=%+v",
+			explicitConfig,
+			replayedFirst,
+		)
+	}
+
+	configOnly := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents",
+		`{"config":"`+retargetedConfigID+`"}`,
+		"idem-agent-launch-config-only",
+		http.StatusCreated,
+		authHeaders(project.AdminToken),
+	)
+	if testutil.RequireType[map[string]any](t, configOnly["agent"])["current_config_id"] != retargetedConfigID {
+		t.Fatalf(
+			"config-only launch did not use requested config: %+v",
+			configOnly,
+		)
+	}
+
+	retargetedLaunch := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents",
+		`{"profile":"`+profileID+`","config":"`+retargetedConfigID+`"}`,
+		"idem-agent-launch-retargeted",
+		http.StatusCreated,
+		authHeaders(project.AdminToken),
+	)
+	bindings := testutil.RequireType[[]any](t, retargetedLaunch["machine_bindings"])
+	if testutil.RequireType[map[string]any](t, retargetedLaunch["agent"])["current_config_id"] != retargetedConfigID ||
+		len(bindings) != 1 {
+		t.Fatalf(
+			"retargeted launch did not use machine-backed config: %+v",
+			retargetedLaunch,
+		)
+	}
+	binding := testutil.RequireType[map[string]any](t, bindings[0])
+	if _, ok := binding["metadata"]; ok {
+		t.Fatalf(
+			"machine binding public response must not expose raw storage metadata: %+v",
+			binding,
+		)
+	}
+	mustPublicHTTPID(t, publicid.KindMachine, testutil.RequireType[string](t, binding["machine_id"]))
+	launchConfig := testutil.RequireType[map[string]any](t, retargetedLaunch["agent_config"])
+	if launchConfig["model"] == nil || launchConfig["instruction_hash"] == "" {
+		t.Fatalf("launch config projection missing model/instruction evidence: %+v", retargetedLaunch["agent_config"])
+	}
+	retargetedAgentID := testutil.RequireType[string](
+		t, testutil.RequireType[map[string]any](t, retargetedLaunch["agent"])["id"],
+	)
+	archivedResponse := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+retargetedAgentID+"/archive",
+		``,
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	if testutil.RequireType[map[string]any](t, archivedResponse["agent"])["state"] != "archived" {
+		t.Fatalf("archive agent response = %+v, want archived", archivedResponse)
+	}
+	archivedRead := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+retargetedAgentID,
+		``,
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	if testutil.RequireType[map[string]any](t, archivedRead["agent"])["state"] != "archived" {
+		t.Fatalf("archived agent read = %+v, want archived", archivedRead)
+	}
+	archivedReplay := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents",
+		`{"profile":"`+profileID+`","config":"`+configID+`"}`,
+		"idem-agent-launch-retargeted",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	archivedReplayAgent := testutil.RequireType[map[string]any](t, archivedReplay["agent"])
+	if len(archivedReplay) != 1 ||
+		archivedReplayAgent["id"] != retargetedAgentID ||
+		archivedReplayAgent["state"] != "archived" {
+		t.Fatalf("archived agent launch replay = %+v, want current archived agent", archivedReplay)
+	}
+	profileOnly := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents",
+		`{"profile":"`+profileID+`"}`,
+		"idem-agent-launch-profile-only",
+		http.StatusCreated,
+		authHeaders(project.AdminToken),
+	)
+	profileOnlyAgent := testutil.RequireType[map[string]any](t, profileOnly["agent"])
+	if profileOnlyAgent["current_config_id"] != retargetedConfigID || profileOnlyAgent["agent_profile_id"] != profileID {
+		t.Fatalf("profile-only launch should run the profile's current config: %+v", profileOnlyAgent)
+	}
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents",
+		`{}`,
+		"idem-agent-launch-missing-config",
+		http.StatusBadRequest,
+		authHeaders(project.AdminToken),
+	)
+
+	other, err := store.Execution().LaunchAgent(
+		ctx,
+		executionstore.LaunchAgentInput{
+			ProjectID: project.ProjectUUID,
+			ProfileID: mustPublicHTTPID(
+				t,
+				publicid.KindAgentProfile,
+				profileID,
+			),
+			AgentConfigID: mustPublicHTTPID(
+				t,
+				publicid.KindAgentConfig,
+				configID,
+			),
+			LaunchedBy:     httpUserPrincipal(project.AdminUserUUID),
+			IdempotencyKey: "idem-agent-launch-storage-same-config",
+		},
+	)
+	if err != nil {
+		t.Fatalf("second storage launch from same config: %v", err)
+	}
+	if other.AgentConfig.ID != mustPublicHTTPID(
+		t,
+		publicid.KindAgentConfig,
+		configID,
+	) {
+		t.Fatalf(
+			"one config should back many agents without changing config pin: %+v",
+			other,
+		)
+	}
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodDelete,
+		project.ProjectPath+"/agent-profiles/"+profileID,
+		"",
+		"idem-agent-profile-delete",
+		http.StatusBadRequest,
+		authHeaders(project.AdminToken),
+	)
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodDelete,
+		project.ProjectPath+"/agent-profiles/"+profileID,
+		"",
+		"",
+		http.StatusNoContent,
+		authHeaders(project.AdminToken),
+	)
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agent-profiles/"+profileID,
+		``,
+		"",
+		http.StatusNotFound,
+		authHeaders(project.AdminToken),
+	)
+	otherAgentID, err := publicid.Encode(publicid.KindAgent, other.Agent.ID)
+	if err != nil {
+		t.Fatalf("encode other agent id: %v", err)
+	}
+	launchedAfterDelete := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodGet,
+		project.ProjectPath+"/agents/"+otherAgentID,
+		``,
+		"",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	launchedAfterDeleteAgent := testutil.RequireType[map[string]any](t, launchedAfterDelete["agent"])
+	if launchedAfterDeleteAgent["id"] != otherAgentID || launchedAfterDeleteAgent["state"] != "active" {
+		t.Fatalf(
+			"profile deletion should not delete launched agents: %+v",
+			launchedAfterDelete,
+		)
+	}
+}
+
+func TestPublicAgentConfigChangeAcceptsLiveMCPDiff(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+
+	handler := newIntegrationServer(pool)
+	project := bootstrapPublicHTTPProject(t, handler, "agent-config-live-policy")
+	sourceYAML := "instruction: Original instruction.\nmodel:\n  provider_config: openai-prod\n  name: gpt-test\n"
+	config := createPublicHTTPAgentConfig(
+		t,
+		handler,
+		project,
+		"config-policy",
+		"yaml",
+		sourceYAML,
+		project.AdminToken,
+		http.StatusCreated,
+	)
+	profile := createPublicHTTPAgentProfile(
+		t,
+		handler,
+		project,
+		"config-policy",
+		"Config Policy",
+		testutil.RequireType[string](t, config["id"]),
+		project.AdminToken,
+		http.StatusCreated,
+	)
+	profileID := testutil.RequireType[string](t, profile["id"])
+	configID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, profile["current_config"])["id"])
+	launched := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents",
+		`{"profile":"`+profileID+`","config":"`+configID+`"}`,
+		"idem-config-policy-agent",
+		http.StatusCreated,
+		authHeaders(project.AdminToken),
+	)
+	agentID := testutil.RequireType[string](t, testutil.RequireType[map[string]any](t, launched["agent"])["id"])
+	changedYAML := `instruction: Add MCP.
+model:
+  provider_config: openai-prod
+  name: gpt-test
+mcp:
+  docs:
+    url: https://mcp.example.com
+`
+	response := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agents/"+agentID+"/config",
+		`{"source_format":"yaml","source":`+quotedJSONString(changedYAML)+`}`,
+		"idem-config-policy-mcp-change",
+		http.StatusOK,
+		authHeaders(project.AdminToken),
+	)
+	if response["agent_config"] == nil || response["agent_input"] == nil {
+		t.Fatalf("unexpected config change response: %+v", response)
+	}
+}
+
+func TestPublicAgentProfilesRejectSourceAuthoring(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+
+	handler := newIntegrationServer(pool)
+	project := bootstrapPublicHTTPProject(t, handler, "agent-profile-bookmark-only")
+	sourceYAML := "instruction: Profiles point to configs.\nmodel:\n  provider_config: openai-prod\n  name: gpt-test\n"
+	config := createPublicHTTPAgentConfig(
+		t,
+		handler,
+		project,
+		"agent-profile-bookmark-only",
+		"yaml",
+		sourceYAML,
+		project.AdminToken,
+		http.StatusCreated,
+	)
+	profile := createPublicHTTPAgentProfile(
+		t,
+		handler,
+		project,
+		"agent-profile-bookmark-only",
+		"Bookmark Only",
+		testutil.RequireType[string](t, config["id"]),
+		project.AdminToken,
+		http.StatusCreated,
+	)
+
+	createResponse := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agent-profiles",
+		`{"name":"Old Shape","source_format":"yaml","source":`+quotedJSONString(
+			sourceYAML,
+		)+`}`,
+		"idem-agent-profile-old-create",
+		http.StatusBadRequest,
+		authHeaders(project.AdminToken),
+	)
+	if errText, _ := createResponse["error"].(string); !strings.Contains(errText, "unsupported") {
+		t.Fatalf(
+			"profile create should reject source fields as unknown: %+v",
+			createResponse,
+		)
+	}
+	updateResponse := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agent-profiles/"+testutil.RequireType[string](t, profile["id"])+"/config",
+		`{"source_format":"yaml","source":`+quotedJSONString(
+			sourceYAML,
+		)+`,"expected_current_config_id":"`+testutil.RequireType[string](t, config["id"])+`"}`,
+		"idem-agent-profile-old-retarget",
+		http.StatusBadRequest,
+		authHeaders(project.AdminToken),
+	)
+	if errText, _ := updateResponse["error"].(string); !strings.Contains(errText, "unsupported") {
+		t.Fatalf(
+			"profile retarget should reject source fields as unknown: %+v",
+			updateResponse,
+		)
+	}
+
+	missingConfigID := testPublicID(
+		t,
+		publicid.KindAgentConfig,
+		httpTestID("missing-agent-profile-config"),
+	)
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agent-profiles",
+		`{"name":"Missing Config","config":"`+missingConfigID+`"}`,
+		"idem-agent-profile-missing-config",
+		http.StatusNotFound,
+		authHeaders(project.AdminToken),
+	)
+	requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		project.ProjectPath+"/agent-profiles/"+testutil.RequireType[string](t, profile["id"])+"/config",
+		`{"config":"`+missingConfigID+`","expected_current_config_id":"`+testutil.RequireType[string](t, config["id"])+`"}`,
+		"idem-agent-profile-retarget-missing-config",
+		http.StatusNotFound,
+		authHeaders(project.AdminToken),
+	)
+}
+
+func TestPublicAgentConfigValidatesMCPAuthSecretReferences(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+
+	handler := newIntegrationServer(pool)
+	project := bootstrapPublicHTTPProject(t, handler, "agent-config-mcp-auth")
+
+	genericSecret := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		"/api/v1/orgs/"+project.OrgID+"/secrets",
+		`{"owner":{"kind":"project","project_id":"`+project.ProjectID+`"},"name":"github-bearer","material":{"kind":"generic","value":"gh-token"}}`,
+		"",
+		http.StatusCreated,
+		authHeaders(project.AdminToken),
+	)
+	oauthSecret := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		"/api/v1/orgs/"+project.OrgID+"/secrets",
+		`{"owner":{"kind":"project","project_id":"`+project.ProjectID+`"},"name":"github-oauth","material":{"kind":"oauth_token_set","access_token":"gh-access"}}`,
+		"",
+		http.StatusCreated,
+		authHeaders(project.AdminToken),
+	)
+	orgSecret := requestJSONWithHeaders(
+		t,
+		handler,
+		http.MethodPost,
+		"/api/v1/orgs/"+project.OrgID+"/secrets",
+		`{"owner":{"kind":"org"},"name":"ungranted-bearer","material":{"kind":"generic","value":"org-token"}}`,
+		"",
+		http.StatusCreated,
+		authHeaders(project.AdminToken),
+	)
+
+	bearerSource := "instruction: Use authenticated MCP.\n" +
+		"model:\n" +
+		"  provider_config: openai-prod\n" +
+		"  name: gpt-test\n" +
+		"mcp:\n" +
+		"  github:\n" +
+		"    url: https://api.githubcopilot.com/mcp\n" +
+		"    auth:\n" +
+		"      type: bearer\n" +
+		"      secret_id: " + testutil.RequireType[string](t, genericSecret["id"]) + "\n"
+	createPublicHTTPAgentConfig(
+		t,
+		handler,
+		project,
+		"mcp-auth-bearer",
+		"yaml",
+		bearerSource,
+		project.AdminToken,
+		http.StatusCreated,
+	)
+
+	oauthSource := "instruction: Use authenticated MCP.\n" +
+		"model:\n" +
+		"  provider_config: openai-prod\n" +
+		"  name: gpt-test\n" +
+		"mcp:\n" +
+		"  github:\n" +
+		"    url: https://api.githubcopilot.com/mcp\n" +
+		"    auth:\n" +
+		"      type: oauth\n" +
+		"      secret_id: " + testutil.RequireType[string](t, oauthSecret["id"]) + "\n"
+	createPublicHTTPAgentConfig(
+		t,
+		handler,
+		project,
+		"mcp-auth-oauth",
+		"yaml",
+		oauthSource,
+		project.AdminToken,
+		http.StatusCreated,
+	)
+
+	wrongKindSource := "instruction: Use authenticated MCP.\n" +
+		"model:\n" +
+		"  provider_config: openai-prod\n" +
+		"  name: gpt-test\n" +
+		"mcp:\n" +
+		"  github:\n" +
+		"    url: https://api.githubcopilot.com/mcp\n" +
+		"    auth:\n" +
+		"      type: oauth\n" +
+		"      secret_id: " + testutil.RequireType[string](t, genericSecret["id"]) + "\n"
+	createPublicHTTPAgentConfig(
+		t,
+		handler,
+		project,
+		"mcp-auth-wrong-kind",
+		"yaml",
+		wrongKindSource,
+		project.AdminToken,
+		http.StatusBadRequest,
+	)
+
+	ungrantedSource := "instruction: Use authenticated MCP.\n" +
+		"model:\n" +
+		"  provider_config: openai-prod\n" +
+		"  name: gpt-test\n" +
+		"mcp:\n" +
+		"  github:\n" +
+		"    url: https://api.githubcopilot.com/mcp\n" +
+		"    auth:\n" +
+		"      type: bearer\n" +
+		"      secret_id: " + testutil.RequireType[string](t, orgSecret["id"]) + "\n"
+	createPublicHTTPAgentConfig(
+		t,
+		handler,
+		project,
+		"mcp-auth-ungranted",
+		"yaml",
+		ungrantedSource,
+		project.AdminToken,
+		http.StatusBadRequest,
+	)
+}
+
+func TestPublicAgentConfigAcceptsJSONSource(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+
+	handler := newIntegrationServer(pool)
+	project := bootstrapPublicHTTPProject(t, handler, "agent-config-json-source")
+	sourceJSON := "{\n  \"instruction\": \"Configured from <JSON> & text.\",\n" +
+		"  \"model\": {\"provider_config\": \"openai-prod\", \"name\": \"gpt-test\"}\n}\n"
+
+	config := createPublicHTTPAgentConfig(
+		t,
+		handler,
+		project,
+		"agent-config-json-source",
+		"json",
+		sourceJSON,
+		project.AdminToken,
+		http.StatusCreated,
+	)
+	if config["source_format"] != "json" || config["source"] != sourceJSON {
+		t.Fatalf("JSON text config source was not stored verbatim: %+v", config)
+	}
+	if _, ok := config["definition"]; ok {
+		t.Fatalf("agent config responses should return source, not definition: %+v", config)
+	}
+	model := testutil.RequireType[map[string]any](t, config["model"])
+	if model["provider_config"] != "openai-prod" || model["name"] != "gpt-test" || config["instruction_hash"] == "" {
+		t.Fatalf("JSON-authored config did not compile into runtime projection: %+v", config)
+	}
+}
+
+func TestPublicAgentLaunchQuotaErrorMessage(t *testing.T) {
+	ctx := t.Context()
+	pool := openIntegrationDB(t, ctx)
+	handler := newIntegrationServer(pool)
+	project := bootstrapPublicHTTPProject(t, handler, "launch-quota")
+	config := createPublicHTTPAgentConfig(t, handler, project, "launch-quota", "yaml",
+		"instruction: Help.\nmodel:\n  provider_config: openai-prod\n  name: gpt-test\n",
+		project.AdminToken, http.StatusCreated)
+	orgID, err := publicid.Decode(publicid.KindOrganization, project.OrgID)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `INSERT INTO org_resource_limit_overrides(org_id,max_active_agents_per_project)
+VALUES($1,0)`, orgID)
+	require.NoError(t, err)
+	response := requestJSONWithHeaders(t, handler, http.MethodPost, project.ProjectPath+"/agents",
+		`{"config":"`+testutil.RequireType[string](t, config["id"])+`"}`, "quota",
+		http.StatusConflict, authHeaders(project.AdminToken))
+	require.Equal(t, "conflict", response["code"])
+	require.Equal(t, "conflict: active agents limit of 0 reached: resource conflict", response["error"])
+}
+
+func TestPublicAgentConfigAcceptsJSONObjectSource(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+
+	handler := newIntegrationServer(pool)
+	project := bootstrapPublicHTTPProject(t, handler, "agent-config-object-source")
+	create := func(body, idempotencyKey string, status int) map[string]any {
+		t.Helper()
+		return requestJSONWithHeaders(
+			t, handler, http.MethodPost, project.ProjectPath+"/agent-configs", body,
+			idempotencyKey, status, authHeaders(project.AdminToken),
+		)
+	}
+
+	objectSource := `{"instruction":"Configured from an object.","model":{"provider_config":"openai-prod","name":"gpt-test"}}`
+	config := create(
+		`{"source_format":"json","source":`+objectSource+`}`,
+		"idem-object-source", http.StatusCreated,
+	)
+	if config["source_format"] != "json" || config["source"] != objectSource {
+		t.Fatalf("JSON object config source was not stored verbatim: %+v", config)
+	}
+	again := create(
+		`{"source_format":"json","source":`+objectSource+`}`,
+		"idem-object-source-again", http.StatusOK,
+	)
+	if again["id"] != config["id"] {
+		t.Fatalf("identical JSON object should return config %v, got %+v", config["id"], again)
+	}
+	reorderedSource := `{ "model": {"name": "gpt-test", "provider_config": "openai-prod"},` +
+		` "instruction": "Configured from an object." }`
+	reordered := create(
+		`{"source": `+reorderedSource+`, "source_format": "json"}`,
+		"idem-object-source-reordered", http.StatusCreated,
+	)
+	if reordered["id"] == config["id"] || reordered["source"] != reorderedSource ||
+		reordered["effective_definition_hash"] != config["effective_definition_hash"] {
+		t.Fatalf("reordered JSON object should be a new version sharing %v's definition, got %+v", config["id"], reordered)
+	}
+	textSource := "{\n  \"model\": {\"provider_config\": \"openai-prod\", \"name\": \"gpt-test\"},\n" +
+		"  \"instruction\": \"Configured from an object.\"\n}\n"
+	asText := create(
+		`{"source_format":"json","source":`+quotedJSONString(textSource)+`}`,
+		"idem-object-source-as-text", http.StatusCreated,
+	)
+	if asText["id"] == config["id"] || asText["source"] != textSource ||
+		asText["effective_definition_hash"] != config["effective_definition_hash"] {
+		t.Fatalf("formatted JSON text should be a new version sharing %v's definition, got %+v", config["id"], asText)
+	}
+
+	sourceYAML := "instruction: Configured from YAML.\nmodel:\n  provider_config: openai-prod\n  name: gpt-test\n"
+	for name, body := range map[string]string{
+		"missing source":        `{"source_format":"json"}`,
+		"missing source_format": `{"source":{"instruction":"x"}}`,
+		"object with yaml": `{"source_format":"yaml","source":` +
+			`{"instruction":"x","model":{"provider_config":"openai-prod","name":"gpt-test"}}}`,
+		"array source":  `{"source_format":"json","source":[]}`,
+		"null source":   `{"source_format":"json","source":null}`,
+		"unknown field": `{"source_format":"yaml","source":` + quotedJSONString(sourceYAML) + `,"definition":{}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			create(body, "", http.StatusBadRequest)
+		})
+	}
+
+	invalid := create(
+		`{"source_format":"json","source":{"instruction":"x","model":{"provider_config":"openai-prod","name":"gpt-test"},`+
+			`"tools":{"run_command":{"enabled":"nope"}}}}`,
+		"", http.StatusBadRequest,
+	)
+	issues := testutil.RequireType[[]any](t, invalid["issues"])
+	if len(issues) == 0 || testutil.RequireType[map[string]any](t, issues[0])["path"] != "/tools/run_command/enabled" {
+		t.Fatalf("invalid JSON object should report compiler issues by path: %+v", invalid)
+	}
+
+	yamlConfig := createPublicHTTPAgentConfig(
+		t, handler, project, "agent-config-object-source-yaml", "yaml", sourceYAML,
+		project.AdminToken, http.StatusCreated,
+	)
+	if yamlConfig["source"] != sourceYAML || yamlConfig["source_format"] != "yaml" {
+		t.Fatalf("YAML source should be stored verbatim: %+v", yamlConfig)
+	}
+}
+
+func TestPublicAgentLaunchCombinesProfileWithAnyConfig(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+
+	handler := newIntegrationServer(pool)
+	project := bootstrapPublicHTTPProject(t, handler, "agent-launch-profile-combos")
+	profileConfig := createPublicHTTPAgentConfig(
+		t, handler, project, "agent-launch-profile-combos-profile", "yaml",
+		"instruction: Profile default.\nmodel:\n  provider_config: openai-prod\n  name: gpt-test\n",
+		project.AdminToken, http.StatusCreated,
+	)
+	profile := createPublicHTTPAgentProfile(
+		t, handler, project, "agent-launch-profile-combos", "Profile Combos",
+		testutil.RequireType[string](t, profileConfig["id"]), project.AdminToken, http.StatusCreated,
+	)
+	profileID := testutil.RequireType[string](t, profile["id"])
+	unrelatedConfig := createPublicHTTPAgentConfig(
+		t, handler, project, "agent-launch-profile-combos-unrelated", "yaml",
+		"instruction: Not a profile version.\nmodel:\n  provider_config: openai-prod\n  name: gpt-test\n",
+		project.AdminToken, http.StatusCreated,
+	)
+	unrelatedConfigID := testutil.RequireType[string](t, unrelatedConfig["id"])
+	launch := func(body, idempotencyKey string, status int) map[string]any {
+		t.Helper()
+		return requestJSONWithHeaders(
+			t, handler, http.MethodPost, project.ProjectPath+"/agents", body,
+			idempotencyKey, status, authHeaders(project.AdminToken),
+		)
+	}
+
+	custom := testutil.RequireType[map[string]any](t, launch(
+		`{"profile":"`+profileID+`","config":"`+unrelatedConfigID+`"}`, "idem-combo-custom", http.StatusCreated,
+	)["agent"])
+	if custom["agent_profile_id"] != profileID || custom["current_config_id"] != unrelatedConfigID {
+		t.Fatalf("profile + unrelated config should attribute to profile and run that config: %+v", custom)
+	}
+
+	inlineBody := `{"profile":"` + profileID + `","config_source":{"source_format":"json","source":` +
+		`{"instruction":"Inline override.","model":{"provider_config":"openai-prod","name":"gpt-test"}}}}`
+	operatorToken := createHTTPProjectMemberToken(t, ctx, pool, project, "agent-launch-combos-operator", "operator")
+	requestJSONWithHeaders(
+		t, handler, http.MethodPost, project.ProjectPath+"/agents", inlineBody,
+		"idem-combo-inline-operator", http.StatusForbidden, authHeaders(operatorToken),
+	)
+	inline := launch(inlineBody, "idem-combo-inline", http.StatusCreated)
+	inlineAgent := testutil.RequireType[map[string]any](t, inline["agent"])
+	inlineConfig := testutil.RequireType[map[string]any](t, inline["agent_config"])
+	const inlineSource = `{"instruction":"Inline override.",` +
+		`"model":{"provider_config":"openai-prod","name":"gpt-test"}}`
+	if inlineAgent["agent_profile_id"] != profileID ||
+		inlineAgent["current_config_id"] == profileConfig["id"] ||
+		inlineAgent["current_config_id"] != inlineConfig["id"] ||
+		inlineConfig["source"] != inlineSource {
+		t.Fatalf("profile + config_source should launch a new config attributed to the profile: %+v", inline)
+	}
+
+	yamlOnly := testutil.RequireType[map[string]any](t, launch(
+		`{"config_source":{"source_format":"yaml","source":`+quotedJSONString(
+			"instruction: Inline YAML.\nmodel:\n  provider_config: openai-prod\n  name: gpt-test\n",
+		)+`}}`,
+		"idem-combo-yaml-only", http.StatusCreated,
+	)["agent"])
+	if _, ok := yamlOnly["agent_profile_id"]; ok {
+		t.Fatalf("config_source-only launch should not be attributed to a profile: %+v", yamlOnly)
+	}
+	replayed := testutil.RequireType[map[string]any](t, launch(
+		`{"config_source":{"source_format":"yaml","source":`+quotedJSONString(
+			"instruction: Inline YAML.\nmodel:\n  provider_config: deleted-provider\n  name: gpt-test\n",
+		)+`}}`,
+		"idem-combo-yaml-only", http.StatusOK,
+	)["agent"])
+	if replayed["id"] != yamlOnly["id"] {
+		t.Fatalf("idempotent config_source retry should replay agent %v, got %+v", yamlOnly["id"], replayed)
+	}
+
+	launch(
+		`{"config":"`+unrelatedConfigID+`","config_source":{"source_format":"yaml","source":"instruction: x"}}`,
+		"idem-combo-both", http.StatusBadRequest,
+	)
+	invalid := launch(
+		`{"profile":"`+profileID+`","config_source":{"source_format":"json","source":{"instruction":"x"}}}`,
+		"idem-combo-invalid", http.StatusBadRequest,
+	)
+	if _, ok := invalid["issues"]; !ok {
+		t.Fatalf("invalid config_source should report compiler issues: %+v", invalid)
+	}
+	for format, source := range map[string]string{
+		"json": `{"instruction":"Bad \u0000 byte.","model":{"provider_config":"openai-prod","name":"gpt-test"}}`,
+		"yaml": `"instruction: \"Bad \\0 byte.\"\nmodel:\n  provider_config: openai-prod\n  name: gpt-test\n"`,
+	} {
+		nul := launch(
+			`{"profile":"`+profileID+`","config_source":{"source_format":"`+format+`","source":`+source+`}}`,
+			"idem-combo-nul-"+format, http.StatusBadRequest,
+		)
+		if message, _ := nul["error"].(string); !strings.Contains(message, "U+0000") {
+			t.Fatalf("%s config_source with U+0000 should be rejected as invalid: %+v", format, nul)
+		}
+	}
+}
+
+func TestPublicAgentLaunchRetargetExhaustion(t *testing.T) {
+	ctx := t.Context()
+	pool := openIntegrationDB(t, ctx)
+	handler := newIntegrationServer(pool)
+	project := bootstrapPublicHTTPProject(t, handler, "launch-retarget")
+	first := createPublicHTTPAgentConfig(t, handler, project, "retarget-first", "yaml",
+		"instruction: First.\nmodel:\n  provider_config: openai-prod\n  name: gpt-test\n",
+		project.AdminToken, http.StatusCreated)
+	second := createPublicHTTPAgentConfig(t, handler, project, "retarget-second", "yaml",
+		"instruction: Second.\nmodel:\n  provider_config: openai-prod\n  name: gpt-test\n",
+		project.AdminToken, http.StatusCreated)
+	firstID, err := publicid.Decode(publicid.KindAgentConfig, testutil.RequireType[string](t, first["id"]))
+	require.NoError(t, err)
+	secondID, err := publicid.Decode(publicid.KindAgentConfig, testutil.RequireType[string](t, second["id"]))
+	require.NoError(t, err)
+	profile := createPublicHTTPAgentProfile(t, handler, project, "retarget", "Retarget",
+		testutil.RequireType[string](t, first["id"]), project.AdminToken, http.StatusCreated)
+	profileID, err := publicid.Decode(publicid.KindAgentProfile, testutil.RequireType[string](t, profile["id"]))
+	require.NoError(t, err)
+	store := newIntegrationStore(pool)
+	current, next := firstID, secondID
+	var attempts atomic.Int32
+	trace := &integrationdb.QueryTrace{OnQuery: func(sql string) {
+		if !strings.HasPrefix(sql, "-- name: LockAgentProfileForLaunch ") {
+			return
+		}
+		attempts.Add(1)
+		_, retargetErr := store.Execution().RetargetAgentProfile(ctx, executionstore.RetargetAgentProfileInput{
+			ProjectID: project.ProjectUUID, ProfileID: profileID, ExpectedCurrentConfigID: current, ConfigID: next,
+		})
+		require.NoError(t, retargetErr)
+		current, next = next, current
+	}}
+	handler = newIntegrationServer(poolWithQueryTracer(t, ctx, pool, trace))
+	response := requestJSONWithHeaders(t, handler, http.MethodPost, project.ProjectPath+"/agents",
+		`{"profile":"`+testutil.RequireType[string](t, profile["id"])+`"}`, "retarget",
+		http.StatusConflict, authHeaders(project.AdminToken))
+	require.Equal(t, "conflict", response["code"])
+	require.Equal(t, "conflict: agent profile changed during launch; retry: resource conflict", response["error"])
+	require.EqualValues(t, 3, attempts.Load())
+	var count int
+	require.NoError(t, pool.QueryRow(ctx,
+		"SELECT count(*) FROM agents WHERE project_id=$1", project.ProjectUUID).Scan(&count))
+	require.Zero(t, count)
+}

@@ -1,0 +1,48 @@
+{
+  "$schema": "https://react.doctor/schema/config.json",
+  "ignore": {
+    "overrides": [
+      {
+        "files": ["src/domains/scoped-mutation.ts"],
+        "rules": ["react-doctor/query-mutation-missing-invalidation"]
+      },
+      {
+        "files": ["src/components/agents/AgentConfigYamlEditor.tsx"],
+        "rules": ["react-doctor/prefer-dynamic-import"]
+      },
+      {
+        "files": ["src/components/active-org/ActiveOrgProvider.tsx"],
+        "rules": ["react-doctor/no-event-handler"]
+      },
+      {
+        // Mirrors the oxlint override: the CLI command manifest is one declarative table.
+        "files": ["src/manifest.ts"],
+        "rules": ["eslint/max-lines"]
+      },
+      {
+        "files": ["src/domains/skills.ts"],
+        "rules": ["react-doctor/async-await-in-loop"]
+      },
+      {
+        // Vitest loads happy-dom through @vitest-environment control comments.
+        "files": ["package.json"],
+        "rules": ["deslop/unused-dev-dependency"]
+      },
+      {
+        "files": [
+          "src/components/agents/AgentConfigMachineSourceComboboxes.tsx",
+          "src/components/agents/AgentConfigMachineSourcesField.tsx",
+          "src/components/agents/AgentConfigModelField.tsx",
+          "src/components/agents/AgentConfigSkillsField.tsx",
+          "src/components/agents/useAgentConfigEditor.ts"
+        ],
+        "rules": [
+          "react-doctor/no-pass-data-to-parent",
+          "react-doctor/no-pass-live-state-to-parent",
+          "react-doctor/no-prop-callback-in-effect"
+        ]
+      }
+    ]
+  },
+  "projects": ["packages/react", "apps/web"]
+}

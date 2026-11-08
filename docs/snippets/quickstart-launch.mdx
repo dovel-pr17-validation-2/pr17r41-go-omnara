@@ -1,0 +1,42 @@
+<CodeGroup>
+```bash CLI
+npx omnara agents launch --file agent.yaml \
+  --name "Machine assistant" \
+  --message "Use your machine to report the operating system and the free disk space. Then find the latest stable Node.js release on the web and tell me the version."
+
+# or upload the config as a reusable profile instead:
+npx omnara profiles create --name machine-assistant --file agent.yaml
+```
+
+```bash REST
+export AGENT="$(
+  jq -n --rawfile src agent.yaml '{
+    config_source: {source: $src, source_format: "yaml"},
+    name: "Machine assistant",
+    message: "Use your machine to report the operating system and the free disk space. Then find the latest stable Node.js release on the web and tell me the version."
+  }' |
+  curl -fsS "$OMNARA_API/orgs/$ORG/projects/$PROJ/agents" \
+    -H "Authorization: Bearer $OMNARA_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d @- |
+  jq -r '.agent.id'
+)"
+```
+
+```typescript SDK
+import { readFile } from 'node:fs/promises'
+
+const source = await readFile('agent.yaml', 'utf8')
+
+const launched = await sdk.createAgent({
+  client,
+  path: { orgID, projectID },
+  body: {
+    config_source: { source, source_format: 'yaml' },
+    name: 'Machine assistant',
+    message: 'Use your machine to report the operating system and the free disk space. Then find the latest stable Node.js release on the web and tell me the version.',
+  },
+})
+const agentID = launched.data.agent.id
+```
+</CodeGroup>

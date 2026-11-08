@@ -1,0 +1,477 @@
+//go:build integration
+
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/omnara-ai/omnara/internal/storage/executionstore"
+	"github.com/stretchr/testify/require"
+)
+
+func TestMachineFailureRoute(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pool := openIntegrationDB(t, ctx)
+	store := newIntegrationStore(pool)
+	handler := newIntegrationHTTPHandler(mustNewServer(t, store).Handler(), pool, store)
+	project := bootstrapPublicHTTPProject(t, handler, "machine-failure-report")
+	now := time.Now().UTC()
+
+	var machinePoolID uuid.UUID
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO machine_pools(
+			org_id, name, management_kind, provider, default_machine_memory_mb,
+			provider_auth_env_var, max_total_machines, max_total_memory_mb,
+			max_machine_memory_mb, created_at, updated_at
+		)
+		VALUES ($1, 'machine-failure-report', 'cluster', 'test', 1024,
+			'TEST_PROVIDER_TOKEN', 1, 1024, 1024, $2, $2)
+		RETURNING id
+	`, project.OrgUUID, now).Scan(&machinePoolID); err != nil {
+		t.Fatalf("insert machine pool fixture: %v", err)
+	}
+	var machineID uuid.UUID
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO machines(
+			org_id, machine_pool_id, source_kind, display_name, provider, lifecycle_state,
+			lifecycle_changed_at, memory_mb, cwd, env, secret_env, provider_options, metadata,
+			next_reconcile_after, provision_attempts, created_at, updated_at
+		)
+		VALUES ($1, $2, 'pool', 'failure report machine', 'test', 'provisioning',
+			$3, 1024, '', '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+			$3, 1, $3, $3)
+		RETURNING id
+	`, project.OrgUUID, machinePoolID, now).Scan(&machineID); err != nil {
+		t.Fatalf("insert provisioning machine fixture: %v", err)
+	}
+	provisioning, err := store.Execution().BeginPoolMachineProviderProvisioning(
+		ctx,
+		executionstore.BeginPoolMachineProviderProvisioningInput{
+			OrgID:            project.OrgUUID,
+			MachineID:        machineID,
+			ProvisionAttempt: 1,
+			TokenName:        "failure reporter",
+		},
+	)
+	if err != nil {
+		t.Fatalf("begin provider provisioning: %v", err)
+	}
+	path := "/api/v1/daemon/failures"
+	requestFailure := func(stage string, exitStatus, captureStatus int, output, token string, wantStatus int) {
+		t.Helper()
+		req := httptest.NewRequest(
+			http.MethodPost,
+			fmt.Sprintf(
+				"%s?stage=%s&exit_status=%d&capture_status=%d",
+				path,
+				stage,
+				exitStatus,
+				captureStatus,
+			),
+			strings.NewReader(output),
+		)
+		req.Header.Set("Content-Type", "text/plain")
+		for key, value := range authHeaders(token) {
+			req.Header.Set(key, value)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != wantStatus {
+			t.Fatalf("failure request status=%d want=%d body=%s", rec.Code, wantStatus, rec.Body.String())
+		}
+	}
+	firstOutput := "zfirst\x00\xff" + strings.Repeat(
+		"x",
+		executionstore.MaxMachineFailureReportOutputBytes-len("first\x00\xff"),
+	)
+	requestFailure("startup_script", 7, 0, firstOutput, provisioning.DaemonToken.Token, http.StatusNoContent)
+	var firstFailure []byte
+	if err := pool.QueryRow(
+		ctx,
+		`SELECT failure_report FROM machines WHERE org_id = $1 AND id = $2`,
+		project.OrgUUID,
+		machineID,
+	).Scan(&firstFailure); err != nil {
+		t.Fatalf("load failure report: %v", err)
+	}
+	var stored struct {
+		Stage           string    `json:"stage"`
+		ExitStatus      int       `json:"exit_status"`
+		OutputTail      string    `json:"output_tail"`
+		OutputTruncated bool      `json:"output_truncated"`
+		ReportedAt      time.Time `json:"reported_at"`
+	}
+	if err := json.Unmarshal(firstFailure, &stored); err != nil {
+		t.Fatalf("decode failure report: %v", err)
+	}
+	if stored.Stage != "startup_script" || stored.ExitStatus != 7 ||
+		len(stored.OutputTail) != executionstore.MaxMachineFailureReportOutputBytes ||
+		!strings.HasPrefix(stored.OutputTail, "first??") || strings.ContainsRune(stored.OutputTail, '\x00') ||
+		!stored.OutputTruncated || stored.ReportedAt.IsZero() {
+		t.Fatalf("stored failure report = %+v", stored)
+	}
+
+	requestFailure("daemon_install", 9, 0, "", provisioning.DaemonToken.Token, http.StatusNoContent)
+	var replayedFailure []byte
+	if err := pool.QueryRow(
+		ctx,
+		`SELECT failure_report FROM machines WHERE org_id = $1 AND id = $2`,
+		project.OrgUUID,
+		machineID,
+	).Scan(&replayedFailure); err != nil {
+		t.Fatalf("load replayed failure report: %v", err)
+	}
+	if err := json.Unmarshal(replayedFailure, &stored); err != nil {
+		t.Fatalf("decode replayed failure report: %v", err)
+	}
+	if stored.Stage != "daemon_install" || stored.ExitStatus != 9 || stored.OutputTail != "" ||
+		stored.OutputTruncated {
+		t.Fatalf("stored replayed failure report = %+v", stored)
+	}
+
+	requestFailure(
+		"startup_script",
+		7,
+		0,
+		strings.Repeat("x", executionstore.MaxMachineFailureReportOutputBytes+2),
+		provisioning.DaemonToken.Token,
+		http.StatusBadRequest,
+	)
+	requestFailure("bogus", 7, 0, "tail", provisioning.DaemonToken.Token, http.StatusBadRequest)
+	requestFailure("startup_script", 7, 0, "tail", "invalid-machine-token", http.StatusUnauthorized)
+
+	if _, err := store.Execution().RecordPoolMachineProvisioningResource(
+		ctx,
+		executionstore.RecordPoolMachineProvisioningResourceInput{
+			OrgID:              project.OrgUUID,
+			MachineID:          machineID,
+			ProviderResourceID: "bootstrap-failure-resource",
+			ProvisionAttempt:   1,
+		},
+	); err != nil {
+		t.Fatalf("record provider resource: %v", err)
+	}
+	if err := store.Execution().CompletePoolMachineProvisioning(
+		ctx,
+		project.OrgUUID,
+		machineID,
+		"bootstrap-failure-resource",
+		"",
+		1,
+	); err != nil {
+		t.Fatalf("complete provisioning: %v", err)
+	}
+	var activeFailure []byte
+	if err := pool.QueryRow(
+		ctx,
+		`SELECT failure_report FROM machines WHERE org_id = $1 AND id = $2`,
+		project.OrgUUID,
+		machineID,
+	).Scan(&activeFailure); err != nil {
+		t.Fatalf("load active machine failure report: %v", err)
+	}
+	if string(activeFailure) != string(replayedFailure) {
+		t.Fatalf("provisioning completion changed failure report: before=%s after=%s", replayedFailure, activeFailure)
+	}
+
+	byoMachine, err := store.Execution().CreateDaemonMachine(
+		ctx,
+		executionstore.CreateDaemonMachineInput{
+			OrgID:          project.OrgUUID,
+			DisplayName:    "BYO failure report machine",
+			IdempotencyKey: "byo-failure-report-machine",
+		},
+	)
+	if err != nil {
+		t.Fatalf("create BYO machine: %v", err)
+	}
+	byoTokenRecord, err := store.Execution().CreateBYOMachineDaemonToken(
+		ctx,
+		executionstore.CreateBYOMachineDaemonTokenInput{
+			OrgID:     project.OrgUUID,
+			MachineID: byoMachine.ID,
+			Name:      "failure reporter",
+		},
+	)
+	if err != nil {
+		t.Fatalf("create BYO machine token: %v", err)
+	}
+	byoToken := byoTokenRecord.Token
+	requestFailure("daemon_install", 11, 0, "BYO install failed", byoToken, http.StatusNoContent)
+	var byoFailure []byte
+	if err := pool.QueryRow(
+		ctx,
+		`SELECT failure_report FROM machines WHERE org_id = $1 AND id = $2`,
+		project.OrgUUID,
+		byoMachine.ID,
+	).Scan(&byoFailure); err != nil {
+		t.Fatalf("load BYO machine failure report: %v", err)
+	}
+	if err := json.Unmarshal(byoFailure, &stored); err != nil {
+		t.Fatalf("decode BYO machine failure report: %v", err)
+	}
+	if stored.Stage != "daemon_install" || stored.ExitStatus != 11 ||
+		stored.OutputTail != "BYO install failed" || stored.OutputTruncated || stored.ReportedAt.IsZero() {
+		t.Fatalf("stored BYO machine failure report = %+v", stored)
+	}
+
+	requestRawFailure := func(query, output, token string, wantStatus int) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, path+"?"+query, strings.NewReader(output))
+		req.Header.Set("Content-Type", "text/plain")
+		for key, value := range authHeaders(token) {
+			req.Header.Set(key, value)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != wantStatus {
+			t.Fatalf("failure request status=%d want=%d body=%s", rec.Code, wantStatus, rec.Body.String())
+		}
+	}
+	requestRawFailure(
+		"stage=daemon_update&daemon_version=1.2.3&target_version=1.3.0",
+		"staging: checksum mismatch",
+		byoToken,
+		http.StatusNoContent,
+	)
+	var updateFailure []byte
+	if err := pool.QueryRow(
+		ctx,
+		`SELECT failure_report FROM machines WHERE org_id = $1 AND id = $2`,
+		project.OrgUUID,
+		byoMachine.ID,
+	).Scan(&updateFailure); err != nil {
+		t.Fatalf("load daemon update failure report: %v", err)
+	}
+	var updateStored map[string]any
+	if err := json.Unmarshal(updateFailure, &updateStored); err != nil {
+		t.Fatalf("decode daemon update failure report: %v", err)
+	}
+	if updateStored["stage"] != "daemon_update" ||
+		updateStored["daemon_version"] != "1.2.3" ||
+		updateStored["target_version"] != "1.3.0" ||
+		updateStored["output_tail"] != "staging: checksum mismatch" {
+		t.Fatalf("stored daemon update failure report = %+v", updateStored)
+	}
+	if _, present := updateStored["exit_status"]; present {
+		t.Fatalf("daemon update failure report has exit_status: %+v", updateStored)
+	}
+	requestRawFailure(
+		"stage=daemon_update&daemon_version=1.2.3&exit_status=7",
+		"detail",
+		byoToken,
+		http.StatusBadRequest,
+	)
+	requestRawFailure("stage=daemon_update", "detail", byoToken, http.StatusBadRequest)
+	requestRawFailure("stage=daemon_update&daemon_version=bogus", "detail", byoToken, http.StatusBadRequest)
+	requestRawFailure("stage=startup_script&capture_status=0", "detail", byoToken, http.StatusBadRequest)
+
+	if _, err := store.Execution().RegisterDaemonRuntimeWithReconciliation(
+		ctx,
+		executionstore.RegisterDaemonRuntimeInput{
+			OrgID:            project.OrgUUID,
+			MachineID:        byoMachine.ID,
+			DaemonTokenID:    byoTokenRecord.Record.ID,
+			DaemonInstanceID: httpTestID("machine-failure-still-failing"),
+			DaemonVersion:    "1.2.3",
+			LeaseTimeout:     time.Hour,
+		},
+	); err != nil {
+		t.Fatalf("register same-version daemon runtime: %v", err)
+	}
+	var keptFailure []byte
+	if err := pool.QueryRow(
+		ctx,
+		`SELECT failure_report FROM machines WHERE org_id = $1 AND id = $2`,
+		project.OrgUUID,
+		byoMachine.ID,
+	).Scan(&keptFailure); err != nil {
+		t.Fatalf("load kept daemon update failure report: %v", err)
+	}
+	if string(keptFailure) != string(updateFailure) {
+		t.Fatalf("same-version registration changed failure report: before=%s after=%s", updateFailure, keptFailure)
+	}
+	updated, err := store.Execution().RegisterDaemonRuntimeWithReconciliation(
+		ctx,
+		executionstore.RegisterDaemonRuntimeInput{
+			OrgID:            project.OrgUUID,
+			MachineID:        byoMachine.ID,
+			DaemonTokenID:    byoTokenRecord.Record.ID,
+			DaemonInstanceID: httpTestID("machine-failure-updated"),
+			DaemonVersion:    "1.3.0",
+			LeaseTimeout:     time.Hour,
+		},
+	)
+	if err != nil {
+		t.Fatalf("register updated daemon runtime: %v", err)
+	}
+	var clearedFailure []byte
+	if err := pool.QueryRow(
+		ctx,
+		`SELECT failure_report FROM machines WHERE org_id = $1 AND id = $2`,
+		project.OrgUUID,
+		byoMachine.ID,
+	).Scan(&clearedFailure); err != nil {
+		t.Fatalf("load cleared daemon update failure report: %v", err)
+	}
+	if clearedFailure != nil {
+		t.Fatalf("updated-version registration kept failure report: %s", clearedFailure)
+	}
+	requestRawFailure("stage=daemon_uninstalled", "", byoToken, http.StatusForbidden)
+	requestRawFailure("stage=daemon_uninstalled", "detail", byoToken, http.StatusBadRequest)
+	requestRawFailure("stage=daemon_uninstalled&capture_status=1", "", byoToken, http.StatusBadRequest)
+	readFailure := func() []byte {
+		t.Helper()
+		var report []byte
+		require.NoError(t, pool.QueryRow(
+			ctx,
+			`SELECT failure_report FROM machines WHERE org_id = $1 AND id = $2`,
+			project.OrgUUID,
+			byoMachine.ID,
+		).Scan(&report))
+		return report
+	}
+	requestRawFailure(
+		"stage=daemon_runtime&capture_status=1", "fatal daemon output\nsignal: killed", byoToken, http.StatusNoContent,
+	)
+	runtimeFailure := readFailure()
+	var storedRuntimeFailure struct {
+		Stage         string    `json:"stage"`
+		OutputTail    string    `json:"output_tail"`
+		Truncated     bool      `json:"output_truncated"`
+		ReportedAt    time.Time `json:"reported_at"`
+		DaemonVersion *string   `json:"daemon_version"`
+	}
+	require.NoError(t, json.Unmarshal(runtimeFailure, &storedRuntimeFailure))
+	require.Equal(t, "daemon_runtime", storedRuntimeFailure.Stage)
+	require.Equal(t, "fatal daemon output\nsignal: killed", storedRuntimeFailure.OutputTail)
+	require.True(t, storedRuntimeFailure.Truncated)
+	require.False(t, storedRuntimeFailure.ReportedAt.IsZero())
+	require.Nil(t, storedRuntimeFailure.DaemonVersion)
+	for _, invalidQuery := range []string{"exit_status=7", "daemon_version=1.3.0", "target_version=1.4.0"} {
+		requestRawFailure("stage=daemon_runtime&"+invalidQuery, "invalid", byoToken, http.StatusBadRequest)
+		require.JSONEq(t, string(runtimeFailure), string(readFailure()))
+	}
+	_, err = store.Execution().RegisterDaemonRuntimeWithReconciliation(ctx, executionstore.RegisterDaemonRuntimeInput{
+		OrgID:            project.OrgUUID,
+		MachineID:        byoMachine.ID,
+		DaemonTokenID:    byoTokenRecord.Record.ID,
+		DaemonInstanceID: httpTestID("machine-runtime-failure-restarted"),
+		DaemonVersion:    "1.4.0",
+		LeaseTimeout:     time.Hour,
+	})
+	require.NoError(t, err)
+	require.JSONEq(t, string(runtimeFailure), string(readFailure()))
+	for _, report := range []struct {
+		stage  string
+		detail string
+	}{
+		{stage: "daemon_uninstall", detail: "remove service: permission denied"},
+		{stage: "daemon_uninstalled"},
+	} {
+		requestRawFailure("stage="+report.stage, report.detail, byoToken, http.StatusNoContent)
+		var stored struct {
+			Stage      string `json:"stage"`
+			OutputTail string `json:"output_tail"`
+		}
+		require.NoError(t, json.Unmarshal(readFailure(), &stored))
+		if stored.Stage != report.stage || stored.OutputTail != report.detail {
+			t.Fatalf("stored daemon uninstall report = %+v", stored)
+		}
+		updated, err = store.Execution().RegisterDaemonRuntimeWithReconciliation(
+			ctx,
+			executionstore.RegisterDaemonRuntimeInput{
+				OrgID:            project.OrgUUID,
+				MachineID:        byoMachine.ID,
+				DaemonTokenID:    byoTokenRecord.Record.ID,
+				DaemonInstanceID: httpTestID("machine-" + report.stage + "-cleared"),
+				DaemonVersion:    "1.3.0",
+				LeaseTimeout:     time.Hour,
+			},
+		)
+		require.NoError(t, err)
+		if failure := readFailure(); failure != nil {
+			t.Fatalf("runtime registration kept daemon uninstall report: %s", failure)
+		}
+		if report.stage == "daemon_uninstall" {
+			if _, err := store.Execution().EndDaemonRuntime(
+				ctx,
+				executionstore.DaemonRuntimeAuthority{
+					OrgID:           project.OrgUUID,
+					MachineID:       byoMachine.ID,
+					DaemonRuntimeID: updated.Runtime.ID,
+					DaemonTokenID:   byoTokenRecord.Record.ID,
+				},
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	machineRead, err := store.Execution().GetMachine(ctx, project.OrgUUID, byoMachine.ID)
+	if err != nil {
+		t.Fatalf("get online machine: %v", err)
+	}
+	if machineRead.ConnectionState != executionstore.MachineConnectionStateOnline ||
+		machineRead.ConnectionStateReason != "" {
+		t.Fatalf(
+			"machine connection = %s reason = %q",
+			machineRead.ConnectionState,
+			machineRead.ConnectionStateReason,
+		)
+	}
+	if _, err := pool.Exec(
+		ctx,
+		`UPDATE daemon_runtimes
+		 SET state = 'ended', ended_at = statement_timestamp(),
+		     state_reason_code = 'daemon_lease_expired'
+		 WHERE org_id = $1 AND id = $2`,
+		project.OrgUUID,
+		updated.Runtime.ID,
+	); err != nil {
+		t.Fatalf("expire daemon runtime lease: %v", err)
+	}
+	machineRead, err = store.Execution().GetMachine(ctx, project.OrgUUID, byoMachine.ID)
+	if err != nil {
+		t.Fatalf("get offline machine: %v", err)
+	}
+	if machineRead.ConnectionState != executionstore.MachineConnectionStateOffline ||
+		machineRead.ConnectionStateReason != "daemon_lease_expired" {
+		t.Fatalf(
+			"machine connection = %s reason = %q",
+			machineRead.ConnectionState,
+			machineRead.ConnectionStateReason,
+		)
+	}
+	replayed, err := store.Execution().CreateDaemonMachine(
+		ctx,
+		executionstore.CreateDaemonMachineInput{
+			OrgID:          project.OrgUUID,
+			DisplayName:    "BYO failure report machine",
+			IdempotencyKey: "byo-failure-report-machine",
+		},
+	)
+	if err != nil {
+		t.Fatalf("replay create BYO machine: %v", err)
+	}
+	if replayed.Created || replayed.ID != byoMachine.ID {
+		t.Fatalf("replay created new machine: created=%v id=%s want=%s", replayed.Created, replayed.ID, byoMachine.ID)
+	}
+	if replayed.ConnectionState != executionstore.MachineConnectionStateOffline ||
+		replayed.ConnectionStateReason != "daemon_lease_expired" {
+		t.Fatalf(
+			"replayed machine connection = %s reason = %q",
+			replayed.ConnectionState,
+			replayed.ConnectionStateReason,
+		)
+	}
+}

@@ -1,0 +1,493 @@
+package compaction
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/omnara-ai/omnara/internal/events"
+	"github.com/omnara-ai/omnara/internal/model"
+	"github.com/omnara-ai/omnara/internal/modelcontext"
+	"github.com/omnara-ai/omnara/internal/storage/executionstore"
+	"github.com/omnara-ai/omnara/internal/storage/storeerr"
+	"github.com/stretchr/testify/require"
+)
+
+func TestRunnerShrinksOversizedSourceBeforeProviderSend(t *testing.T) {
+	events := make([]executionstore.CompactionSourceEventRecord, 0, 8)
+	for sequence := int64(1); sequence <= 8; sequence++ {
+		events = append(events, textCompactionEvent(sequence, strings.Repeat("large event payload ", 180)))
+	}
+	store := &fakeStore{events: events}
+	client := &summaryModel{caps: model.Capabilities{
+		ContextWindowTokens:    8_000,
+		MaxOutputTokens:        new(1_024),
+		DefaultMaxOutputTokens: 1_024,
+	}}
+	compactionInput := runInput(testPlan(1, 8, 8))
+	result, err := testRunner(store, client).
+		RunClaimed(context.Background(), compactionInput, store.addStartedClaim(compactionInput))
+	if err != nil {
+		t.Fatalf("run oversized source: %v", err)
+	}
+	if result.State != RunCompleted || len(store.replacements) == 0 {
+		t.Fatalf("oversized result=%+v replacements=%+v", result, store.replacements)
+	}
+	if store.replacements[0].NextSourceEventSequenceEnd >= 8 ||
+		store.replacements[0].APIFormat != client.APIFormat() ||
+		store.replacements[0].APIVariant != client.ModelAPIVariant() ||
+		store.replacements[0].ProviderRequestID != "" ||
+		store.replacements[0].ProviderResponseID != "" {
+		t.Fatalf("preflight replacement = %+v", store.replacements[0])
+	}
+	if len(client.requests) != 1 {
+		t.Fatalf("provider requests = %d, want only the fitting replacement", len(client.requests))
+	}
+	var sent model.RequestPolicy
+	require.NoError(t, json.Unmarshal(client.requests[0].ProviderRequest, &sent))
+	require.Equal(t, 1_024, sent.MaxOutputTokens)
+}
+
+func TestRunnerRecordsBoundaryAdjustmentSeparatelyFromBudgetOverflow(t *testing.T) {
+	store := &fakeStore{events: []executionstore.CompactionSourceEventRecord{
+		textCompactionEvent(1, strings.Repeat("closed semantic event ", 20)),
+		mustCompactionEvent(
+			2,
+			string(events.KindContextCheckpoint),
+			"",
+			json.RawMessage(`[]`),
+		),
+	}}
+	compactionInput := runInput(testPlan(1, 2, 2))
+	result, err := testRunner(store, &summaryModel{}).
+		RunClaimed(context.Background(), compactionInput, store.addStartedClaim(compactionInput))
+	if err != nil {
+		t.Fatalf("run boundary adjustment: %v", err)
+	}
+	if result.State != RunCompleted || len(store.replacements) != 1 ||
+		store.replacements[0].NextSourceEventSequenceEnd != 1 ||
+		store.replacements[0].ErrorKind != model.ErrorKindInvalidRequest ||
+		store.replacements[0].ErrorCode != "compaction_source_boundary_adjustment" {
+		t.Fatalf("boundary adjustment result=%+v replacements=%+v", result, store.replacements)
+	}
+}
+
+func TestRunnerReplansWhenPublishFindsUnsafeBoundary(t *testing.T) {
+	store := &fakeStore{
+		events: []executionstore.CompactionSourceEventRecord{
+			textCompactionEvent(1, strings.Repeat("first closed event ", 20)),
+			textCompactionEvent(2, strings.Repeat("second closed event ", 20)),
+		},
+		publishErrs: []error{storeerr.ErrCheckpointBoundaryUnsafe},
+	}
+	client := &summaryModel{results: []summaryResult{
+		{response: completeSummaryResponse("Concise first summary.")},
+		{response: completeSummaryResponse("Concise replacement summary.")},
+	}}
+	compactionInput := runInput(testPlan(1, 2, 2))
+	result, err := testRunner(store, client).RunClaimed(
+		context.Background(), compactionInput, store.addStartedClaim(compactionInput),
+	)
+	if err != nil {
+		t.Fatalf("run publish-time boundary adjustment: %v", err)
+	}
+	if result.State != RunCompleted || len(store.replacements) != 1 ||
+		store.replacements[0].ErrorCode != "compaction_source_boundary_adjustment" ||
+		store.replacements[0].NextSourceEventSequenceEnd != 1 ||
+		store.replacements[0].APIFormat != client.APIFormat() ||
+		store.replacements[0].APIVariant != client.ModelAPIVariant() ||
+		len(client.requests) != 2 {
+		t.Fatalf(
+			"publish-time adjustment result=%+v replacements=%+v requests=%d",
+			result,
+			store.replacements,
+			len(client.requests),
+		)
+	}
+}
+
+func TestRunnerShrinksSourceWhenSerializedProviderRequestExceedsBudget(t *testing.T) {
+	store := &fakeStore{events: []executionstore.CompactionSourceEventRecord{
+		textCompactionEvent(1, strings.Repeat("first closed unit ", 40)),
+		textCompactionEvent(2, strings.Repeat("second closed unit ", 40)),
+	}}
+	client := &summaryModel{
+		caps: model.Capabilities{
+			ContextWindowTokens: 8_000,
+			MaxOutputTokens:     new(1_024),
+		},
+		preparedEstimate: func(input model.PrepareInput, body []byte) int {
+			if input.Context.ContextCheckpoint == nil &&
+				strings.Contains(string(body), "second closed unit") {
+				return 7_000
+			}
+			return 500
+		},
+	}
+	compactionInput := runInput(testPlan(1, 2, 2))
+	result, err := testRunner(store, client).
+		RunClaimed(context.Background(), compactionInput, store.addStartedClaim(compactionInput))
+	if err != nil {
+		t.Fatalf("run serialized oversized source: %v", err)
+	}
+	if result.State != RunCompleted || len(store.replacements) != 1 ||
+		store.replacements[0].ErrorCode != "compaction_source_over_budget" ||
+		store.replacements[0].NextSourceEventSequenceEnd != 1 ||
+		store.replacements[0].APIFormat != client.APIFormat() ||
+		store.replacements[0].APIVariant != client.ModelAPIVariant() ||
+		store.replacements[0].ProviderRequestID != "" ||
+		store.replacements[0].ProviderResponseID != "" {
+		t.Fatalf("serialized oversized result=%+v replacements=%+v", result, store.replacements)
+	}
+	if len(client.requests) != 1 ||
+		strings.Contains(string(client.requests[0].ProviderRequest), "second closed unit") {
+		t.Fatalf("provider requests = %+v, want one request without oversized source", client.requests)
+	}
+}
+
+func TestRunnerKeepsLaterAnswerAsBoundaryWitnessWithoutSummarizingToolGroup(t *testing.T) {
+	turnID := testIDN(810)
+	oldOutput := textCompactionEvent(1, strings.Repeat("older closed output ", 40))
+	oldOutput.TurnID = testIDN(811)
+	answeredInput := textCompactionEvent(2, strings.Repeat("answered opening input ", 40))
+	answeredInput.Kind = string(events.KindAgentInput)
+	answeredInput.IsOpeningEvent = true
+	answeredInput.TurnID = turnID
+	toolOutput := textCompactionEvent(3, "TOOL_GROUP_MUST_STAY_RAW")
+	toolOutput.TurnID = turnID
+	toolResult := textCompactionEvent(4, "TOOL_RESULT_MUST_STAY_RAW")
+	toolResult.Kind = string(events.KindToolResult)
+	toolResult.TurnID = turnID
+	store := &fakeStore{
+		events: []executionstore.CompactionSourceEventRecord{
+			oldOutput,
+			answeredInput,
+			toolOutput,
+			toolResult,
+		},
+		atomicGroups: []executionstore.CompactionAtomicGroupRecord{{
+			Kind: "tool_call_result", StartSequence: 3, EndSequence: 4,
+		}},
+	}
+	client := &summaryModel{results: []summaryResult{{
+		response: completeSummaryResponse("Concise checkpoint for the answered request."),
+	}}}
+	compactionInput := runInput(testPlan(1, 2, 4))
+	result, err := testRunner(store, client).RunClaimed(
+		context.Background(), compactionInput, store.addStartedClaim(compactionInput),
+	)
+	if err != nil {
+		t.Fatalf("run compaction with retained boundary witness: %v", err)
+	}
+	if result.State != RunCompleted || result.Checkpoint == nil ||
+		result.Checkpoint.SummarizedThroughEventSequence != 2 || len(client.requests) != 1 {
+		t.Fatalf("boundary-witness result=%+v requests=%d", result, len(client.requests))
+	}
+	prompt := string(client.requests[0].ProviderRequest)
+	if !strings.Contains(prompt, "answered opening input") ||
+		strings.Contains(prompt, "TOOL_GROUP_MUST_STAY_RAW") ||
+		strings.Contains(prompt, "TOOL_RESULT_MUST_STAY_RAW") {
+		t.Fatalf("sent compaction source leaked retained tool group: %s", prompt)
+	}
+}
+
+func TestSafeCompactionSourceEndsDoNotSplitAtomicGroups(t *testing.T) {
+	events := []executionstore.CompactionSourceEventRecord{
+		textCompactionEvent(1, "one"), textCompactionEvent(2, "two"),
+		textCompactionEvent(3, "three"), textCompactionEvent(4, "four"),
+	}
+	ends := safeCompactionSourceEnds(events, []AtomicGroup{{
+		Kind: "tool_call_result", StartSequence: 2, EndSequence: 3,
+	}})
+	want := []int64{1, 3, 4}
+	if len(ends) != len(want) {
+		t.Fatalf("safe ends = %v, want %v", ends, want)
+	}
+	for index := range want {
+		if ends[index] != want[index] {
+			t.Fatalf("safe ends = %v, want %v", ends, want)
+		}
+	}
+}
+
+func TestRunnerRecoveryPrefersWholeAnsweredTurn(t *testing.T) {
+	firstTurnID := testIDN(812)
+	secondTurnID := testIDN(813)
+	records := []executionstore.CompactionSourceEventRecord{
+		textCompactionEvent(1, strings.Repeat("first opening ", 200)),
+		textCompactionEvent(2, "first answer"),
+		textCompactionEvent(3, strings.Repeat("second opening ", 20)),
+		textCompactionEvent(4, "second answer"),
+	}
+	records[0].Kind = string(events.KindAgentInput)
+	records[0].TurnID = firstTurnID
+	records[1].TurnID = firstTurnID
+	records[2].Kind = string(events.KindAgentInput)
+	records[2].TurnID = secondTurnID
+	records[3].TurnID = secondTurnID
+	store := &fakeStore{events: records}
+	client := &summaryModel{results: []summaryResult{{err: model.ProviderError{Kind: model.ErrorKindContextWindow}}}}
+	input := runInput(testPlan(1, 4, 4))
+	result, err := testRunner(store, client).RunClaimed(t.Context(), input, store.addStartedClaim(input))
+	require.NoError(t, err)
+	require.Equal(t, RunCompleted, result.State)
+	require.Len(t, store.replacements, 1)
+	require.Equal(t, int64(2), store.replacements[0].NextSourceEventSequenceEnd)
+	require.Equal(t, int64(2), result.Checkpoint.SummarizedThroughEventSequence)
+	require.Len(t, client.requests, 2)
+	require.Contains(t, string(client.requests[1].ProviderRequest), "first answer")
+	require.NotContains(t, string(client.requests[1].ProviderRequest), "second opening")
+}
+
+func TestSafeCompactionSourceEndsRequireModelVisibleSemantics(t *testing.T) {
+	events := []executionstore.CompactionSourceEventRecord{
+		mustCompactionEvent(1, string(events.KindAgentInput), "config_change", json.RawMessage(`[]`)),
+		textCompactionEvent(2, "visible input"),
+		mustCompactionEvent(3, string(events.KindContextCheckpoint), "", json.RawMessage(`[]`)),
+		mustCompactionEvent(4, string(events.KindToolResult), "completed", json.RawMessage(`[]`)),
+		textCompactionEvent(5, "visible output"),
+	}
+	ends := safeCompactionSourceEnds(events, nil)
+	want := []int64{2, 5}
+	if len(ends) != len(want) {
+		t.Fatalf("semantic safe ends = %v, want %v", ends, want)
+	}
+	for index := range want {
+		if ends[index] != want[index] {
+			t.Fatalf("semantic safe ends = %v, want %v", ends, want)
+		}
+	}
+	rendered, err := renderEventSource(events)
+	if err != nil {
+		t.Fatalf("render semantic source: %v", err)
+	}
+	if strings.Contains(rendered, "Event 1") || strings.Contains(rendered, "Event 3") ||
+		strings.Contains(rendered, "Event 4") || !strings.Contains(rendered, "Event 2") ||
+		!strings.Contains(rendered, "Event 5") || strings.Contains(rendered, "execution_error=true") {
+		t.Fatalf("rendered semantic source = %q", rendered)
+	}
+}
+
+func TestRenderEventSourceReducesProjectionWithoutMutatingCanonicalOutput(t *testing.T) {
+	original := json.RawMessage(
+		`[{"type":"structured_data","value":{"stdout":"` + strings.Repeat("x", 40_960) +
+			`TAIL"}}]`,
+	)
+	event := mustCompactionEvent(1, "tool_result", "completed", append(json.RawMessage(nil), original...))
+	event.ToolName = "run_command"
+	event.ProviderCallID = "call_1"
+	rendered, err := renderEventSource([]executionstore.CompactionSourceEventRecord{event})
+	if err != nil {
+		t.Fatalf("render event source: %v", err)
+	}
+	if string(event.ContentParts) != string(original) {
+		t.Fatal("canonical tool output was mutated")
+	}
+	if !strings.Contains(rendered, "omitted") || !strings.Contains(rendered, "TAIL") ||
+		!strings.Contains(rendered, "Tool: run_command call_id=call_1") {
+		t.Fatalf("reduced tool projection = %q", rendered)
+	}
+}
+
+func TestRenderContentPartsLabelsMediaRefsAsArtifacts(t *testing.T) {
+	raw := json.RawMessage(`[{"type":"media_ref","artifact_id":"00000000-0000-0000-0000-000000000001"}]`)
+	original := string(raw)
+	got := renderContentParts(raw)
+	path := "/artifacts/" + modelcontext.ArtifactPublicID("00000000-0000-0000-0000-000000000001")
+	if !strings.Contains(got, "Artifact: ") || !strings.Contains(got, path) {
+		t.Fatalf("rendered content parts = %q", got)
+	}
+	if string(raw) != original {
+		t.Fatal("canonical attachment reference was mutated")
+	}
+	if strings.Contains(got, "Content: ") {
+		t.Fatalf("media_ref should not use generic content label: %q", got)
+	}
+}
+
+func TestRenderEventSourceIncludesToolOutcome(t *testing.T) {
+	event := mustCompactionEvent(1, "tool_result", "", nil)
+	event.ToolName = "run_command"
+	event.ProviderCallID = "call_1"
+	event.ToolOutcome = string(executionstore.ToolResultOutcomeCanceled)
+	rendered, err := renderEventSource([]executionstore.CompactionSourceEventRecord{event})
+	if err != nil {
+		t.Fatalf("render event source: %v", err)
+	}
+	if !strings.Contains(rendered, "Tool: run_command call_id=call_1 outcome=canceled") {
+		t.Fatalf("rendered source = %q", rendered)
+	}
+}
+
+func TestRunnerDurablyRetriesOpenSourceRange(t *testing.T) {
+	store := &fakeStore{events: []executionstore.CompactionSourceEventRecord{textCompactionEvent(1, "one")}}
+	compactionInput := runInput(testPlan(1, 2, 2))
+	result, err := testRunner(store, &summaryModel{}).
+		RunClaimed(context.Background(), compactionInput, store.addStartedClaim(compactionInput))
+	if err != nil || result.State != RunRetryScheduled || len(store.retryFailures) != 1 ||
+		store.retryFailures[0].ErrorKind != model.ErrorKindTransient ||
+		store.retryFailures[0].ErrorCode != "load_compaction_source_failed" ||
+		!strings.Contains(string(store.retryFailures[0].ErrorDetails), "not closed") {
+		t.Fatalf("open range result=%+v failures=%+v err=%v", result, store.retryFailures, err)
+	}
+}
+
+func TestRunnerReservesFittingSummaryAllowanceForSmallWindow(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		capacity               *int
+		allowance, input, want int
+	}{
+		{"explicit small normal allowance", new(9000), 1000, 4000, 1000},
+		{"inherited large capacity", new(9000), 0, 3000, 5000},
+		{"unknown capacity with large allowance", nil, 9000, 3000, 5000},
+		{"large source without default", new(9000), 0, 8000, 976},
+		{"large source with small default", new(9000), 1000, 8500, 476},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeStore{events: []executionstore.CompactionSourceEventRecord{
+				textCompactionEvent(1, strings.Repeat("source detail ", 100)),
+			}}
+			client := &summaryModel{
+				caps: model.Capabilities{
+					ContextWindowTokens:    10000,
+					MaxOutputTokens:        tc.capacity,
+					DefaultMaxOutputTokens: tc.allowance,
+				},
+				sourceInputTokens: tc.input,
+			}
+			compactionInput := runInput(testPlan(1, 1, 1))
+			result, err := testRunner(store, summaryModelWithExplicitCapabilities{client}).
+				RunClaimed(context.Background(), compactionInput, store.addStartedClaim(compactionInput))
+			require.NoError(t, err)
+			require.Equal(t, RunCompleted, result.State)
+			require.Len(t, client.requests, 1)
+			require.Empty(t, store.terminalFailures)
+			var sent model.RequestPolicy
+			require.NoError(t, json.Unmarshal(client.requests[0].ProviderRequest, &sent))
+			require.Equal(t, tc.want, sent.MaxOutputTokens)
+		})
+	}
+}
+
+func TestCompactionAllowanceFitRespectsMinimumAndFinalInput(t *testing.T) {
+	for _, tc := range []struct {
+		name                               string
+		input, minimum, growth, wantOutput int
+	}{
+		{name: "minimum fits", input: 29_376, minimum: 1_024, wantOutput: 1_024},
+		{name: "below minimum", input: 29_377, minimum: 1_024},
+		{name: "no room for output", input: 30_400},
+		{name: "final input grows", input: 24_000, growth: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := summaryModelWithOutputMinimum{
+				summaryModelWithExplicitCapabilities: summaryModelWithExplicitCapabilities{&summaryModel{
+					caps: model.Capabilities{ContextWindowTokens: 32_000, MaxOutputTokens: new(24_000)},
+					preparedEstimate: func(input model.PrepareInput, _ []byte) int {
+						if input.Policy.MaxOutputTokens < 16_000 {
+							return tc.input + tc.growth
+						}
+						return tc.input
+					},
+				}},
+				minimum: tc.minimum,
+			}
+			prepared, err := largestFittingCompactionRequest(
+				context.Background(), runInput(testPlan(1, 1, 1)), "",
+				[]executionstore.CompactionSourceEventRecord{textCompactionEvent(1, "closed source")},
+				nil, nil, client, model.RequestPolicy{MaxOutputTokens: 16_000}, "compaction", 0)
+			require.NoError(t, err)
+			if tc.wantOutput == 0 {
+				require.Equal(t, int64(1), prepared.sourceEnd)
+				require.True(t, prepared.prepared.InputBudget.OverBudget())
+				require.Equal(t, 16_000, prepared.prepared.MaxOutputTokens)
+				return
+			}
+			require.Equal(t, int64(1), prepared.sourceEnd)
+			require.True(t, prepared.prepared.InputBudget.Fits())
+			require.Equal(t, tc.wantOutput, prepared.prepared.MaxOutputTokens)
+		})
+	}
+}
+
+func TestCompactionAllowanceFitPrefersWholeTurnAndPreservesPartialProgress(t *testing.T) {
+	largeText := strings.Repeat("work ", 19_200)
+	for _, tc := range []struct {
+		name, firstText, secondText, firstKind string
+		separateTurns, wantReduced             bool
+		wantEnd                                int64
+	}{
+		{name: "whole turn fits reduced allowance", firstText: "short request", secondText: largeText,
+			firstKind: string(events.KindAgentInput), wantEnd: 2, wantReduced: true},
+		{name: "oversized turn keeps preferred partial", firstText: "short request", secondText: largeText + largeText,
+			firstKind: string(events.KindAgentInput), wantEnd: 1},
+		{name: "oversized turn keeps reduced partial", firstText: largeText, secondText: largeText,
+			firstKind: string(events.KindModelOutput), wantEnd: 1, wantReduced: true},
+		{name: "preferred whole turn wins", firstText: "small output", secondText: largeText,
+			firstKind: string(events.KindModelOutput), separateTurns: true, wantEnd: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := []executionstore.CompactionSourceEventRecord{
+				textCompactionEvent(1, tc.firstText), textCompactionEvent(2, tc.secondText),
+			}
+			source[0].Kind = tc.firstKind
+			source[0].TurnID, source[1].TurnID = testIDN(812), testIDN(812)
+			if tc.separateTurns {
+				source[1].TurnID = testIDN(813)
+			}
+			client := summaryModelWithExplicitCapabilities{&summaryModel{caps: model.Capabilities{
+				ContextWindowTokens: 32_000, MaxOutputTokens: new(24_000),
+			}}}
+			prepared, err := largestFittingCompactionRequest(
+				context.Background(), runInput(testPlan(1, 2, 2)), "", source, source, nil,
+				client, model.RequestPolicy{MaxOutputTokens: 16_000}, "compaction", 0)
+			require.NoError(t, err)
+			require.Equal(t, tc.wantEnd, prepared.sourceEnd)
+			require.True(t, prepared.prepared.InputBudget.Fits())
+			require.Positive(t, prepared.prepared.MaxOutputTokens)
+			if tc.wantReduced {
+				require.Less(t, prepared.prepared.MaxOutputTokens, 16_000)
+			} else {
+				require.Equal(t, 16_000, prepared.prepared.MaxOutputTokens)
+			}
+		})
+	}
+}
+
+type summaryModelWithOutputMinimum struct {
+	summaryModelWithExplicitCapabilities
+	minimum int
+}
+
+func (m summaryModelWithOutputMinimum) OutputTokenLimits() (model.OutputTokenLimits, error) {
+	return model.OutputTokenLimits{Minimum: m.minimum}, nil
+}
+
+type summaryModelWithExplicitCapabilities struct{ *summaryModel }
+
+func (m summaryModelWithExplicitCapabilities) Capabilities() model.Capabilities { return m.caps }
+
+func TestCompactionRetainsOverflowLocator(t *testing.T) {
+	path := "/artifacts/art_overflow"
+	parts, err := json.Marshal([]map[string]any{
+		{
+			"type":  "structured_data",
+			"value": map[string]any{"path": path, "preview": strings.Repeat("x", 8192)},
+		},
+		{"type": "text", "text": strings.Repeat("other content", 5000)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := mustCompactionEvent(1, "tool_result", "completed", parts)
+	event.ToolName = "web_fetch"
+	rendered, err := renderEventSource([]executionstore.CompactionSourceEventRecord{event})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rendered, path) {
+		t.Fatal("compaction lost overflow locator")
+	}
+}

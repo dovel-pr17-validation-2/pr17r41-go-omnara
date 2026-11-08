@@ -1,0 +1,131 @@
+import type { ComponentProps } from 'react'
+
+export {
+  ArrowDownIcon,
+  ArrowLeftIcon as ArrowLeft,
+  ArrowRightIcon as ArrowRight,
+  ArrowUpRightIcon as ArrowUpRight,
+  BoltIcon,
+  BookOpenIcon as BookOpen,
+  CpuChipIcon as Bot,
+  CpuChipIcon as BotIcon,
+  CubeIcon as Box,
+  LightBulbIcon as Brain,
+  CpuChipIcon as BrainCircuit,
+  BuildingOffice2Icon as Building2,
+  CalendarDaysIcon as CalendarIcon,
+  ChartBarIcon as ChartBar,
+  CheckIcon as Check,
+  CheckCircleIcon,
+  CheckIcon,
+  ChevronDownIcon as ChevronDown,
+  ChevronDownIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon as ChevronRight,
+  ChevronRightIcon,
+  ChevronUpDownIcon as ChevronsUpDown,
+  ChevronUpDownIcon as ChevronsUpDownIcon,
+  ChevronUpIcon,
+  ExclamationCircleIcon as CircleAlert,
+  CheckCircleIcon as CircleCheck,
+  QuestionMarkCircleIcon as CircleHelp,
+  CodeBracketIcon as CodeBracket,
+  CodeBracketIcon,
+  DocumentDuplicateIcon as Copy,
+  DocumentDuplicateIcon as CopyIcon,
+  CreditCardIcon as CreditCard,
+  DocumentTextIcon,
+  ArrowDownTrayIcon as Download,
+  EllipsisHorizontalIcon as Ellipsis,
+  EyeIcon,
+  EyeSlashIcon,
+  DocumentIcon as File,
+  ArchiveBoxIcon as FileArchive,
+  DocumentPlusIcon as FilePlus,
+  FilmIcon,
+  FingerPrintIcon as Fingerprint,
+  FolderIcon as Folder,
+  FunnelIcon,
+  HandRaisedIcon,
+  HomeIcon as House,
+  InformationCircleIcon as InfoIcon,
+  KeyIcon as KeyRound,
+  Squares2X2Icon as LayoutGrid,
+  ArrowPathIcon as Loader2,
+  ArrowPathIcon as LoaderCircleIcon,
+  ArrowRightStartOnRectangleIcon as LogOut,
+  MagnifyingGlassCircleIcon,
+  EnvelopeIcon as Mail,
+  EnvelopeOpenIcon as MailCheck,
+  ChatBubbleOvalLeftEllipsisIcon as MessageCircleQuestion,
+  ChatBubbleLeftRightIcon as MessagesSquare,
+  MinusIcon as Minus,
+  ComputerDesktopIcon as Monitor,
+  MoonIcon as Moon,
+  EllipsisHorizontalIcon as MoreHorizontal,
+  EllipsisHorizontalIcon as MoreHorizontalIcon,
+  MusicalNoteIcon,
+  NoSymbolIcon,
+  Bars3Icon as PanelLeftIcon,
+  PaperClipIcon as Paperclip,
+  PauseIcon,
+  PencilIcon,
+  PhotoIcon,
+  PlayIcon,
+  PlusIcon as Plus,
+  PlusIcon,
+  PresentationChartBarIcon,
+  MagnifyingGlassIcon as SearchIcon,
+  PaperAirplaneIcon as SendHorizontal,
+  ServerIcon as Server,
+  Cog6ToothIcon as SettingsIcon,
+  SparklesIcon as Sparkles,
+  StopIcon as Square,
+  SunIcon as Sun,
+  TableCellsIcon,
+  CommandLineIcon as Terminal,
+  TrashIcon as Trash2,
+  TrashIcon as Trash2Icon,
+  ExclamationTriangleIcon as TriangleAlert,
+  ArrowUpTrayIcon as Upload,
+  UserGroupIcon,
+  UserIcon,
+  UsersIcon as Users,
+  XMarkIcon as X,
+  XCircleIcon,
+  XMarkIcon as XIcon,
+} from '@heroicons/react/24/outline'
+export { ChevronsDownUp as ChevronsDownUpIcon } from 'lucide-react'
+
+function CircleBase({
+  dashed,
+  ...props
+}: ComponentProps<'svg'> & {
+  dashed?: boolean
+}) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.5}
+      strokeDasharray={dashed ? '3 3' : undefined}
+      aria-hidden="true"
+      {...props}
+    >
+      <circle cx="12" cy="12" r="9" />
+    </svg>
+  )
+}
+
+export function Circle(props: ComponentProps<'svg'>) {
+  return <CircleBase {...props} />
+}
+
+export function CircleIcon(props: ComponentProps<'svg'>) {
+  return <CircleBase {...props} />
+}
+
+export function CircleDashed(props: ComponentProps<'svg'>) {
+  return <CircleBase dashed {...props} />
+}

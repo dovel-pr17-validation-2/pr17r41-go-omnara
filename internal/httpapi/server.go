@@ -1,0 +1,532 @@
+package httpapi
+
+import (
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/benbjohnson/clock"
+	"github.com/google/uuid"
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/omnara-ai/omnara/internal/agentconfig"
+	"github.com/omnara-ai/omnara/internal/authn"
+	httpauth "github.com/omnara-ai/omnara/internal/httpapi/auth"
+	"github.com/omnara-ai/omnara/internal/integration/discord"
+	"github.com/omnara-ai/omnara/internal/integration/github"
+	"github.com/omnara-ai/omnara/internal/machinepool"
+	"github.com/omnara-ai/omnara/internal/mcp"
+	"github.com/omnara-ai/omnara/internal/mcpregistry"
+	"github.com/omnara-ai/omnara/internal/modelprovider"
+	"github.com/omnara-ai/omnara/internal/notifications"
+	"github.com/omnara-ai/omnara/internal/outboundhttp"
+	"github.com/omnara-ai/omnara/internal/redistore"
+	"github.com/omnara-ai/omnara/internal/secrets"
+	"github.com/omnara-ai/omnara/internal/sigv4"
+	"github.com/omnara-ai/omnara/internal/storage"
+	"github.com/omnara-ai/omnara/internal/storage/executionstore"
+	"github.com/omnara-ai/omnara/internal/storage/modelstore"
+	"github.com/omnara-ai/omnara/internal/storage/skillstore"
+	"github.com/omnara-ai/omnara/observability/metrics"
+)
+
+type Server struct {
+	githubClientConfig                  github.Config
+	gitCredentialClients                *github.InstallationClientCache
+	discordClientConfig                 discord.Config
+	log                                 *slog.Logger
+	store                               *storage.Store
+	skills                              *skillstore.Store
+	authLimiter                         httpauth.RateLimiter
+	apiRateLimit                        *apiRateLimit
+	authOAuthStates                     httpauth.OAuthStateStore
+	trustedProxyNets                    []*net.IPNet
+	email                               httpauth.EmailSender
+	authClientRateLimits                authn.ClientRateLimits
+	authSignupEnabled                   bool
+	authResetEnabled                    bool
+	authRoutes                          *httpauth.Handler
+	publicURL                           string
+	publicAPIURL                        string
+	publicOrigins                       []configuredOrigin
+	billingURL                          string
+	daemonReleaseURL                    string
+	agentEventWakeupSubscriber          notifications.AgentEventWakeupSubscriber
+	agentToolCallUpdateSubscriber       notifications.AgentToolCallUpdateSubscriber
+	agentStreamDeltaSubscriber          notifications.AgentStreamDeltaSubscriber
+	agentEventStreamReconciler          *agentEventStreamReconciler
+	daemonHub                           *daemonSocketHub
+	recorder                            *metrics.HTTPRecorder
+	integrationInboxIntake              *metrics.IntegrationInboxIntakeRecorder
+	daemonRecorder                      *metrics.DaemonRecorder
+	agentConfigOptions                  agentconfig.CompileOptions
+	allowInsecureModelProviderEndpoints bool
+	modelDiscoverer                     modelprovider.DiscoverFunc
+	allowInsecureLocalHostBypass        bool
+	defaultPools                        []executionstore.DefaultMachinePoolTemplate
+	defaultModelProvider                *modelstore.DefaultModelProviderTemplate
+	hostedCredentialProvisioner         modelprovider.HostedCredentialProvisioner
+	daemonNotifications                 *daemonNotificationConfig
+	replyPublisher                      replyChannelPublisher
+	mcpOAuthHTTPClient                  *http.Client
+	mcpClient                           mcp.Client
+	sigV4CredentialCache                *sigv4.CredentialCache
+	integrationHTTPClient               *http.Client
+	slackOAuth                          SlackOAuthConfig
+	secretKeyWrapper                    secrets.KeyWrapper
+	authHTTPClient                      *http.Client
+	oauthClientMetadataHTTPClient       *http.Client
+	mcpRegistry                         *mcpregistry.Registry
+	openAPIRequestValidator             middleware
+	openAPIAuthorizer                   operationAuthorizer
+	apiMCP                              *mcpsdk.Server
+	apiDispatch                         atomic.Pointer[http.Handler]
+	webAssets                           fs.FS
+	closeOnce                           sync.Once
+	machinePoolManager                  *machinepool.Manager
+	daemonRuntimeLeaseDuration          time.Duration
+	daemonSocketFallbackDrainInterval   time.Duration
+	daemonSocketFallbackDrainJitter     time.Duration
+	agentEventReconciliationInterval    time.Duration
+	skillDownloadSigningKey             []byte
+	timer                               clock.Clock
+}
+
+type daemonNotificationConfig struct {
+	subscriber notifications.DaemonWakeupSubscriber
+	presence   notifications.DaemonPresenceStore
+	replicaID  uuid.UUID
+}
+
+type Option func(*Server)
+
+func WithSkillDownloadSigningKey(key []byte) Option {
+	return func(s *Server) {
+		s.skillDownloadSigningKey = append([]byte(nil), key...)
+	}
+}
+
+func WithEmailSender(sender httpauth.EmailSender) Option {
+	return func(s *Server) {
+		s.email = sender
+	}
+}
+
+func WithPasswordAuthEnabled(signupEnabled, resetEnabled bool) Option {
+	return func(s *Server) {
+		s.authSignupEnabled = signupEnabled
+		s.authResetEnabled = resetEnabled
+	}
+}
+
+func WithAuthClientRateLimits(limits authn.ClientRateLimits) Option {
+	return func(s *Server) {
+		s.authClientRateLimits = limits
+	}
+}
+
+func WithAuthRateLimiter(limiter httpauth.RateLimiter) Option {
+	return func(s *Server) {
+		s.authLimiter = limiter
+	}
+}
+
+func WithOAuthStateStore(store httpauth.OAuthStateStore) Option {
+	return func(s *Server) {
+		s.authOAuthStates = store
+	}
+}
+
+func WithRedisBackedAuth(client *redistore.Client) Option {
+	return func(s *Server) {
+		if client == nil {
+			return
+		}
+		WithAuthRateLimiter(httpauth.NewRedisRateLimiter(client))(s)
+		WithOAuthStateStore(httpauth.NewRedisOAuthStateStore(client))(s)
+	}
+}
+
+func WithTrustedProxyCIDRs(cidrs []string) Option {
+	return func(s *Server) {
+		s.trustedProxyNets = nil
+		for _, cidr := range cidrs {
+			_, network, err := net.ParseCIDR(cidr)
+			if err != nil {
+				s.log.Warn("ignoring invalid trusted proxy CIDR", "cidr", cidr, "error", err)
+				continue
+			}
+			s.trustedProxyNets = append(s.trustedProxyNets, network)
+		}
+	}
+}
+
+func WithPublicURL(publicURL string) Option {
+	return func(s *Server) {
+		s.publicURL = strings.TrimRight(strings.TrimSpace(publicURL), "/")
+	}
+}
+
+func WithPublicAPIURL(publicAPIURL string) Option {
+	return func(s *Server) {
+		s.publicAPIURL = strings.TrimRight(strings.TrimSpace(publicAPIURL), "/")
+	}
+}
+
+func WithBillingURL(billingURL string) Option {
+	return func(s *Server) {
+		s.billingURL = strings.TrimRight(strings.TrimSpace(billingURL), "/")
+	}
+}
+
+func WithDaemonReleaseURL(releaseURL string) Option {
+	return func(s *Server) {
+		s.daemonReleaseURL = strings.TrimSpace(releaseURL)
+	}
+}
+
+// WithWebAssets configures embedded SPA assets.
+func WithWebAssets(assets fs.FS) Option {
+	return func(s *Server) {
+		s.webAssets = assets
+	}
+}
+
+func WithSecretKeyWrapper(keyWrapper secrets.KeyWrapper) Option {
+	return func(s *Server) {
+		s.secretKeyWrapper = keyWrapper
+	}
+}
+
+func WithDefaultMachinePools(defaultPoolTemplates []executionstore.DefaultMachinePoolTemplate) Option {
+	return func(s *Server) {
+		s.defaultPools = defaultPoolTemplates
+	}
+}
+
+func WithDefaultModelProvider(template *modelstore.DefaultModelProviderTemplate) Option {
+	return func(s *Server) {
+		s.defaultModelProvider = template
+	}
+}
+
+func WithHostedCredentialProvisioner(provisioner modelprovider.HostedCredentialProvisioner) Option {
+	return func(s *Server) {
+		s.hostedCredentialProvisioner = provisioner
+	}
+}
+
+func WithSlackOAuth(config SlackOAuthConfig) Option {
+	return func(s *Server) {
+		s.slackOAuth = config
+	}
+}
+
+func WithIntegrationHTTPClient(client *http.Client) Option {
+	return func(s *Server) {
+		s.integrationHTTPClient = client
+	}
+}
+
+func WithAuthHTTPClient(client *http.Client) Option {
+	return func(s *Server) {
+		s.authHTTPClient = client
+	}
+}
+
+func WithOAuthClientMetadataHTTPClient(client *http.Client) Option {
+	return func(s *Server) {
+		s.oauthClientMetadataHTTPClient = client
+	}
+}
+
+func WithMCPRegistry(registry *mcpregistry.Registry) Option {
+	return func(s *Server) {
+		s.mcpRegistry = registry
+	}
+}
+
+func WithHTTPRecorder(recorder *metrics.HTTPRecorder) Option {
+	return func(s *Server) {
+		s.recorder = recorder
+	}
+}
+
+func WithIntegrationInboxIntakeRecorder(recorder *metrics.IntegrationInboxIntakeRecorder) Option {
+	return func(s *Server) { s.integrationInboxIntake = recorder }
+}
+
+func WithDaemonRecorder(recorder *metrics.DaemonRecorder) Option {
+	return func(s *Server) {
+		s.daemonRecorder = recorder
+	}
+}
+
+func WithDaemonNotifications(
+	subscriber notifications.DaemonWakeupSubscriber,
+	presence notifications.DaemonPresenceStore,
+	replicaID uuid.UUID,
+) Option {
+	return func(s *Server) {
+		s.daemonNotifications = &daemonNotificationConfig{
+			subscriber: subscriber,
+			presence:   presence,
+			replicaID:  replicaID,
+		}
+	}
+}
+
+func WithAgentEventWakeupSubscriber(subscriber notifications.AgentEventWakeupSubscriber) Option {
+	return func(s *Server) {
+		s.agentEventWakeupSubscriber = subscriber
+	}
+}
+
+func WithAgentToolCallUpdateSubscriber(subscriber notifications.AgentToolCallUpdateSubscriber) Option {
+	return func(s *Server) {
+		s.agentToolCallUpdateSubscriber = subscriber
+	}
+}
+
+func WithAgentStreamDeltaSubscriber(subscriber notifications.AgentStreamDeltaSubscriber) Option {
+	return func(s *Server) {
+		s.agentStreamDeltaSubscriber = subscriber
+	}
+}
+
+func WithDaemonReplyPublisher(publisher replyChannelPublisher) Option {
+	return func(s *Server) {
+		s.replyPublisher = publisher
+	}
+}
+
+func WithMachinePoolManager(manager *machinepool.Manager) Option {
+	return func(s *Server) {
+		s.machinePoolManager = manager
+	}
+}
+
+func WithDaemonSocketFallbackDrainTiming(interval time.Duration, jitter time.Duration) Option {
+	return func(s *Server) {
+		if interval > 0 {
+			s.daemonSocketFallbackDrainInterval = interval
+		}
+		if jitter >= 0 && (interval <= 0 || jitter <= interval) {
+			s.daemonSocketFallbackDrainJitter = jitter
+		}
+	}
+}
+
+func (s *Server) daemonRuntimePresenceTTL() time.Duration {
+	ttl := 3 * s.daemonRuntimeHeartbeatAfter()
+	if s.daemonRuntimeLeaseDuration < ttl {
+		return s.daemonRuntimeLeaseDuration
+	}
+	return ttl
+}
+
+func (s *Server) daemonRuntimeHeartbeatAfter() time.Duration {
+	leaseHeartbeat := s.daemonRuntimeLeaseDuration / 3
+	if leaseHeartbeat > 0 && leaseHeartbeat < daemonRuntimeHeartbeatInterval {
+		return leaseHeartbeat
+	}
+	return daemonRuntimeHeartbeatInterval
+}
+
+func WithAgentConfigOptions(opts agentconfig.CompileOptions) Option {
+	return func(s *Server) {
+		s.agentConfigOptions = opts
+	}
+}
+
+func WithAllowInsecureModelProviderEndpoints() Option {
+	return func(s *Server) {
+		s.allowInsecureModelProviderEndpoints = true
+	}
+}
+
+func WithModelDiscoverer(discoverer modelprovider.DiscoverFunc) Option {
+	return func(s *Server) {
+		s.modelDiscoverer = discoverer
+	}
+}
+
+// WithAllowInsecureLocalHostBypass exempts loopback and Docker's
+// host.docker.internal alias from the public-host guard, so local
+// daemons/containers can reach the API without a matching Host header. Only
+// wire this when OMNARA_ALLOW_INSECURE_DEV_DEFAULTS is set.
+func WithAllowInsecureLocalHostBypass() Option {
+	return func(s *Server) {
+		s.allowInsecureLocalHostBypass = true
+	}
+}
+
+func New(log *slog.Logger, store *storage.Store, opts ...Option) (*Server, error) {
+	if log == nil {
+		log = slog.Default()
+	}
+	server := &Server{
+		log:                               log,
+		store:                             store,
+		authSignupEnabled:                 true,
+		authResetEnabled:                  true,
+		daemonRuntimeLeaseDuration:        executionstore.DaemonRuntimeLeaseDuration,
+		daemonSocketFallbackDrainInterval: defaultDaemonSocketFallbackDrainInterval,
+		daemonSocketFallbackDrainJitter:   defaultDaemonSocketFallbackDrainJitter,
+		agentEventReconciliationInterval:  defaultAgentEventReconciliationInterval,
+		modelDiscoverer:                   modelprovider.DiscoverModels,
+		timer:                             clock.New(),
+	}
+	var authStore httpauth.Store
+	var compromiseRevoker httpauth.CompromiseRevoker
+	if store != nil {
+		server.skills = store.Skills()
+		authStore = store.Identity()
+		compromiseRevoker = store.AccountSecurity()
+	}
+	openAPIRequestValidator, err := newOpenAPIRequestValidator()
+	if err != nil {
+		return nil, fmt.Errorf("create openapi request validator: %w", err)
+	}
+	server.openAPIRequestValidator = openAPIRequestValidator
+	openAPIAuthorizer, err := newOpenAPIAuthorizer()
+	if err != nil {
+		return nil, fmt.Errorf("create openapi operation authorizer: %w", err)
+	}
+	server.openAPIAuthorizer = openAPIAuthorizer
+	server.apiMCP, err = server.newAPIMCPServer()
+	if err != nil {
+		return nil, fmt.Errorf("create api mcp server: %w", err)
+	}
+	for _, opt := range opts {
+		opt(server)
+	}
+	gitHTTPClient := server.githubClientConfig.HTTPClient
+	if gitHTTPClient == nil {
+		gitHTTPClient = server.integrationHTTPClient
+	}
+	server.gitCredentialClients, err = github.NewInstallationClientCache(github.InstallationClientCacheConfig{
+		Capacity: 128, HTTPClient: gitHTTPClient, APIURL: server.githubClientConfig.APIURL,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create Git credentials client cache: %w", err)
+	}
+	publicOrigin, err := parseConfiguredOrigin(server.publicURL)
+	if err != nil {
+		return nil, err
+	}
+	publicAPIOrigin, err := parseConfiguredOrigin(server.publicAPIURL)
+	if err != nil {
+		return nil, err
+	}
+	if publicOrigin.host != "" {
+		server.publicOrigins = append(server.publicOrigins, publicOrigin)
+		if publicAPIOrigin.host != "" {
+			server.publicOrigins = append(server.publicOrigins, publicAPIOrigin)
+		}
+	}
+	server.authRoutes = httpauth.New(httpauth.Config{
+		Log:                      log,
+		Store:                    authStore,
+		CompromiseRevoker:        compromiseRevoker,
+		ClientRateLimits:         server.authClientRateLimits,
+		Limiter:                  server.authLimiter,
+		OAuthStates:              server.authOAuthStates,
+		Email:                    server.email,
+		SignupEnabled:            server.authSignupEnabled,
+		ResetEnabled:             server.authResetEnabled,
+		PublicURL:                server.publicURL,
+		MCPResourceURLs:          server.mcpResourceURLs(),
+		TrustedProxyNets:         server.trustedProxyNets,
+		PrincipalFromContext:     principalFromContext,
+		HTTPClient:               server.authHTTPClient,
+		ClientMetadataHTTPClient: server.oauthClientMetadataHTTPClient,
+	})
+	if server.agentEventWakeupSubscriber == nil {
+		return nil, fmt.Errorf(
+			"agent event wakeup subscriber is required; wire via WithAgentEventWakeupSubscriber",
+		)
+	}
+	if server.agentToolCallUpdateSubscriber == nil {
+		return nil, fmt.Errorf(
+			"agent tool call update subscriber is required; wire via WithAgentToolCallUpdateSubscriber",
+		)
+	}
+	if server.agentStreamDeltaSubscriber == nil {
+		return nil, fmt.Errorf(
+			"agent stream delta subscriber is required; wire via WithAgentStreamDeltaSubscriber",
+		)
+	}
+	if store != nil {
+		server.agentEventStreamReconciler = newAgentEventStreamReconciler(
+			log,
+			store.Execution(),
+			server.timer,
+			server.agentEventReconciliationInterval,
+			defaultAgentEventReconciliationBatchSize,
+		)
+	}
+	if config := server.daemonNotifications; config != nil {
+		if store == nil {
+			return nil, fmt.Errorf("store is required for daemon notifications")
+		}
+		var err error
+		server.daemonHub, err = newDaemonSocketHub(
+			config.subscriber,
+			server.replyPublisher,
+			config.presence,
+			config.replicaID,
+			log,
+			server.daemonRecorder,
+			server.daemonSocketFallbackDrainInterval,
+			server.daemonSocketFallbackDrainJitter,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("create daemon socket hub: %w", err)
+		}
+	}
+	server.mcpOAuthHTTPClient = outboundhttp.NewPublicClient(outboundhttp.PublicClientOptions{
+		AllowLoopback: server.agentConfigOptions.AllowInsecureLocalMCPHTTP,
+	})
+	server.mcpClient = mcp.New(mcp.Options{HTTPClient: server.mcpOAuthHTTPClient})
+	server.sigV4CredentialCache, err = sigv4.NewCredentialCache()
+	if err != nil {
+		return nil, err
+	}
+	return server, nil
+}
+
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	s.registerRoutes(mux)
+	apiDispatch := chain(mux, s.apiDispatchMiddlewares(mux)...)
+	s.apiDispatch.Store(&apiDispatch)
+	return chain(mux,
+		maxBody(requestBodyLimit, uploadBudget),
+		requestEvents(s.log, s.recorder, mux),
+		rejectCanceledRequests,
+		s.publicHostGuard,
+		s.auth,
+		s.limitAPIRequests,
+		s.openAPIRequestValidator,
+	)
+}
+
+func (s *Server) Close() {
+	if s == nil {
+		return
+	}
+	s.closeOnce.Do(func() {
+		if s.agentEventStreamReconciler != nil {
+			s.agentEventStreamReconciler.close()
+		}
+		if s.daemonHub != nil {
+			s.daemonHub.Close()
+		}
+	})
+}

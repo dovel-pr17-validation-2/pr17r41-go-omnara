@@ -1,0 +1,262 @@
+-- name: ListAgentTurnsForRead :many
+SELECT turn.id,
+       agent.project_id,
+       turn.agent_id,
+       turn.turn_sequence,
+       turn.latest_event_id,
+       turn.latest_semantic_event_id,
+       (
+         SELECT count(*)::bigint
+         FROM agent_events event
+         WHERE event.agent_id = turn.agent_id
+           AND event.turn_id = turn.id
+       ) AS event_count
+FROM agent_turns turn
+JOIN agents agent ON agent.id = turn.agent_id
+WHERE agent.project_id = sqlc.arg(project_id)
+  AND turn.agent_id = sqlc.arg(agent_id)
+  AND (
+    sqlc.arg(before_turn_sequence)::bigint <= 0
+    OR turn.turn_sequence < sqlc.arg(before_turn_sequence)::bigint
+  )
+ORDER BY turn.turn_sequence DESC
+LIMIT sqlc.arg(page_limit);
+
+-- name: AgentTurnExistsInProject :one
+SELECT EXISTS (
+  SELECT 1
+  FROM agent_turns turn
+  JOIN agents agent ON agent.id = turn.agent_id
+  WHERE agent.project_id = sqlc.arg(project_id)
+    AND turn.agent_id = sqlc.arg(agent_id)
+    AND turn.id = sqlc.arg(id)
+)::bool;
+
+-- name: ListAgentEventsForRead :many
+SELECT projection.id, projection.org_id, projection.project_id, projection.agent_id,
+       projection.turn_id, projection.turn_sequence, projection.is_opening_event,
+       projection.sequence, projection.event_kind, projection.input_kind,
+       projection.actor_id, projection.idempotency_scope, projection.input_idempotency_key,
+       projection.agent_input_id,
+       projection.control_type, projection.target_interaction_id, projection.agent_config_id,
+       projection.tool_call_id, projection.tool_outcome, projection.model_call_context_id,
+       projection.model_stop_reason, projection.context_checkpoint_id,
+       projection.summarized_through_event_sequence, projection.checkpoint_summary,
+       projection.content_blocks, projection.created_at,
+       projection.input_tokens_total, projection.uncached_input_tokens,
+       projection.cache_read_input_tokens, projection.cache_write_input_tokens,
+       projection.output_tokens_total, projection.reasoning_output_tokens,
+       projection.provider_metadata
+FROM agent_event_read_projection projection
+WHERE projection.project_id = sqlc.arg(project_id)
+  AND projection.agent_id = sqlc.arg(agent_id)
+  AND projection.sequence > sqlc.arg(after_sequence)
+ORDER BY projection.sequence ASC
+LIMIT sqlc.arg(page_limit);
+
+-- name: ListAgentEventsBeforeForRead :many
+SELECT projection.id, projection.org_id, projection.project_id, projection.agent_id,
+       projection.turn_id, projection.turn_sequence, projection.is_opening_event,
+       projection.sequence, projection.event_kind, projection.input_kind,
+       projection.actor_id, projection.idempotency_scope, projection.input_idempotency_key,
+       projection.agent_input_id,
+       projection.control_type, projection.target_interaction_id, projection.agent_config_id,
+       projection.tool_call_id, projection.tool_outcome, projection.model_call_context_id,
+       projection.model_stop_reason, projection.context_checkpoint_id,
+       projection.summarized_through_event_sequence, projection.checkpoint_summary,
+       projection.content_blocks, projection.created_at,
+       projection.input_tokens_total, projection.uncached_input_tokens,
+       projection.cache_read_input_tokens, projection.cache_write_input_tokens,
+       projection.output_tokens_total, projection.reasoning_output_tokens,
+       projection.provider_metadata
+FROM agent_event_read_projection projection
+WHERE projection.project_id = sqlc.arg(project_id)
+  AND projection.agent_id = sqlc.arg(agent_id)
+  AND (
+    sqlc.arg(before_sequence)::bigint <= 0
+    OR projection.sequence < sqlc.arg(before_sequence)::bigint
+  )
+ORDER BY projection.sequence DESC
+LIMIT sqlc.arg(page_limit);
+
+-- name: ListTurnEventsForRead :many
+SELECT projection.id, projection.org_id, projection.project_id, projection.agent_id,
+       projection.turn_id, projection.turn_sequence, projection.is_opening_event,
+       projection.sequence, projection.event_kind, projection.input_kind,
+       projection.actor_id, projection.idempotency_scope, projection.input_idempotency_key,
+       projection.agent_input_id,
+       projection.control_type, projection.target_interaction_id, projection.agent_config_id,
+       projection.tool_call_id, projection.tool_outcome, projection.model_call_context_id,
+       projection.model_stop_reason, projection.context_checkpoint_id,
+       projection.summarized_through_event_sequence, projection.checkpoint_summary,
+       projection.content_blocks, projection.created_at,
+       projection.input_tokens_total, projection.uncached_input_tokens,
+       projection.cache_read_input_tokens, projection.cache_write_input_tokens,
+       projection.output_tokens_total, projection.reasoning_output_tokens,
+       projection.provider_metadata
+FROM agent_event_read_projection projection
+WHERE projection.project_id = sqlc.arg(project_id)
+  AND projection.agent_id = sqlc.arg(agent_id)
+  AND projection.turn_id = sqlc.arg(turn_id)
+  AND (
+    sqlc.arg(before_sequence)::bigint <= 0
+    OR projection.sequence < sqlc.arg(before_sequence)::bigint
+  )
+ORDER BY projection.sequence DESC
+LIMIT sqlc.arg(page_limit);
+
+-- name: ListTurnBoundaryEventsForRead :many
+SELECT projection.id, projection.org_id, projection.project_id, projection.agent_id,
+       projection.turn_id, projection.turn_sequence, projection.is_opening_event,
+       projection.sequence, projection.event_kind, projection.input_kind,
+       projection.actor_id, projection.idempotency_scope, projection.input_idempotency_key,
+       projection.agent_input_id,
+       projection.control_type, projection.target_interaction_id, projection.agent_config_id,
+       projection.tool_call_id, projection.tool_outcome, projection.model_call_context_id,
+       projection.model_stop_reason, projection.context_checkpoint_id,
+       projection.summarized_through_event_sequence, projection.checkpoint_summary,
+       projection.content_blocks, projection.created_at,
+       projection.input_tokens_total, projection.uncached_input_tokens,
+       projection.cache_read_input_tokens, projection.cache_write_input_tokens,
+       projection.output_tokens_total, projection.reasoning_output_tokens,
+       projection.provider_metadata
+FROM agent_event_read_projection projection
+JOIN agent_turns turn
+  ON turn.agent_id = projection.agent_id
+ AND turn.id = projection.turn_id
+WHERE projection.project_id = sqlc.arg(project_id)
+  AND projection.agent_id = sqlc.arg(agent_id)
+  AND projection.turn_id = ANY(sqlc.arg(turn_ids)::uuid[])
+  AND (
+    projection.is_opening_event
+    OR projection.id = turn.latest_event_id
+    OR projection.id = turn.latest_semantic_event_id
+  )
+ORDER BY projection.turn_sequence DESC, projection.sequence ASC;
+
+-- name: IsOutputLimitBoundary :one
+SELECT EXISTS (
+  SELECT 1
+  FROM agent_events event
+  JOIN agents agent ON agent.id = event.agent_id
+  JOIN model_outputs output ON output.agent_id = event.agent_id
+    AND output.id = event.model_output_id
+  WHERE agent.project_id = sqlc.arg(project_id)
+    AND event.agent_id = sqlc.arg(agent_id)
+    AND event.sequence = sqlc.arg(event_sequence)
+    AND output.stop_reason = 'max_tokens'
+    AND NOT EXISTS (
+      SELECT 1 FROM tool_calls call
+      WHERE call.agent_id = output.agent_id AND call.model_output_id = output.id
+    )
+)::boolean;
+
+-- name: ListContextEvents :many
+WITH page AS (
+  SELECT event.id, event.agent_id, event.agent_input_id, event.sequence, event.created_at,
+         event.event_kind, event.model_output_id
+  FROM agent_events event
+  WHERE event.agent_id = sqlc.arg(agent_id)
+    AND event.sequence > sqlc.arg(after_sequence)
+    AND event.sequence <= sqlc.arg(watermark)
+    AND EXISTS (
+      SELECT 1
+      FROM agents scoped_agent
+      WHERE scoped_agent.project_id = sqlc.arg(project_id)
+        AND scoped_agent.id = sqlc.arg(agent_id)
+    )
+    AND (
+      event.event_kind = 'model_output'
+      OR (
+        event.event_kind = 'agent_input'
+        AND EXISTS (
+          SELECT 1
+          FROM agent_inputs input
+          WHERE input.agent_id = event.agent_id
+            AND input.id = event.agent_input_id
+            AND (
+              (input.input_kind = 'config_change' AND event.sequence > 1)
+              OR (
+                input.input_kind = 'content'
+                AND EXISTS (
+                  SELECT 1
+                  FROM content_blocks block
+                  WHERE block.agent_id = input.agent_id
+                    AND block.owner_agent_input_id = input.id
+                    AND block.block_kind IN ('text', 'artifact', 'reasoning', 'tool_call', 'error')
+                    AND NOT block.exclude_from_model_context
+                )
+              )
+            )
+        )
+      )
+    )
+  ORDER BY event.sequence ASC
+  LIMIT sqlc.arg(page_limit)
+)
+SELECT page.id,
+       page.agent_input_id,
+       page.sequence,
+       page.created_at,
+       page.event_kind,
+       page.model_output_id,
+       output.model_call_context_id,
+       revision.model_provider_config_id,
+       coalesce(revision.provider_model_slug, '') AS requested_provider_model_slug,
+       coalesce(context.api_format, '') AS api_format,
+       coalesce(context.api_variant, '') AS api_variant,
+       coalesce(context.input_fingerprint, '')::text AS input_fingerprint,
+       context.input_tokens_total, context.uncached_input_tokens,
+       context.cache_read_input_tokens, context.cache_write_input_tokens,
+       context.output_tokens_total, context.reasoning_output_tokens,
+       coalesce(context.input_event_sequence, 0)::bigint AS input_event_sequence,
+       context.agent_config_id, context.configured_model_revision_id,
+       coalesce(context.operation_kind = 'normal' AND context.state = 'succeeded', false)::boolean AS is_successful_normal_call,
+       output.provider_replay,
+       coalesce(output.stop_reason, '') AS stop_reason,
+       CASE
+         WHEN page.event_kind = 'agent_input' AND input.input_kind = 'config_change' AND page.sequence > 1 THEN
+           jsonb_build_array(jsonb_build_object('type', 'text', 'text', 'Agent configuration changed. The current system prompt, model, and tool policy are reflected in this model call.'))
+         ELSE
+           coalesce(blocks.content_parts, '[]'::jsonb)::jsonb
+       END AS content_parts
+FROM page
+LEFT JOIN agent_inputs input
+  ON input.agent_id = page.agent_id
+ AND input.id = page.agent_input_id
+LEFT JOIN model_outputs output
+  ON output.agent_id = page.agent_id
+ AND output.id = page.model_output_id
+LEFT JOIN model_call_contexts context
+  ON context.agent_id = output.agent_id
+ AND context.id = output.model_call_context_id
+LEFT JOIN configured_model_revisions revision
+  ON revision.org_id = context.org_id
+ AND revision.id = context.configured_model_revision_id
+LEFT JOIN LATERAL (
+  SELECT jsonb_agg(
+           CASE
+             WHEN block.block_kind = 'text' THEN jsonb_build_object('type', 'text', 'text', coalesce(block.text_content, ''))
+             WHEN block.block_kind = 'artifact' THEN jsonb_build_object('type', 'media_ref', 'artifact_id', block.artifact_id)
+             WHEN block.block_kind = 'reasoning' THEN jsonb_build_object('type', 'reasoning', 'text', coalesce(block.text_content, ''))
+             WHEN block.block_kind = 'tool_call' THEN jsonb_build_object('type', 'tool_call', 'tool_call_id', block.tool_call_id)
+             WHEN block.block_kind = 'error' THEN jsonb_build_object('type', 'error', 'text', coalesce(block.text_content, ''))
+             ELSE NULL
+           END
+           ORDER BY block.ordinal
+         ) AS content_parts
+  FROM content_blocks block
+  WHERE block.agent_id = page.agent_id
+    AND (
+      block.owner_agent_input_id = page.agent_input_id
+      OR block.owner_model_output_id = page.model_output_id
+    )
+    AND block.block_kind IN ('text', 'artifact', 'reasoning', 'tool_call', 'error')
+    AND NOT block.exclude_from_model_context
+) blocks ON true
+ORDER BY page.sequence ASC;
+
+-- name: GetAgentTurn :one
+SELECT t.id,t.turn_sequence,t.latest_event_id,t.latest_semantic_event_id
+FROM agent_turns t JOIN agents a ON a.id=t.agent_id
+WHERE a.project_id=sqlc.arg(project_id) AND t.agent_id=sqlc.arg(agent_id) AND t.id=sqlc.arg(id);

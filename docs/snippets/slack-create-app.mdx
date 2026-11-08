@@ -1,0 +1,44 @@
+<CodeGroup>
+```bash CLI
+omnara integrations slack itg_3jehcyd5n6a2bfgik7mv4qtrwz \
+  --app-name "Release Research" \
+  --app-configuration-token "xoxe.xoxp-..."
+```
+
+```bash REST
+curl "$OMNARA_API/orgs/$ORG/projects/$PROJ/integrations/itg_3jehcyd5n6a2bfgik7mv4qtrwz/slack-setup" \
+  -H "Authorization: Bearer $OMNARA_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "app_name": "Release Research",
+    "app_configuration_token": "xoxe.xoxp-..."
+  }'
+```
+
+```typescript SDK
+const setup = await sdk.createIntegrationSlackSetup({
+  client,
+  path: { orgID, projectID, integrationID: 'itg_3jehcyd5n6a2bfgik7mv4qtrwz' },
+  body: {
+    app_name: 'Release Research',
+    app_configuration_token: 'xoxe.xoxp-...',
+  },
+})
+console.log(setup.data.oauth_url)
+```
+</CodeGroup>
+
+```json
+{
+  "integration_id": "itg_3jehcyd5n6a2bfgik7mv4qtrwz",
+  "setup_revision": 1,
+  "provider": "slack",
+  "flow_id": "ioaf_aeaqcaibaeaqcaibaeaqcaibae",
+  "slack_app_id": "A0919XJRZ3T",
+  "oauth_url": "https://slack.com/oauth/v2/authorize?client_id=…&scope=…&state=…",
+  "redirect_uri": "https://app.omnara.com/api/integrations/oauth/callback",
+  "events_url": "https://app.omnara.com/api/integrations/slack/events",
+  "actions_url": "https://app.omnara.com/api/integrations/slack/actions",
+  "expires_at": "2026-08-03T21:41:00Z"
+}
+```
